@@ -1,0 +1,169 @@
+# Seed alpha library extracted from the dead-code archive in
+# /Users/wxy/Desktop/code/all_mode_fac.py (lines 607-EOF, a triple-quoted string never executed).
+# ND-mode (daily-frequency, cs_*/ts_*) expressions only -- see
+# configs/seed_alpha_library_dt.yaml for the DT-mode (in_*/cross_*/day_*)
+# sibling. `ret_1d` (day-over-day return) is aliased to the `Return`
+# field (configs/fields.yaml); evaluating a `Return`-referencing entry
+# requires the data it's evaluated against to actually have that field
+# populated -- see alphamine.data.base.add_derived_return_field.
+#
+# Why this list has 35 entries (not all ~700+ unique expressions in the
+# archive): the archive is a scratch pad of ~20 SEPARATE, historically
+# distinct research experiments concatenated into one dead string
+# literal, not one program ever executed top-to-bottom -- so
+# extract_merged_expr_dict does NOT collapse same-named entries across
+# blocks (an earlier version of this script wrongly did, silently
+# discarding good candidates whenever an unrelated later block reused
+# a generic name like '1' or 'gap_filling'; fixed -- see that
+# function's docstring for the full reasoning). What's excluded here,
+# for real (not bug) reasons, confirmed by the printed report:
+#   (1) A 2-argument masked `cs_rank(x, create_valid_mask(index_weight))`
+#       calling convention appears throughout (39 occurrences) --
+#       configs/operators.yaml's `cs_rank` is unary-only, no masked
+#       variant, so these correctly fail to parse.
+#   (2) Most `cross_*`/`day_*`-named expressions in the archive are
+#       DT-mode (intraday) factors, correctly rejected by this ND-only
+#       pass (see configs/seed_alpha_library_dt.yaml for those).
+#   (3) Fundamental/balance-sheet factors (e.g. income_net_profit,
+#       balance_total_liability, min_circu_mkt_cap) and a few exotic
+#       ops (compute_ttm, energy_ratio_*) fall entirely outside this
+#       project's OHLCV/VWAP/AdjClose/Return field-and-operator
+#       vocabulary -- same honest-skip treatment as `amt_1d`.
+# Regenerate with:
+#   PYTHONPATH=src .venv/bin/python scripts/extract_seed_factors_from_legacy.py
+#
+# Each entry's `expression` is this project's own canonical
+# Expression.__repr__() form (round-trips through
+# alphamine.core.expr_parser.parse_expression_string /
+# alphamine.core.seed_library.load_seed_alpha_library), NOT the
+# original legacy call-syntax string. `name` is a comma-joined
+# list of every legacy factor name that mapped to this exact
+# expression (see this script's dedup-by-expression-string step).
+seed_factors:
+- name: distance_to_high
+  expression: sub(1, div(cs_rank(Close), ts_max(cs_rank(Close), 20)))
+  source: all_mode_fac.py legacy archive
+- name: drawdown_recovery
+  expression: sub(cs_rank(Close), ts_min(cs_rank(Close), 10))
+  source: all_mode_fac.py legacy archive
+- name: gap_filling
+  expression: neg(abs_(sub(Open, ts_delay(Close, 1))))
+  source: all_mode_fac.py legacy archive
+- name: intraday_strength
+  expression: div(sub(cs_rank(Close), cs_rank(Open)), add(cs_rank(sub(High, Low)),
+    0.0001))
+  source: all_mode_fac.py legacy archive
+- name: mean_reversion_strength
+  expression: sub(0.5, cs_rank(div(Return, ts_stddev(Return, 20))))
+  source: all_mode_fac.py legacy archive
+- name: price_vol_correlation
+  expression: ts_corr(cs_rank(Return), cs_rank(Volume), 10)
+  source: all_mode_fac.py legacy archive
+- name: rank_acceleration
+  expression: ts_delta(ts_delta(cs_rank(div(Return, ts_delay(Return, 1))), 1), 1)
+  source: all_mode_fac.py legacy archive
+- name: rank_breakdown_low
+  expression: sub(cs_rank(div(Return, ts_delay(Return, 1))), ts_min(cs_rank(div(Return,
+    ts_delay(Return, 1))), 20))
+  source: all_mode_fac.py legacy archive
+- name: rank_breakout_high
+  expression: sub(cs_rank(div(Return, ts_delay(Return, 1))), ts_max(cs_rank(div(Return,
+    ts_delay(Return, 1))), 20))
+  source: all_mode_fac.py legacy archive
+- name: rank_change_volatility
+  expression: ts_stddev(sub(cs_rank(div(Return, ts_delay(Return, 1))), ts_delay(cs_rank(div(Return,
+    ts_delay(Return, 1))), 1)), 10)
+  source: all_mode_fac.py legacy archive
+- name: rank_deviation_abs
+  expression: sub(cs_rank(div(Return, ts_delay(Return, 1))), ts_mean(cs_rank(div(Return,
+    ts_delay(Return, 1))), 10))
+  source: all_mode_fac.py legacy archive
+- name: rank_deviation_rel
+  expression: div(sub(cs_rank(div(Return, ts_delay(Return, 1))), ts_mean(cs_rank(div(Return,
+    ts_delay(Return, 1))), 10)), ts_mean(cs_rank(div(Return, ts_delay(Return, 1))),
+    10))
+  source: all_mode_fac.py legacy archive
+- name: rank_extreme_return_reversal
+  expression: sub(1, cs_rank(abs_(Return)))
+  source: all_mode_fac.py legacy archive
+- name: rank_low_price_preference
+  expression: sub(1, cs_rank(Return))
+  source: all_mode_fac.py legacy archive
+- name: rank_ma_crossover
+  expression: sub(ts_mean(cs_rank(div(Return, ts_delay(Return, 1))), 5), ts_mean(cs_rank(div(Return,
+    ts_delay(Return, 1))), 20))
+  source: all_mode_fac.py legacy archive
+- name: rank_mean_reversion
+  expression: sub(0.5, cs_rank(div(Return, ts_delay(Return, 1))))
+  source: all_mode_fac.py legacy archive
+- name: rank_momentum_3d
+  expression: sub(cs_rank(Return), ts_delay(cs_rank(Return), 3))
+  source: all_mode_fac.py legacy archive
+- name: rank_momentum_abs
+  expression: sub(cs_rank(div(Return, ts_delay(Return, 1))), ts_delay(cs_rank(div(Return,
+    ts_delay(Return, 1))), 1))
+  source: all_mode_fac.py legacy archive
+- name: rank_momentum_rel
+  expression: div(sub(cs_rank(div(Return, ts_delay(Return, 1))), ts_delay(cs_rank(div(Return,
+    ts_delay(Return, 1))), 1)), ts_delay(cs_rank(div(Return, ts_delay(Return, 1))),
+    1))
+  source: all_mode_fac.py legacy archive
+- name: rank_momentum_sharpe
+  expression: div(sub(cs_rank(div(Return, ts_delay(Return, 1))), ts_delay(cs_rank(div(Return,
+    ts_delay(Return, 1))), 5)), ts_stddev(cs_rank(div(Return, ts_delay(Return, 1))),
+    10))
+  source: all_mode_fac.py legacy archive
+- name: rank_momentum_strength
+  expression: div(ts_delta(cs_rank(div(Return, ts_delay(Return, 1))), 1), ts_stddev(cs_rank(div(Return,
+    ts_delay(Return, 1))), 10))
+  source: all_mode_fac.py legacy archive
+- name: rank_price_momentum
+  expression: div(sub(cs_rank(Return), ts_delay(cs_rank(Return), 5)), ts_stddev(cs_rank(Return),
+    20))
+  source: all_mode_fac.py legacy archive
+- name: rank_price_vol_divergence
+  expression: sub(cs_rank(Return), cs_rank(Volume))
+  source: all_mode_fac.py legacy archive
+- name: rank_quantile_cross
+  expression: sub(ts_mean(cs_rank(div(Return, ts_delay(Return, 1))), 5), ts_mean(cs_rank(div(Return,
+    ts_delay(Return, 1))), 60))
+  source: all_mode_fac.py legacy archive
+- name: rank_self_corr
+  expression: ts_corr(cs_rank(div(Return, ts_delay(Return, 1))), ts_delay(cs_rank(div(Return,
+    ts_delay(Return, 1))), 1), 10)
+  source: all_mode_fac.py legacy archive
+- name: rank_trend_corr
+  expression: ts_corr(cs_rank(div(Return, ts_delay(Return, 1))), ts_delay(cs_rank(div(Return,
+    ts_delay(Return, 1))), 1), 10)
+  source: all_mode_fac.py legacy archive
+- name: rank_value_reversion
+  expression: sub(0.5, cs_rank(div(Return, Vwap)))
+  source: all_mode_fac.py legacy archive
+- name: rank_vol_shock
+  expression: sub(cs_rank(Volume), ts_mean(cs_rank(Volume), 20))
+  source: all_mode_fac.py legacy archive
+- name: rank_volatility
+  expression: ts_stddev(cs_rank(div(Return, ts_delay(Return, 1))), 10)
+  source: all_mode_fac.py legacy archive
+- name: rank_volatility_inv
+  expression: div(1, add(ts_stddev(cs_rank(div(Return, ts_delay(Return, 1))), 20),
+    0.0001))
+  source: all_mode_fac.py legacy archive
+- name: rank_volatility_reversal
+  expression: sub(0.5, cs_rank(sub(High, Low)))
+  source: all_mode_fac.py legacy archive
+- name: risk_adjusted_return
+  expression: div(cs_rank(Return), add(cs_rank(ts_stddev(Return, 20)), 0.0001))
+  source: all_mode_fac.py legacy archive
+- name: scaled_momentum
+  expression: div(sub(cs_rank(Return), ts_delay(cs_rank(Return), 5)), add(ts_stddev(cs_rank(Return),
+    20), 0.0001))
+  source: all_mode_fac.py legacy archive
+- name: vol_adjusted_momentum
+  expression: div(sub(cs_rank(Return), ts_delay(cs_rank(Return), 1)), add(cs_rank(Volume),
+    0.0001))
+  source: all_mode_fac.py legacy archive
+- name: volatility_break
+  expression: div(ts_delta(cs_rank(Return), 5), add(ts_stddev(cs_rank(Return), 10),
+    0.0001))
+  source: all_mode_fac.py legacy archive

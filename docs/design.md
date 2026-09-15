@@ -1,0 +1,220 @@
+# AlphaCube 设计:一个三维张量,三张面,一个引擎,全流程跑在它上面
+
+## 1. 起点
+
+数据天然是三维的:`(S, D, M)` = (股票, 交易日, 分钟)。前一个项目把它拆成两个二维世界:
+DT 世界在固定股票的 `(D, M)` 面上算,ND 世界在分钟轴已归约的 `(D, S)` 面上算,
+两套字段注册表同名不同义、两个解析器、两条引擎,以及为了把 DT 结果搬进 ND 世界的
+`__dtN` 物化胶水。冗余在类型层,不在计算层;真正丢掉的是表达力:没有任何算子用到
+第三张面 `(M, S)`,"每分钟跨股票排序再日内聚合"这类日内截面因子写不出来。
+
+AlphaCube 只保留一个数据对象(立方体)、一份注册表、一个解析器、一个引擎,并把原项目的
+全部功能迁到它上面:GP、四个 RL miner、PPO 热启动、三种池、奖励目标、研究入口、legacy
+表达式(GeneralCall)、1498 条历史因子、种子库、组合层、模型层、组合构建/优化/执行、回测。
+
+## 2. 三张面与算子的双份注册
+
+同一个二维核函数喂 `(股票 × 天)` 和喂 `(股票 × 分钟)` 语义不同。在三维上要无歧义,
+就必须把 ND 核函数**复制成两份注册项**,各自声明作用面:
+
+| 面 | 核函数看到的 (行, 列) | 计算轴 | 执行模式 | 注册名 |
+|---|---|---|---|---|
+| dt / in | `(D, M)`,固定 s | M | 按股票或按日分块 | `in_*` |
+| dt / day | `(D, M) → (D, 1)` | M(归约) | 按股票或按日分块 | `day_*` |
+| dt / cross | `(D, M)`,固定 s | D | 按股票分块,逐股票调核 | `cross_*` |
+| nd / cs | `(D, S)`,M 已归约 | S | 整面板 | `cs_*` |
+| nd / ts | `(D, S)`,M 已归约 | D | 整面板 | `ts_*` |
+| nt / cs | `(M, S)`,固定 d | S | 按日分块,**逐日调核** | `nt_cs_*` |
+| nt / ts | `(M, S)`,固定 d | M | 按日分块,**逐日调核** | `nt_ts_*` |
+| shared | elementwise | 无 | 任意 | `add` … |
+
+`catalog.build_registry` 从 vendored 的核函数库(`src/alphacube/operators/`,与前项目逐字节
+相同)生成搜索注册表:DT 121 个、ND 48 个、NT 48 个(与 ND 同一函数对象)、共享 25 个,
+共 242 个。`rank`(与 cs_rank 重复)与 `indneutralize`(需行业码)刻意排除。参数烘焙变体
+沿用前项目。布尔输出(非根)与前视算子(不进搜索词表)由探针在构建期判定。
+
+NT 面**逐日调核**是定义本身:把 ND 核函数作用在每一天的 `(M, S)` 面上。把多天的列拼成
+一次调用更快,但不是同一个计算:两个 ND 核(`ts_pearson`/`ts_spearman`)本来就跨列混合,
+而且任何归约的 float32 顺序都随张量几何变化,只有逐日调用既语义准确又与分块无关。
+
+## 3. 静态类型:宽度与信息分开追踪
+
+每个节点三个属性(`expression.Shape`):
+
+- `collapsed`:分钟宽度字面为 1(`day_*` 输出、ND 面板、宽度 1 的 `in_slice`)。
+- `degenerate`:逐分钟无真实变化,无论宽度。这是"每股票每天一个值"的真正含义。
+- `width`:字面分钟宽度(`in_slice(x, 10, 229)` 是 220),混宽相遇在运行期报错。
+
+规则:`in_*`/`nt_*`/`day_*` 要求操作数非退化;`in_expand` 要求字面宽度 1;ND 面算子要求
+操作数退化(引擎给它 `(D, S)` 面板);`cross_*` 与 elementwise 透传/广播。**根必须退化**,
+且不是布尔/近常数算子,且至少读一个字段。搜索文法严格执行;研究解析(`strict=False`)有
+两处放宽:`day_*` 套在字面宽度 1 上(legacy 恒等/置零)、`in_expand` 套在任何退化操作数上
+(引擎取第 0 列)。
+
+日频字段不是叶子而是表达式:`close_1d = day_last(Close)`,`vol_1d = day_sum(Volume)`,
+`ret_1d = close_1d / ts_delay(close_1d, 1) - 1`(`parser.DAILY_MACROS`)。`daily.DailyData`
+(前项目 `FeatureData` 的替身)就是用这些表达式从立方体算出来的日频面板集合,下游阶段
+消费它。
+
+## 4. 引擎:按分块轴分阶段
+
+节点的执行模式由计算轴决定(`engine/schedule.py`):`P`(整 `(D, S)` 面板驻内存:ND 面算子,
+以及操作数全为面板/退化的 elementwise 节点)、`S`(按股票分块 `(C, D, M)`:D 轴算子必须)、
+`D`(按日分块 `(S, C, M)`:NT 面必须)。自由节点先继承子节点模式,再继承父节点,默认 `S`。
+轮次由就绪集贪心生成:能跑 `P` 先跑,否则取闭包更大的立方体模式。
+
+**交接按轮次而不是按模式判定**:任何一条边的两端落在不同轮次(包括被另一模式隔开的
+同模式,`S → D → S`),子节点就要交接 —— 退化值(含所有 P 节点)交接一个 `(S, D)` 面板
+(取第 0 列,对退化值精确),全宽值以规范 `(S, D, M)` 顺序落盘,再按消费方朝向读回。
+对现有算子库,不含 NT 算子的树恰好一次 S→P 交接。
+
+**掩码策略**:`mask_policy="boundaries"`(默认)只在假有限值可能泄漏的位置重新施加停牌掩码:
+D 轴算子(`cross_*`)与 NT 算子的输入,以及离开轮次的值(根、面板交接、落盘边界);日内节点只影响
+自己的股票日,所以这与 `"all"`(每个节点都掩)结果逐 bit 相同(tests/test_mask_policy.py 在随机
+文法树上锁定),但掩码开销降到原来的一小部分。
+
+**store 的三种读法**(`store.py`,同一接口 `read_cube(name, rows, d0, d1)` / `read_status`):单目录
+`CubeStore`;带 **D 主序镜像**(`build_d_major_mirror` 写出 `(D, S, M)` 副本,按日分块的多股票读取变成
+连续读,读取结果逐 bit 相同);**增量分段** `SegmentedCubeStore`(生产布局:`<root>/minute` 历史基础 +
+`<root>/incremental/<段>/minute` 追加段 + `index.json`,日期与股票在读切片时拼接,meta 哈希与 index
+契约校验,新股票只在其出现的段里有值;与前项目 `segmented_store` 同一 schema)。`open_cube_store`
+按目录结构自动选择。
+
+核函数视图(`engine/kernels.py`):M 轴 DT 核吃 `(A·B, M)` 零拷贝视图;`cross_*` 逐股票循环;
+NT 面逐日 `(M, S)`;ND 面 `(D, S)`;elementwise 三维广播。常数是 `(1, 1, 1)` 视图。
+`GeneralCall` 走同一套分派:字面参数按原位置重新插入,tensor-list 参数按位置组装,
+list 值中间结果(multireg 的 tvalue 列表)只允许被另一个算子消费。
+
+**dtype 契约**:每个节点出口都是 float32(bool/int 结果也转),与旧 numpy 路径"每节点
+float 往返"一致;需要布尔掩码的核函数(参数名 `mask`/`*_mask`)在调用时按参数名转回 bool。
+**停牌掩码**在每个计算节点出口施加(`is_gt0(NaN)` 返回有限的 0.0,只掩叶子挡不住它)。
+
+## 5. 精度契约(测试锁定,见 tests/test_engine.py)
+
+- DT 三族(in/day/cross,含 in_expand 与 elementwise 混合):与逐股票调核**逐 bit 相同**。
+- NT 两族:与逐日在 `(M, S)` 面上调核**逐 bit 相同**(含跨列混合的 `nt_ts_spearman`)。
+- ND 面:与直接在 `(D, S)` 上调核**逐 bit 相同**。
+- 任意分块大小、任意轮次结构(含 S→D→S 落盘)结果**逐 bit 不变**;150 棵随机文法树上锁定。
+- 跨设备(CPU/CUDA)不承诺逐 bit。
+
+## 6. 内存模型
+
+单位:一个 float32 立方体 = `S × D × M × 4 B`。峰值 ≈ (叶子缓存 ≤ 8 + 活跃中间量 ≈ 4 +
+滚动窗口工作集 w) × 块立方体;`CubeEngine(chunk_bytes=...)` 按此自动定块(默认 2 GB)。
+
+| 规模 | 单立方体 | 整体不分块 (w=60) | 64 只一块 |
+|---|---|---|---|
+| 300 × 970 × 241 | 0.28 GB | 20 GB | 3.7 GB |
+| 1000 × 970 × 241 | 0.94 GB | 68 GB | 3.7 GB |
+| 5215 × 2814 × 241 | 14.1 GB | 1.0 TB | 12.5 GB |
+
+本机实测(300 × 500 × 241 合成,8 线程 CPU):8 条三面混合表达式 5.5 秒;GP 首代 24 棵
+深度 4 的树 74 秒,后续每代 8 到 14 秒;平均每棵新树 1.1 秒。
+
+## 7. 挖掘层:五个 miner 一套底层
+
+**词表与文法**(`mining/tokens.py`):RPN token 空间 = 字段 + 可搜索算子(剔前视)+ 常数 +
+窗口(各面窗口池的并集 + 面板真实分钟数)。窗口先于算子入栈,算子的掩码检查栈顶窗口是否
+在自己的窗口池里(`in_expand` 只在真实分钟数下合法);操作数兼容性即 `operand_ok`;
+`SEP` 只在单栈项是合法根时给出。掩码与 `push` 逐 token 一致(测试对全词表逐一比对)。
+
+**延迟批量奖励**(`mining/env.py`):`TokenEnv.step` 在 SEP 时返回 `reward=None` 的待定
+结果;miner 攒够一批(PPO 的 `episodes_per_update`、QCM 的 `episodes_per_batch`、SAGE 的
+`trajectories_per_update`、Forge 的 decode 批)后 `BatchRewarder.rewards` 一次引擎调用求出
+全部面板(批内 CSE),再按顺序过池:单因子 IC 有限 → 覆盖率 ≥ 阈值 → 与成员 |corr| 去重
+→ 事务性插入 → 奖励 = 池 IC;任何拒绝 = 惩罚。`gamma = 1`、单终止奖励,回填后的 PPO 数值
+与"立刻算"完全一致。这是 RL 走分钟数据唯一可行的形态。
+
+**miner**:`AlphaGenMiner`(PPO,LSTM actor-critic)、`AlphaQCMMiner`(IQN,尾均值 CVaR 式选
+动作,回放池按批推入,更新次数与逐步调度相同)、`AlphaForgeMiner`(Generator/Masker/
+Predictor,直通估计)、`AlphaSAGEMiner`(RGCN 编码部分树 + GFlowNet 轨迹平衡,奖励 =
+exp(clip(池 IC)) × 新颖度)、`PPOWarmStartQCMMiner`(PPO 记录带最终奖励的 transition,
+QCM 回放池预热)、`GPMiner`(需求驱动的类型化生成器,面均衡抽算子,一代一次引擎调用,
+覆盖率闸的 |IC| 适应度,结构聚类 + 簇剔除 + 簇内锦标赛,面板缓存跨代复用)。
+各自与论文的简化处保留原项目的说明。
+
+**池**(`mining/pool.py`):`MsePool`(z-score 后 OLS,缺失 z 视为中性 0)、`MeanStdPool`
+(Adam 最大化 ICIR)、`DynamicRollingPool`(滚动窗口内拟合);同一套闸:IC 有限、覆盖率、
+|corr| 去重、事务性;`test_ensemble` 用 label 的可执行收益作 P&L 腿。
+
+**奖励目标**:`open_vwap15`(生产 label:t+1 日开盘 15 分钟 VWAP 进、t+1+h 出,直接从立方体
+算)、`close`,以及 `models.targets` 的 volatility / downside_volatility / rank / class /
+spike / crash(`cli.make_label`)。
+
+## 8. legacy 表达式:GeneralCall 与 1498 条历史因子
+
+四类文法之外的调用走 `GeneralCall`(`fullcatalog.py` 扫描全库:装饰函数 + 各模块公开函数,
+按模块与前缀归面;含 `legacy_framework_compat`、`legacy_specialized_*`、`dt_spectral`):
+三张量(`select_where`)、字面参数(`in_slice`、`day_pdf_tail_sum_m(x, f, 50, False, 'rank')`)、
+tensor-list(`in_multireg([...], y, d, 'tvalue')` → `tensor_list_std`)、改宽度(`delete_open_close`)。
+调用前按核函数签名检查参数个数。别名:`abs`/`sum`/`rank`/`_max`/`_min`/`_pow`/
+`cross_zscore_rolling`/`in_stddev`(按参数个数)/`in_multireg`(路由到 legacy 签名);语法糖:
+`+ - * / ** | &`、`== > < >= <=`、`.float()`、list 参数、`in_expand(x)` 缺省宽度;因子按名
+引用文本级内联;240 网格 → 241 网格迁移(`legacy/minute_grid.py`)。
+
+**裸字段的日频语义**:表达式里没有任何分钟级算子(只有 ND 面与 elementwise)时,裸字段
+一律取日频聚合(`ts_corr(open, vol, 10)` 是日频 open 与日频 vol),与旧 ND 模式解析一致;
+含分钟算子的表达式里裸字段是分钟字段,ND 面算子的原始字段子树操作数才被强制日频化。
+
+验收(`scripts/legacy_acceptance.py`,合成 6 × 60 × 241 立方体):
+
+| 项目 | 数量 |
+|---|---|
+| 语料 | 1498 |
+| 解析通过 | 1442 |
+| 解析失败:字段不存在(行业、基本面、`*_1d` 分钟列) | 33 |
+| 解析失败:库里没有的函数 `merge_and_forward_fill` | 8 |
+| 解析失败:语料本身括号错位导致的参数个数错误 | 11 |
+| 解析失败:分钟算子套在坍缩操作数上 | 4 |
+| 根不是每股票每天一个值 | 13 |
+| 求值通过 | 1429 / 1429 |
+| 至少有有限值 | 1415 |
+
+种子库 `configs/seed_alpha_library_{nd,dt}.yaml`:DT 51 条、ND 35 条全部可解析,
+`legacy.seed_pool` 一次引擎调用后按序入池。
+
+**生产计算入口**(`calculate.py`,`cli calculate`):按批求值、每个因子一个原子写入的 `.npy`、
+目录级状态目录(SUCCESS / PARSE_FAILED / NOT_DAILY / EVAL_FAILED / DEFERRED_RESOURCE_RISK,含原因)、
+资源风险算子延后策略(`ts_pearson`、`nt_ts_pearson`、`nt_ts_spearman`、`in_multireg` 及按名引用
+它们的因子,`--allow-resource-risk` 放开)、**断点续算**(重启后按表达式摘要跳过已完成因子,
+续跑结果与一次跑完逐 bit 相同)、Parquet 导出(`<根>/<YYYYMMDD>/<因子>.parquet`,列 `date, symbol,
+<因子>`;上市前无行、停牌为空;manifest 可续)。
+
+**Feature Boosting 预压榨**(`mining/boosting.py`):每轮配一对(字段组, 算子组),在携带的操作数上
+做有界的局部组合,已是日频的候选一次引擎调用求值、GBDT 置换重要性排序,幸存者携带进下一轮;
+未归约的全宽候选抽样携带作为操作数(`day_std(in_mean_rolling(Ret, 5))` 这类组合由此跨轮生成)。
+`run_mining(presqueeze=...)` 把幸存者先送进池再开始搜索。
+
+## 9. 下游阶段
+
+`models/`(估计器、目标、评估、训练器、conformal CVaR、horizon mixture)、`combine/`
+(post_combine 的多方法样本外排行榜与方向对齐,FactorGCL 超图 GNN)、`portfolio/`
+(信号→权重、A 股手数优化器、美股优化器、凸稀疏优化)、`execution/`(Almgren-Chriss 与
+鲁棒版)、`backtest/`(逐日引擎、成本、冲击、指标)从前项目整体迁入,数值逻辑逐字节不变,
+只改了数据入口:它们只消费 `(D, S)` 面板 / `DailyData`,不再有任何表达式求值。唯一的
+API 变化:`FactorGCLCombiner.fit(panels, target, epochs, train_days=)` / `predict(panels)`,
+`build_prior_incidence(panels)`。
+
+## 10. 边界与未做
+
+- **两轴/三轴算子**:不新增核函数。分钟级跨股票配对(S² 量级)已由 `nt_ts_pearson` /
+  `nt_ts_spearman` 覆盖(逐日 `(M, S)` 面);"日内市场 beta"这类看似三轴的因子由面切换组合可达,
+  `day_last(in_regbeta(Ret, nt_cs_mean(Ret), 10))` 在一个 D 轮内求值且与逐日参考逐 bit 相同
+  (tests/test_production.py::test_two_axis_factor_by_composition)。
+- 语料里 11 条括号错位与 8 条 `merge_and_forward_fill` 无法计算(库里没有该函数)。
+- CUDA 路径本机无法验证:`scripts/validate_gpu_parity.py` 在服务器上跑(逐算子 CPU/CUDA 差异 +
+  一代 GP);`scripts/compare_daily_store.py --root <计算根目录>` 在真数据上比对派生日频字段与
+  V2 日频 store(本机自校验:Open/High/Low/Close 逐 bit,Volume/Amount/Vwap/Return 为 float32
+  求和顺序量级 ~1e-7 的差异)。
+
+## 11. 与服务器数据的关系
+
+`open_cube_store` 直接读前项目的 V2 计算根目录(`minute/` + `incremental/`)或单个分钟 store 目录,
+无需转换;`python train.py`(参数全部显式)、`cli mine/research/calculate`、`scripts/check_store.py`、
+`scripts/compare_miners.py` 都接受同一个 `--store`:
+
+```bash
+python -m alphacube.cli mine --store /root/autodl-tmp/qmt_daily_data/fast_factor_compute/minute \
+    --start 20230101 --end 20231231 --max-symbols 300 --miner alphaqcm --budget 2000 --device cuda \
+    --seed-library configs/seed_alpha_library_dt.yaml --out mining_runs
+```

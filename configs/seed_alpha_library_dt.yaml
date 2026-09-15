@@ -1,0 +1,185 @@
+# Seed alpha library extracted from the dead-code archive in
+# /Users/wxy/Desktop/code/all_mode_fac.py (lines 607-EOF, a triple-quoted string never executed).
+# DT-mode (day x minute, in_*/cross_*/day_*) expressions only -- see
+# configs/seed_alpha_library_nd.yaml for the ND-mode (cs_*/ts_*) sibling.
+# Regenerate with:
+#   PYTHONPATH=src .venv/bin/python scripts/extract_seed_factors_from_legacy.py
+#
+# Each entry's `expression` is this project's own canonical
+# Expression.__repr__() form (round-trips through
+# alphamine.core.expr_parser.parse_expression_string /
+# alphamine.core.seed_library.load_seed_alpha_library), NOT the
+# original legacy call-syntax string. `name` is a comma-joined
+# list of every legacy factor name that mapped to this exact
+# expression (see this script's dedup-by-expression-string step).
+seed_factors:
+- name: '10'
+  expression: day_mean(in_regbeta(in_max_rolling(High, 50), in_min_rolling(Low, 50),
+    50))
+  source: all_mode_fac.py legacy archive
+- name: 10_m
+  expression: cross_mean(day_mean(in_regbeta(in_max_rolling(High, 50), in_min_rolling(Low,
+    50), 50)), 20)
+  source: all_mode_fac.py legacy archive
+- name: 10_std
+  expression: cross_stddev(day_mean(in_regbeta(in_max_rolling(High, 50), in_min_rolling(Low,
+    50), 50)), 20)
+  source: all_mode_fac.py legacy archive
+- name: '2'
+  expression: day_std(Volume)
+  source: all_mode_fac.py legacy archive
+- name: 2m
+  expression: cross_mean(day_std(Volume), 20)
+  source: all_mode_fac.py legacy archive
+- name: 2std
+  expression: cross_stddev(day_std(Volume), 20)
+  source: all_mode_fac.py legacy archive
+- name: '3'
+  expression: day_std(div(High, Low))
+  source: all_mode_fac.py legacy archive
+- name: 3m
+  expression: cross_mean(day_std(div(High, Low)), 20)
+  source: all_mode_fac.py legacy archive
+- name: 3std
+  expression: cross_stddev(day_std(div(High, Low)), 20)
+  source: all_mode_fac.py legacy archive
+- name: '7'
+  expression: day_last(mul(in_regbeta(in_max_rolling(High, 50), in_min_rolling(Low,
+    50), 50), in_r2(in_max_rolling(High, 50), in_min_rolling(Low, 50), 50)))
+  source: all_mode_fac.py legacy archive
+- name: 7_m
+  expression: cross_mean(day_last(mul(in_regbeta(in_max_rolling(High, 50), in_min_rolling(Low,
+    50), 50), in_r2(in_max_rolling(High, 50), in_min_rolling(Low, 50), 50))), 20)
+  source: all_mode_fac.py legacy archive
+- name: 7_std
+  expression: cross_stddev(day_last(mul(in_regbeta(in_max_rolling(High, 50), in_min_rolling(Low,
+    50), 50), in_r2(in_max_rolling(High, 50), in_min_rolling(Low, 50), 50))), 20)
+  source: all_mode_fac.py legacy archive
+- name: '9'
+  expression: day_mean(in_corr(in_max_rolling(High, 50), in_min_rolling(Low, 50),
+    50))
+  source: all_mode_fac.py legacy archive
+- name: 9_m
+  expression: cross_mean(day_mean(in_corr(in_max_rolling(High, 50), in_min_rolling(Low,
+    50), 50)), 20)
+  source: all_mode_fac.py legacy archive
+- name: 9_std
+  expression: cross_stddev(day_mean(in_corr(in_max_rolling(High, 50), in_min_rolling(Low,
+    50), 50)), 20)
+  source: all_mode_fac.py legacy archive
+- name: a4
+  expression: day_skew(div(Volume, in_sum(Volume)))
+  source: all_mode_fac.py legacy archive
+- name: a4m
+  expression: cross_mean(day_skew(div(Volume, in_sum(Volume))), 20)
+  source: all_mode_fac.py legacy archive
+- name: a4std
+  expression: cross_stddev(day_skew(div(Volume, in_sum(Volume))), 20)
+  source: all_mode_fac.py legacy archive
+- name: a5
+  expression: day_kurt(div(Volume, in_sum(Volume)))
+  source: all_mode_fac.py legacy archive
+- name: a5m
+  expression: cross_mean(day_kurt(div(Volume, in_sum(Volume))), 20)
+  source: all_mode_fac.py legacy archive
+- name: a5std
+  expression: cross_stddev(day_kurt(div(Volume, in_sum(Volume))), 20)
+  source: all_mode_fac.py legacy archive
+- name: a6
+  expression: div(day_skew(div(Volume, in_sum(Volume))), day_kurt(div(Volume, in_sum(Volume))))
+  source: all_mode_fac.py legacy archive
+- name: a6m
+  expression: cross_mean(div(day_skew(div(Volume, in_sum(Volume))), day_kurt(div(Volume,
+    in_sum(Volume)))), 20)
+  source: all_mode_fac.py legacy archive
+- name: a6std
+  expression: cross_stddev(div(day_skew(div(Volume, in_sum(Volume))), day_kurt(div(Volume,
+    in_sum(Volume)))), 20)
+  source: all_mode_fac.py legacy archive
+- name: c10
+  expression: day_corr(Close, div(Volume, in_delay(Volume, 1)))
+  source: all_mode_fac.py legacy archive
+- name: c10m
+  expression: cross_mean(day_corr(Close, div(Volume, in_delay(Volume, 1))), 20)
+  source: all_mode_fac.py legacy archive
+- name: c10std
+  expression: cross_stddev(day_corr(Close, div(Volume, in_delay(Volume, 1))), 20)
+  source: all_mode_fac.py legacy archive
+- name: c6
+  expression: day_corr(Close, Volume)
+  source: all_mode_fac.py legacy archive
+- name: c6m
+  expression: cross_mean(day_corr(Close, Volume), 20)
+  source: all_mode_fac.py legacy archive
+- name: c6std
+  expression: cross_stddev(day_corr(Close, Volume), 20)
+  source: all_mode_fac.py legacy archive
+- name: c7
+  expression: day_corr(Close, in_delay(Volume, 1))
+  source: all_mode_fac.py legacy archive
+- name: c7m
+  expression: cross_mean(day_corr(Close, in_delay(Volume, 1)), 20)
+  source: all_mode_fac.py legacy archive
+- name: c7std
+  expression: cross_stddev(day_corr(Close, in_delay(Volume, 1)), 20)
+  source: all_mode_fac.py legacy archive
+- name: c8
+  expression: day_corr(Close, in_shift(Volume, 1))
+  source: all_mode_fac.py legacy archive
+- name: c8m
+  expression: cross_mean(day_corr(Close, in_shift(Volume, 1)), 20)
+  source: all_mode_fac.py legacy archive
+- name: c8std
+  expression: cross_stddev(day_corr(Close, in_shift(Volume, 1)), 20)
+  source: all_mode_fac.py legacy archive
+- name: c9
+  expression: day_corr(Close, div(Volume, in_shift(Volume, 1)))
+  source: all_mode_fac.py legacy archive
+- name: c9m
+  expression: cross_mean(day_corr(Close, div(Volume, in_shift(Volume, 1))), 20)
+  source: all_mode_fac.py legacy archive
+- name: c9std
+  expression: cross_stddev(day_corr(Close, div(Volume, in_shift(Volume, 1))), 20)
+  source: all_mode_fac.py legacy archive
+- name: day_ret
+  expression: cross_mean(sub(div(day_last(Close), cross_delay(day_last(Close), 1)),
+    1), 20)
+  source: all_mode_fac.py legacy archive
+- name: day_std
+  expression: cross_stddev(sub(div(day_last(Close), cross_delay(day_last(Close), 1)),
+    1), 20)
+  source: all_mode_fac.py legacy archive
+- name: dayret
+  expression: sub(div(day_last(Close), day_first(Open)), 1)
+  source: all_mode_fac.py legacy archive
+- name: fight_dis_m
+  expression: day_sum(sub(in_sorted_cumsum_forward(in_relative_distance_m(Close),
+    Volume), in_sorted_cumsum_backward(in_relative_distance_m(Close), Volume)))
+  source: all_mode_fac.py legacy archive
+- name: fight_dis_p
+  expression: day_sum(sub(in_sorted_cumsum_forward(in_relative_distance_p(Close),
+    Volume), in_sorted_cumsum_backward(in_relative_distance_p(Close), Volume)))
+  source: all_mode_fac.py legacy archive
+- name: in_day_ret
+  expression: cross_mean(sub(div(day_last(Close), day_first(Open)), 1), 20)
+  source: all_mode_fac.py legacy archive
+- name: in_day_std
+  expression: cross_stddev(sub(div(day_last(Close), day_first(Open)), 1), 20)
+  source: all_mode_fac.py legacy archive
+- name: night_ret
+  expression: cross_mean(sub(div(day_first(Open), cross_delay(day_last(Close), 1)),
+    1), 20)
+  source: all_mode_fac.py legacy archive
+- name: night_std
+  expression: cross_stddev(sub(div(day_first(Open), cross_delay(day_last(Close), 1)),
+    1), 20)
+  source: all_mode_fac.py legacy archive
+- name: peak
+  expression: day_argmax(in_local_mean(Volume, 5))
+  source: all_mode_fac.py legacy archive
+- name: w240_resid_vwap_close
+  expression: day_mean(cross_regres(Vwap, Close, 60))
+  source: all_mode_fac.py legacy archive
+- name: w240_vwap_spread
+  expression: day_mean(abs_(sub(Vwap, div(add(High, Low), 2))))
+  source: all_mode_fac.py legacy archive

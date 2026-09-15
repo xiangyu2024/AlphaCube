@@ -1,0 +1,274 @@
+"""挖完之后怎么把因子合成一个信号 —— 池内权重之外的、正经的组合层。
+
+为什么需要它:池的 `_fit_weights` 是**搜索过程中的奖励信号**,要求每插入一条
+就能重算一次,所以它必须便宜、粗糙。它不是、也不该是最终的组合方法。但
+上一版的训练脚本直接把池权重当成果输出了,于是出现两个具体问题:
+
+1. **方向没对齐。** GP 默认 `fitness_signed=False`,即用 `|IC|` 筛选 ——
+   明确承认"负 IC 因子是可反转的信号,和它的正镜像一样有价值"。但从来没有
+   任何地方真的去反转它。于是池里同时存在 IC=-0.015 和 IC=+0.010 的成员,
+   组合时互相抵消。筛选口径和组合口径不一致,是实打实的缺陷。
+2. **权重经常退化成等权。** 上一版项目 `MseAlphaPool._fit_weights` 的 OLS 前置条件是
+   `np.all(np.isfinite(design), axis=1)` —— 要求**所有成员在同一格子上同时
+   有限**。只要有一条成员是常数/布尔型(z-score 后整片 NaN),这个交集就塌了,
+   直接走 `return np.full(n, 1/n)` 兜底。输出里权重全是 +0.1000、
+   `combined_coverage` 很低,就是这个症状。(本项目 `mining.pool.MsePool` 把缺失 z-score 记 0,
+   不再这样塌;但池权重仍只是搜索期的奖励信号,不是最终组合。)
+
+本模块做的事:先按各因子自身 IC 的符号**对齐方向**,再用多种方法组合,并且
+**统一在样本外比较** —— 权重/模型一律只用训练段拟合,指标只报测试段。不这样
+做的话,树模型在样本内必然好看,但那个数字没有意义。
+
+方法:
+    equal      等权(方向对齐后)
+    ic         按训练段 |IC| 加权
+    icir       按训练段 |ICIR| 加权 —— 稳定性比绝对强度更值钱
+    lstsq      OLS(池当前用的口径,作为基线)
+    ridge      带正则的线性,因子间共线时比 OLS 稳
+    gbdt       HistGradientBoosting(sklearn 自带,原生吃 NaN)
+    lightgbm   需要 pip install lightgbm
+    xgboost    需要 pip install xgboost
+    factorgcl  超图 GNN(`combine/factorgcl/`):一天一张图、股票为节点、节点
+               特征是该股当天的因子向量,在先验因子超边之外再学一组隐超边,
+               训练目标是 MSE(前瞻收益) + 时序残差对比损失。它和树模型的
+               区别在于**显式建模同一天股票之间的关系**,而不是把每个
+               (股票,天) 当独立样本
+
+树模型的样本量:全市场 10 年 x 10 因子 = 1.26 亿行,直接喂进去不现实,所以
+拟合前按 `max_fit_rows` 随机下采样(预测仍在全量上做)。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+from ..metrics import backtest_metrics, cross_sectional_pearson, rank_rows
+
+WEIGHT_METHODS = ("equal", "ic", "icir", "lstsq", "ridge")
+MODEL_METHODS = ("ridge", "gbdt", "lightgbm", "xgboost", "factorgcl")
+DEFAULT_METHODS = ("equal", "ic", "icir", "lstsq", "gbdt")
+
+
+def factor_ic_series(column: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """逐日截面 IC 序列。"""
+    return cross_sectional_pearson(column, target)
+
+
+def align_signs(
+    columns: Sequence[np.ndarray], target: np.ndarray, days: Optional[slice] = None
+) -> Tuple[List[np.ndarray], np.ndarray]:
+    """把每个因子翻成"IC 为正"的方向,返回 (对齐后的列, 符号)。
+
+    符号只用 `days` 指定的训练段估计 —— 用全样本定方向就是在偷看测试段,
+    那会把一个前视偏差伪装成组合方法的收益。IC 非有限(常数/全 NaN 因子)时
+    符号取 +1,不翻。
+    """
+    signs = np.ones(len(columns), dtype=np.float64)
+    for i, column in enumerate(columns):
+        sub_c = column[days] if days is not None else column
+        sub_t = target[days] if days is not None else target
+        ic = float(np.nanmean(factor_ic_series(sub_c, sub_t)))
+        if np.isfinite(ic) and ic < 0:
+            signs[i] = -1.0
+    return [s * c for s, c in zip(signs, columns)], signs
+
+
+def _weights_for(
+    method: str, columns: Sequence[np.ndarray], target: np.ndarray, days: slice
+) -> np.ndarray:
+    n = len(columns)
+    if method == "equal":
+        return np.full(n, 1.0 / n, dtype=np.float64)
+
+    if method in ("ic", "icir"):
+        scores = np.zeros(n, dtype=np.float64)
+        for i, column in enumerate(columns):
+            series = factor_ic_series(column[days], target[days])
+            finite = series[np.isfinite(series)]
+            if finite.size < 2:
+                continue
+            mean = float(finite.mean())
+            if method == "ic":
+                scores[i] = abs(mean)
+            else:
+                std = float(finite.std())
+                scores[i] = abs(mean / std) if std > 1e-12 else 0.0
+        total = scores.sum()
+        # 全零(所有因子都退化)时退回等权,并且这是**显式**的,不是静默兜底
+        return scores / total if total > 1e-12 else np.full(n, 1.0 / n)
+
+    if method == "lstsq":
+        design = np.stack([c[days] for c in columns], axis=-1).reshape(-1, n)
+        y = target[days].reshape(-1)
+        mask = np.all(np.isfinite(design), axis=1) & np.isfinite(y)
+        if mask.sum() < max(n, 10):
+            return np.full(n, 1.0 / n, dtype=np.float64)
+        weights, *_ = np.linalg.lstsq(design[mask], y[mask], rcond=None)
+        return weights.astype(np.float64)
+
+    raise ValueError(f"{method} 不是权重类方法")
+
+
+def _model_prediction(
+    method: str,
+    columns: Sequence[np.ndarray],
+    target: np.ndarray,
+    days: slice,
+    max_fit_rows: int,
+    seed: int,
+) -> np.ndarray:
+    """用训练段拟合一个模型,在全样本上预测,返回 (T, N) 面板。"""
+    from ..models.estimators import ESTIMATOR_REGISTRY
+
+    key = {"gbdt": "hgb"}.get(method, method)   # 注册表里叫 hgb
+    if key not in ESTIMATOR_REGISTRY:
+        raise KeyError(
+            f"估计器 '{key}' 不可用。已注册: {sorted(ESTIMATOR_REGISTRY)}。"
+            "lightgbm/xgboost 是可选依赖,需要单独 pip install。"
+        )
+    T, N = target.shape
+    stacked = np.stack(columns, axis=-1)          # (T, N, n_factors)
+    X_all = stacked.reshape(T * N, len(columns))
+
+    train = np.zeros((T, N), dtype=bool)
+    train[days] = True
+    y = target.reshape(-1)
+    fit_rows = np.flatnonzero(train.reshape(-1) & np.isfinite(y))
+    if fit_rows.size < 100:
+        raise ValueError("训练段有限样本不足 100 行,无法拟合模型")
+    if fit_rows.size > max_fit_rows:
+        rng = np.random.default_rng(seed)
+        fit_rows = rng.choice(fit_rows, size=max_fit_rows, replace=False)
+
+    model = ESTIMATOR_REGISTRY[key]()
+    model.fit(X_all[fit_rows], y[fit_rows])
+    return np.asarray(model.predict(X_all), dtype=np.float64).reshape(T, N)
+
+
+def _factorgcl_prediction(
+    columns: Sequence[np.ndarray],
+    target: np.ndarray,
+    days: slice,
+    seed: int,
+    epochs: int = 5,
+    **kwargs,
+) -> np.ndarray:
+    """超图 GNN 组合:一天一张图,节点=股票,节点特征=该股当天的因子向量。
+
+    列直接作为因子面板喂给组合器 —— 它的 `build_prior_incidence` 只是把每列
+    逐日 z-score 后堆成先验关联矩阵(对已经是 z-score 的列是幂等的),不再
+    像上一版那样逐条走 AST 重算。
+    `train_days` 保证优化器只看得到训练段。
+    """
+    from .factorgcl import FactorGCLCombiner
+
+    combiner = FactorGCLCombiner(seed=seed, **kwargs)
+    combiner.fit(columns, target, epochs=epochs, train_days=days)
+    return combiner.predict(columns)
+
+
+@dataclass
+class CombinationResult:
+    method: str
+    weights: Optional[np.ndarray]
+    combined: np.ndarray
+    metrics: Dict[str, float]
+
+
+def combine(
+    method: str,
+    columns: Sequence[np.ndarray],
+    target: np.ndarray,
+    real_returns: np.ndarray,
+    train_days: slice,
+    test_days: slice,
+    max_fit_rows: int = 2_000_000,
+    seed: int = 0,
+    factorgcl_kwargs: Optional[Dict] = None,
+) -> CombinationResult:
+    """按 `method` 组合,指标只在 `test_days`(样本外)上算。"""
+    if method == "factorgcl":
+        combined = _factorgcl_prediction(columns, target, train_days, seed,
+                                         **(factorgcl_kwargs or {}))
+        weights = None
+    elif method in MODEL_METHODS:
+        combined = _model_prediction(method, columns, target, train_days, max_fit_rows, seed)
+        weights = None
+    else:
+        weights = _weights_for(method, columns, target, train_days)
+        combined = np.zeros_like(target, dtype=np.float64)
+        for column, weight in zip(columns, weights):
+            combined = combined + weight * column
+
+    ic_series = cross_sectional_pearson(combined[test_days], target[test_days])
+    metrics = dict(backtest_metrics(ic_series, combined[test_days], real_returns[test_days]))
+    metrics["rank_ic"] = float(np.nanmean(cross_sectional_pearson(
+        rank_rows(combined[test_days]), rank_rows(target[test_days]))))
+    metrics["coverage"] = float(np.isfinite(combined[test_days]).mean())
+    return CombinationResult(method, weights, combined, metrics)
+
+
+def compare(
+    columns: Sequence[np.ndarray],
+    target: np.ndarray,
+    real_returns: np.ndarray,
+    methods: Sequence[str] = DEFAULT_METHODS,
+    train_frac: float = 0.7,
+    align: bool = True,
+    max_fit_rows: int = 2_000_000,
+    seed: int = 0,
+    factorgcl_kwargs: Optional[Dict] = None,
+) -> Tuple[List[CombinationResult], np.ndarray]:
+    """跑一组组合方法,全部在同一个样本外切分上比较。
+
+    返回 (结果列表, 方向符号)。`align=False` 可用来对照"不对齐方向"的效果 ——
+    这正是当前池权重的口径。
+    """
+    if not columns:
+        raise ValueError("没有因子可组合")
+    T = target.shape[0]
+    split = max(1, min(T - 1, int(T * train_frac)))
+    train_days, test_days = slice(0, split), slice(split, T)
+
+    if align:
+        columns, signs = align_signs(columns, target, days=train_days)
+    else:
+        signs = np.ones(len(columns), dtype=np.float64)
+
+    results: List[CombinationResult] = []
+    for method in methods:
+        try:
+            results.append(combine(method, columns, target, real_returns,
+                                   train_days, test_days, max_fit_rows, seed,
+                                   factorgcl_kwargs))
+        except Exception as exc:  # 缺可选依赖/样本不足,跳过但要说出来
+            results.append(CombinationResult(
+                method, None, np.full_like(target, np.nan, dtype=np.float64),
+                {"error": str(exc)[:120]}))
+    return results, signs
+
+
+def leaderboard(results: Sequence[CombinationResult]) -> "object":
+    """结果 → 按样本外 ICIR 排序的表。"""
+    import pandas as pd
+
+    rows = []
+    for result in results:
+        row = {"method": result.method}
+        row.update({k: v for k, v in result.metrics.items() if k != "error"})
+        if "error" in result.metrics:
+            row["error"] = result.metrics["error"]
+        rows.append(row)
+    table = pd.DataFrame(rows).set_index("method")
+    if "icir" in table.columns:
+        table = table.sort_values("icir", ascending=False, na_position="last")
+    return table
+
+
+__all__ = [
+    "CombinationResult", "DEFAULT_METHODS", "MODEL_METHODS", "WEIGHT_METHODS",
+    "align_signs", "combine", "compare", "factor_ic_series", "leaderboard",
+]
