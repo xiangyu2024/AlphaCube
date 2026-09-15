@@ -247,7 +247,8 @@ def _make_pdf_and_x(
         x_max = torch.where(mask, x, torch.full_like(x, float("-inf"))).max(dim=-1, keepdim=True)[0]
         x_adj = (x - x_min) / ((x_max - x_min) + eps)
     else:
-        rank = torch.where(mask, x, torch.full_like(x, float("inf"))).argsort(dim=-1).argsort(dim=-1).float()
+        rank = (torch.where(mask, x, torch.full_like(x, float("inf")))
+                .argsort(dim=-1, stable=True).argsort(dim=-1, stable=True).float())
         rank_max = rank.max(dim=-1, keepdim=True)[0]
         x_adj = rank / (rank_max + eps)
 
@@ -337,7 +338,7 @@ def day_pdf_quantile_bilateral_half_width(
 
     idx = torch.arange(L, device=device).view(1, L).expand(B, L)
     dist_ = (idx - center_idx).abs()
-    order = torch.argsort(dist_, dim=-1)
+    order = torch.argsort(dist_, dim=-1, stable=True)
 
     pdf_sorted = torch.gather(pdf, 1, order)
     cum = torch.cumsum(pdf_sorted, dim=-1)
@@ -512,7 +513,7 @@ def top_frac_sum_masked(x: torch.Tensor, y: torch.Tensor, n: int) -> torch.Tenso
     valid_cnt = mask_valid.sum(dim=1, keepdim=True)
     k = torch.ceil(valid_cnt / n).long()
     x_fill = torch.where(mask_valid, x, torch.full_like(x, float("-inf")))
-    _, indices = torch.sort(x_fill, dim=1, descending=True)
+    _, indices = torch.sort(x_fill, dim=1, descending=True, stable=True)
     row_idx = torch.arange(T, device=x.device).view(-1, 1)
     max_k = k.max()
     gathered = y[row_idx, indices[:, :max_k]]

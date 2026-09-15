@@ -321,7 +321,12 @@ def rank(x: torch.Tensor, valid_mask: Optional[torch.Tensor] = None, pct: bool =
     # Invalid entries are pushed ABOVE every valid value (not below) so they
     # land at the end of the sort and don't shift valid entries' ranks.
     x_rank[~valid_mask] = torch.finfo(x.dtype).max
-    ranks = (torch.argsort(torch.argsort(x_rank, dim=-1, descending=False), dim=-1) + 1).to(x.dtype)
+    # stable=True: ties keep index order, which is the only tie-break every torch
+    # backend agrees on. Without it CPU and GPU hand tied values each other's ranks
+    # (a 1/n difference, not an ULP one) and minute data ties constantly -- prices
+    # sit on a tick grid, volumes repeat, suspended minutes are zero.
+    ranks = (torch.argsort(torch.argsort(x_rank, dim=-1, descending=False, stable=True),
+                           dim=-1, stable=True) + 1).to(x.dtype)
     if pct:
         valid_count = valid_mask.sum(dim=-1, keepdim=True).to(x.dtype)
         ranks = torch.where(valid_count > 0, ranks / valid_count, torch.full_like(ranks, float("nan")))

@@ -83,7 +83,7 @@ src/alphacube/
   legacy/                     1498 条历史因子、240→241 网格迁移、种子库
   models/ combine/ portfolio/ execution/ backtest/   从前项目迁入的下游阶段
   cli.py                      synth / research / mine
-  operators/                  vendored 核函数库(未改)
+  operators/                  vendored 核函数库(仅一处自觉修改:排序加 stable,见 design.md §5)
 tests/                        精度契约、分块不变性、调度、掩码、文法、RL、legacy 语料、下游各阶段
 docs/design.md                设计文档
 ```
@@ -92,15 +92,22 @@ docs/design.md                设计文档
 
 | 项目 | 结果 |
 |---|---|
-| 测试 | 283 passed, 8 skipped(可选依赖 lightgbm / xgboost / tabpfn) |
+| 测试 | 303 passed, 8 skipped(可选依赖 lightgbm / xgboost / tabpfn) |
 | 掩码策略 / 分段 store / D 主序镜像 / 断点续算 | 与整体掩码、整块 store、无镜像、一次跑完逐 bit 相同 |
 | DT 三族 / NT 两族 / ND 面板 | 与逐股票 / 逐日 / 整面板直接调核逐 bit 相同 |
 | 分块不变性 | 任意分块与轮次结构逐 bit 不变(150 棵随机文法树) |
 | 植入信号 | 研究入口测得 IC 大于 0.25;GP 前 110 天挖出的池在后 50 天样本外 IC 大于 0.15 |
 | legacy 语料 | 1442 / 1498 解析,1429 / 1429 求值,1415 条有有限值(其余为缺字段、语料括号错位、库中无此函数) |
+| 加速器路径(本机 MPS 实跑) | 238 个可搜索算子:0 个只在加速器上失败、0 个后端缺核、0 处有限/NaN 版图变化、0 处超出归约顺序的值差异 |
 
 ## 未做
 
-只剩需要服务器的两项:`scripts/validate_gpu_parity.py`(CUDA)与 `scripts/compare_daily_store.py
---root`(真数据上派生日频字段 vs V2 日频 store)。两轴/三轴算子由面切换组合覆盖,不新增核函数。
-详见 design.md §10。
+只剩需要服务器**复跑**的两项,两个脚本本机都已跑过(一个换设备,一个换数据):
+
+```bash
+PYTHONPATH=src python scripts/validate_gpu_parity.py --device cuda      # 本机已用 --device mps 跑通
+PYTHONPATH=src python scripts/compare_daily_store.py --root /root/autodl-tmp/qmt_daily_data/fast_factor_compute
+```
+
+前者逐算子比对 CPU 与 CUDA,判据是各自离 float64 参照多远(见 design.md §5);后者比对派生日频字段
+与 V2 日频 store,退出码 0/1 即结论。两轴/三轴算子由面切换组合覆盖,不新增核函数。详见 design.md §10。

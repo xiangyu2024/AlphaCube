@@ -29,7 +29,7 @@ AlphaCube 只保留一个数据对象(立方体)、一份注册表、一个解�
 | shared | elementwise | 无 | 任意 | `add` … |
 
 `catalog.build_registry` 从 vendored 的核函数库(`src/alphacube/operators/`,与前项目逐字节
-相同)生成搜索注册表:DT 121 个、ND 48 个、NT 48 个(与 ND 同一函数对象)、共享 25 个,
+相同,**唯一一处自觉偏离见 §5 的稳定排序**)生成搜索注册表:DT 121 个、ND 48 个、NT 48 个(与 ND 同一函数对象)、共享 25 个,
 共 242 个。`rank`(与 cs_rank 重复)与 `indneutralize`(需行业码)刻意排除。参数烘焙变体
 沿用前项目。布尔输出(非根)与前视算子(不进搜索词表)由探针在构建期判定。
 
@@ -95,7 +95,33 @@ float 往返"一致;需要布尔掩码的核函数(参数名 `mask`/`*_mask`)在
 - NT 两族:与逐日在 `(M, S)` 面上调核**逐 bit 相同**(含跨列混合的 `nt_ts_spearman`)。
 - ND 面:与直接在 `(D, S)` 上调核**逐 bit 相同**。
 - 任意分块大小、任意轮次结构(含 S→D→S 落盘)结果**逐 bit 不变**;150 棵随机文法树上锁定。
-- 跨设备(CPU/CUDA)不承诺逐 bit。
+- 跨设备(CPU/CUDA/MPS)不承诺逐 bit,但承诺三件事(tests/test_device_parity.py,有加速器才跑):
+  **没有算子只在加速器上失败**(设备错配、`.numpy()`、漏 `device=` 都表现为此)、
+  **有限/NaN 版图不变**、**选择类算子**(`day_last` / `day_first` / `day_max` / `in_expand`,
+  取元素而非归约)**逐 bit 相同**。
+
+**float64 参照模式**:`CubeEngine(view, dtype="float64")` 把叶子、落盘、面板整条路径加宽。
+这不是生产模式(两倍内存,GPU 后端不收 float64),而是给 float32 答案一个可测量的真值。
+必要性:若干核函数经由灾难性抵消得到结果,它们**自身**的 float32 误差远大于任何设备差异——
+在 16×30×241 合成立方体上 `nt_ts_hurst` 离 float64 有 11296 ULP(相对 1.3e-3)、`nt_ts_skew` 7913、
+`in_zscore_rolling` 2950、`in_regres` 2742。所以"GPU 差了 3000 ULP"本身不能读作故障,
+必须问"CPU 差了多少"。注意 `day_mean` 内部 `x.float()` 会把 float64 收窄回 float32,
+这类核函数的参照值只是误差下界。
+
+**稳定排序(对 vendored 核函数库的唯一一处自觉修改)**:`torch.argsort` / `torch.sort` 默认
+**非稳定**,并列值的先后由后端自己决定。凡是输出"名次"或"用排序下标去取另一个张量"的核函数,
+并列一旦被换序,结果就变了——这是 **1/n 级**差异,不是 ULP 级。真实分钟数据并列极多
+(价格在最小变动价位格点上、成交量重复、停牌分钟为零),合成立方体里 Close 有 13.8% 的行、
+Volume 有 44.6% 的行至少一处并列;实测 MPS 与 CPU 给同一行的并列值互换名次。
+
+因此七处加上 `stable=True`,并列一律按下标先后(与 pandas `method="first"` 同约定):
+`common.rank`(→ `in_rank` / `cs_rank` / `nt_cs_rank`)、`nd_ts` 的 spearman 窗口排名、
+`legacy_specialized_dt` 的排名/近邻/取序下标三处、`legacy_specialized_nd` 的日期排序、
+`dt_in` 的 `in_sorted_cumsum_{forward,backward}`(用 a 的排序下标去 gather b)。
+**代价**:CPU 上并列处取值随之改变(合成盘 `in_rank` 影响 0.21% 的格点),与前项目的历史因子值
+不再逐 bit 相同;legacy 语料的验收数字未变(1442 解析 / 1429 求值 / 1415 有限)。
+**收益**:同一因子在 CPU 与 GPU 上取值相同、重复计算取值相同。
+tests/test_device_parity.py 钉住这两条。
 
 ## 6. 内存模型
 
@@ -202,10 +228,21 @@ API 变化:`FactorGCLCombiner.fit(panels, target, epochs, train_days=)` / `predi
   `day_last(in_regbeta(Ret, nt_cs_mean(Ret), 10))` 在一个 D 轮内求值且与逐日参考逐 bit 相同
   (tests/test_production.py::test_two_axis_factor_by_composition)。
 - 语料里 11 条括号错位与 8 条 `merge_and_forward_fill` 无法计算(库里没有该函数)。
-- CUDA 路径本机无法验证:`scripts/validate_gpu_parity.py` 在服务器上跑(逐算子 CPU/CUDA 差异 +
-  一代 GP);`scripts/compare_daily_store.py --root <计算根目录>` 在真数据上比对派生日频字段与
-  V2 日频 store(本机自校验:Open/High/Low/Close 逐 bit,Volume/Amount/Vwap/Return 为 float32
-  求和顺序量级 ~1e-7 的差异)。
+- **加速器路径已在本机 MPS 上实跑**,不再是"只有脚本":`scripts/validate_gpu_parity.py --device mps`
+  在 16×30×241 合成立方体上跑完全部 **238 个可搜索算子**,结果是
+  **0 个只在加速器上失败、0 个后端缺核、0 处有限/NaN 版图变化**;值差异只有 `in_rank` 一处不属于
+  归约顺序(见 §5 的并列排名)。这说明引擎的非 CPU 路径本身没有设备错配类缺陷。
+  CUDA 仍需服务器复跑同一脚本(`--device cuda`,默认值),因为 CUDA 的归约实现与 MPS 不同。
+- 脚本的读法:光看 ULP 数不能判断对错(见 §5 的 float64 参照),所以表格给的是
+  **两个设备各自离 float64 参照多远**,而不是它们互相差多少;判据是加速器误差是否超过 CPU 误差的
+  `--slack` 倍(默认 4)。探针的操作数与外包装一律用 `day_last`(选择而非归约):
+  用 `day_mean` 会让两个设备拿到不同输入,再被病态核函数放大成看起来像设备故障的东西,
+  而 float64 参照因 `day_mean` 内部收窄恰好继承 CPU 的舍入,比较就此对 GPU 不公平。
+- `scripts/compare_daily_store.py --root <计算根目录>` 在真数据上比对派生日频字段与 V2 日频 store
+  (本机自校验:Open/High/Low/Close 逐 bit,Volume/Amount/Vwap/Return 为 float32 求和顺序量级
+  ~1e-7 的差异)。`--root` 分支本身已由 tests/test_compare_daily_store.py 覆盖:日频 store 的
+  两个轴都造得比视图宽(前后补日期、交错插入多余股票),逼出**按标签而不是按位置对齐**;
+  轴对不上、字段缺失、字段被污染各有一条用例,退出码 0/1 可直接作服务器上的判据。
 
 ## 11. 与服务器数据的关系
 

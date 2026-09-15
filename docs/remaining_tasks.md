@@ -40,5 +40,34 @@
 | 7 两轴/三轴算子 | 以组合覆盖 | tests/test_production.py::test_two_axis_factor_by_composition,design.md §10 |
 | 8 日频比对脚本 | 完成(本机自校验) | `scripts/compare_daily_store.py`(`--self-check` OK;`--root` 待服务器) |
 | 9 check_store | 完成 | `scripts/check_store.py` |
-| 10 CUDA 验证 | 脚本就绪,待服务器 | `scripts/validate_gpu_parity.py` |
-| 11 真数据比对 | 待服务器 | `scripts/compare_daily_store.py --root ...` |
+| 10 CUDA 验证 | 本机已用 MPS 实跑并修掉发现的问题;CUDA 待服务器复跑 | `scripts/validate_gpu_parity.py`、`tests/test_device_parity.py`、`CubeEngine(dtype="float64")` |
+| 11 真数据比对 | `--root` 分支已在造出来的 V2 日频 store 上跑通;真数据待服务器 | `scripts/compare_daily_store.py`、`tests/test_compare_daily_store.py` |
+
+
+## 第四轮(2026-09-14 更晚):把 10、11 从"只有脚本"推到"本机能验的都验了"
+
+本机没有 CUDA,但有 MPS。任务 10 的实质是"引擎的非 CPU 路径有没有设备类缺陷",这一点换个
+加速器一样能问,于是把脚本从写死 CUDA 改成 `--device`,在 MPS 上真跑了一遍全部 **238 个可搜索
+算子**。结果:**0 个只在加速器上失败、0 个后端缺核、0 处有限/NaN 版图变化**——引擎本身没有
+设备错配类缺陷(漏 `device=`、`.numpy()`、主机端索引)。
+
+过程中三件事值得记下来,因为它们都是"看起来像结论、其实是量错了"的例子:
+
+1. **ULP 要记在值来源的量级上**。`in_demean` 的绝对差 7.6e-06 一度被算成"相对误差 133%",
+   因为它的输出被 `day_mean` 包成了解析意义上的 0。改用 `day_last` 收口(选择而非归约),
+   并把 ULP 参照量级下限设在面板 99 分位,7.6e-06 就还原成它本来的样子:100 量级上的 1 个 ULP。
+2. **光看 ULP 数判不了对错**。若干核函数经灾难性抵消得结果,自身 float32 误差就有上万 ULP
+   (`nt_ts_hurst` 11296 ULP ≈ 相对 1.3e-3)。所以给引擎加了 `dtype="float64"` 参照模式,
+   表格改成报**两个设备各自离 float64 多远**,判据是加速器误差是否超 CPU 的 `--slack` 倍。
+3. **探针的操作数必须两个设备完全相同**。原先 ND 面探针喂 `day_mean(Close)`,两设备输入就已不同,
+   再被 `ts_regbeta` 这类病态核函数放大 70 倍,看着像设备故障;更糟的是 `day_mean` 内部
+   `x.float()` 收窄,float64 参照恰好继承 CPU 的舍入,比较对 GPU 不公平。换成 `day_last` 后,
+   8 个"可疑"算子里 7 个消失。
+
+剩下的第 8 个是真的:**`common.rank` 走非稳定 `argsort`,并列值的名次在不同后端互换**(1/n 级,
+不是 ULP 级)。经确认后给七处排序加了 `stable=True`(见 design.md §5),这是对 vendored 核函数库
+唯一一处自觉修改;改完 238 个算子全部落在归约顺序噪声内,legacy 语料验收数字不变。
+
+任务 11 这边,`--root` 分支此前从未执行过。现在造了一份 V2 日频 store 做测试夹具,并且**两个轴
+都造得比视图宽**(前后补日期、交错插入多余股票),逼出按标签而不是按位置对齐;轴对不上、字段缺失、
+字段被污染各有一条用例。脚本也从"只打印"改成返回 0/1,服务器上可直接当判据用。

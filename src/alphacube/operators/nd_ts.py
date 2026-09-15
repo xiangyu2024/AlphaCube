@@ -509,7 +509,7 @@ def ts_spearman(data: torch.Tensor, d: int, abs_corr: bool = False, agg: str = "
     mask = ~torch.isnan(windows)
 
     x_filled = torch.where(mask, windows, torch.full_like(windows, float("inf")))
-    ranks = torch.argsort(torch.argsort(x_filled, dim=1), dim=1).to(windows.dtype)
+    ranks = torch.argsort(torch.argsort(x_filled, dim=1, stable=True), dim=1, stable=True).to(windows.dtype)
     ranks = torch.where(mask, ranks, torch.full_like(ranks, float("nan")))
 
     rank_mean = torch.nanmean(ranks, dim=1, keepdim=True)

@@ -8,10 +8,11 @@ through ``is_gt0`` or a NaN-aware reducer), and hands results on:
 
 - roots and degenerate nodes crossing modes -> in-memory ``(S, D)`` panels
   (column 0; exact for minute-degenerate values);
-- full-width nodes crossing modes -> a ``(S, D, M)`` float32 memmap in
-  ``workdir`` (deleted at the end).
+- full-width nodes crossing modes -> a ``(S, D, M)`` memmap in ``workdir``
+  (deleted at the end).
 
-Panel rounds run whole ``(D, S)`` tensors on ``device``.
+Panel rounds run whole ``(D, S)`` tensors on ``device``. ``dtype="float64"``
+widens the whole path for a reference run (see the constructor).
 """
 
 from __future__ import annotations
@@ -49,17 +50,32 @@ class CubeEngine:
     def __init__(self, view: CubeView, device: str = "cpu", chunk_symbols: Optional[int] = None,
                  chunk_days: Optional[int] = None, chunk_bytes: int = 2 << 30,
                  apply_mask: bool = True, mask_policy: str = "boundaries",
-                 workdir: Optional[os.PathLike] = None, torch_threads: Optional[int] = None) -> None:
+                 workdir: Optional[os.PathLike] = None, torch_threads: Optional[int] = None,
+                 dtype: str = "float32") -> None:
         """``mask_policy``: "all" re-applies the stock-day mask at every computed
         node; "boundaries" (default) only where a fake finite value could leak
         -- inputs of day-axis / NT operators and values leaving a round -- which
         is provably the same result (an intraday node only affects its own
         stock-day) at a fraction of the masking cost. Locked by
-        tests/test_engine.py::test_mask_policies_agree."""
+        tests/test_engine.py::test_mask_policies_agree.
+
+        ``dtype``: "float32" is the production contract (and what the legacy
+        corpus was validated against). "float64" widens leaves, boundaries and
+        panels, which is not a production mode -- it costs twice the memory and
+        no GPU backend takes it -- but gives a *reference* answer to measure the
+        float32 one against: several kernels (``in_zscore_rolling``,
+        ``in_regres``, ``ts_skew``, ``ts_hurst``) reach the float32 result
+        through catastrophic cancellation, and their own rounding error is far
+        larger than any difference between two devices. See
+        scripts/validate_gpu_parity.py --ref64."""
         if mask_policy not in ("all", "boundaries"):
             raise ValueError("mask_policy must be 'all' or 'boundaries'")
+        if dtype not in ("float32", "float64"):
+            raise ValueError("dtype must be 'float32' or 'float64'")
         self.view = view
         self.device = torch.device(device)
+        self.dtype = torch.float32 if dtype == "float32" else torch.float64
+        self.np_dtype = np.float32 if dtype == "float32" else np.float64
         self.chunk_symbols = chunk_symbols
         self.chunk_days = chunk_days
         self.chunk_bytes = int(chunk_bytes)
@@ -139,7 +155,7 @@ class CubeEngine:
                         p = self._leaf_panel(node.expr)
                     else:
                         p = panels[node.key]
-                    out[i] = np.ascontiguousarray(p.T, dtype=np.float32)     # (D, S)
+                    out[i] = np.ascontiguousarray(p.T, dtype=self.np_dtype)   # (D, S)
             for b in bounds.values():
                 stats["boundary_bytes"] += float(b.nbytes)
         finally:
@@ -155,7 +171,7 @@ class CubeEngine:
         """A bare degenerate leaf root (a Constant) as an (S, D) panel."""
         S, D = self.view.n_symbols, self.view.n_days
         if isinstance(expr, Constant):
-            p = np.full((S, D), expr.value, dtype=np.float32)
+            p = np.full((S, D), expr.value, dtype=self.np_dtype)
             if self._mask_needed:
                 p[~self.view.tradable()] = np.nan
             return p
@@ -172,20 +188,20 @@ class CubeEngine:
 
     def _load_leaf_cube(self, expr: Expression, mode: str, lo: int, hi: int, tradable: torch.Tensor) -> torch.Tensor:
         if isinstance(expr, Constant):
-            return torch.full((1, 1, 1), expr.value, dtype=torch.float32, device=self.device)
+            return torch.full((1, 1, 1), expr.value, dtype=self.dtype, device=self.device)
         arr = self.view.read_s(expr.field, lo, hi) if mode == MODE_S else self.view.read_d(expr.field, lo, hi)
-        t = torch.from_numpy(arr).to(self.device)
+        t = torch.from_numpy(arr).to(self.device, self.dtype)
         return self._mask_cube(t, tradable)
 
     def _panel_slice(self, key: str, panels: Dict[str, np.ndarray], mode: str, lo: int, hi: int) -> torch.Tensor:
         p = panels[key]
         sl = p[lo:hi, :] if mode == MODE_S else p[:, lo:hi]
-        return torch.from_numpy(np.ascontiguousarray(sl)).to(self.device).unsqueeze(-1)
+        return torch.from_numpy(np.ascontiguousarray(sl)).to(self.device, self.dtype).unsqueeze(-1)
 
     def _bound_slice(self, key: str, bounds: Dict[str, np.memmap], mode: str, lo: int, hi: int) -> torch.Tensor:
         b = bounds[key]
         sl = b[lo:hi] if mode == MODE_S else b[:, lo:hi]
-        return torch.from_numpy(np.ascontiguousarray(sl)).to(self.device)
+        return torch.from_numpy(np.ascontiguousarray(sl)).to(self.device, self.dtype)
 
     def _run_cube_chunk(self, rnd: Round, lo: int, hi: int, panels, bounds, tmp, tolerant: bool) -> None:
         mode = rnd.mode
@@ -233,8 +249,8 @@ class CubeEngine:
             if n.panel_out:
                 p = panels.get(n.key)
                 if p is None:
-                    p = panels[n.key] = np.full((S, D), np.nan, dtype=np.float32)
-                col = out[..., 0].float() if out.dtype == torch.bool else out[..., 0]
+                    p = panels[n.key] = np.full((S, D), np.nan, dtype=self.np_dtype)
+                col = out[..., 0].to(self.dtype) if out.dtype == torch.bool else out[..., 0]
                 if col.shape[0] == 1 and col.shape[1] == 1:
                     col = col.expand(hi - lo if mode == MODE_S else S, D if mode == MODE_S else hi - lo)
                 arr = col.detach().cpu().numpy()
@@ -245,12 +261,12 @@ class CubeEngine:
                 else:
                     p[:, lo:hi] = arr
             if n.boundary:
-                arr = (out.float() if out.dtype == torch.bool else out).detach().cpu().numpy()
+                arr = (out.to(self.dtype) if out.dtype == torch.bool else out).detach().cpu().numpy()
                 b = bounds.get(n.key)
                 if b is None:
                     # width comes from the RESULT: a width-changing call (in_slice) is narrower than M
                     path = Path(tmp.name) / f"bound_{len(bounds):04d}.npy"
-                    b = bounds[n.key] = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32,
+                    b = bounds[n.key] = np.lib.format.open_memmap(path, mode="w+", dtype=self.np_dtype,
                                                                    shape=(S, D, int(arr.shape[-1])))
                 if mode == MODE_S:
                     b[lo:hi] = arr
@@ -270,11 +286,11 @@ class CubeEngine:
 
         def operand(c: Node) -> torch.Tensor:
             if isinstance(c.expr, Constant):
-                return torch.full((1, 1), c.expr.value, dtype=torch.float32, device=self.device)
+                return torch.full((1, 1), c.expr.value, dtype=self.dtype, device=self.device)
             if c.key in values:
                 return values[c.key]
             if c.key in panels:
-                return torch.from_numpy(np.ascontiguousarray(panels[c.key].T)).to(self.device)
+                return torch.from_numpy(np.ascontiguousarray(panels[c.key].T)).to(self.device, self.dtype)
             raise RuntimeError(f"panel operand {c.key} unavailable")
 
         for n in rnd.nodes:
@@ -301,12 +317,12 @@ class CubeEngine:
             values[n.key] = out
             if n.is_root or n.panel_out:
                 if out.dtype == torch.bool:
-                    out = out.float()
+                    out = out.to(self.dtype)
                 if out.shape[0] == 1 and out.shape[1] == 1:
                     out = out.expand(self.view.n_days, self.view.n_symbols)
                     if self._mask_needed:
                         out = torch.where(tradable_ds, out, torch.full((), float("nan"), dtype=out.dtype, device=out.device))
-                panels[n.key] = np.ascontiguousarray(out.detach().cpu().numpy().T, dtype=np.float32)
+                panels[n.key] = np.ascontiguousarray(out.detach().cpu().numpy().T, dtype=self.np_dtype)
 
 
 __all__ = ["CubeEngine", "EvalResult"]

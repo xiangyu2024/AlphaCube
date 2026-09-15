@@ -387,7 +387,7 @@ def compute_ttm(
     valid = pub_mask & ~torch.isnan(values_exp)
 
     # 按 stat_date 降序排序
-    _, indices = torch.sort(dates_exp.where(valid, -1), dim=2, descending=True)
+    _, indices = torch.sort(dates_exp.where(valid, -1), dim=2, descending=True, stable=True)
     sorted_values = torch.gather(values_exp, 2, indices)
     sorted_valid = torch.gather(valid, 2, indices)
 
