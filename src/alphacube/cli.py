@@ -118,6 +118,7 @@ def cmd_mine(a) -> int:
         presqueeze=(dict(n_iterations=a.presqueeze) if a.presqueeze else None), gp_params=gp,
         allow_boolean_ops=a.allow_boolean_ops, allow_resource_risk=a.allow_resource_risk,
         checkpoint_every=a.checkpoint_every,
+        skip_kernels=tuple(x for x in a.skip_kernels.split(",") if x),
         workdir=a.workdir,
         max_expr_len=a.max_expr_len, combine_methods=tuple(x for x in a.combine.split(",") if x),
         combine_train_frac=a.combine_train_frac, out_root=a.out, run_id=a.run_id,
@@ -182,6 +183,12 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--max-depth", type=int, default=4)
     m.add_argument("--max-expr-len", type=int, default=20, help="RL token budget per expression")
     m.add_argument("--pool-capacity", type=int, default=10)
+    m.add_argument("--skip-kernels", default="",
+                   help="comma list of operators the search may BREED but never EVALUATE (scored -inf "
+                        "unevaluated). Unlike dropping them from the vocabulary, this leaves every RNG "
+                        "draw where it was, so a run reproduces an earlier one exactly up to the first "
+                        "refusal -- use it with --allow-resource-risk to replay a run that was poisoned "
+                        "by an expensive operator")
     m.add_argument("--checkpoint-every", type=int, default=0,
                    help="write the ranked archive to <run>/checkpoints/archive_gen<N>.csv every N "
                         "generations. Without it the expressions exist only in memory until the whole "

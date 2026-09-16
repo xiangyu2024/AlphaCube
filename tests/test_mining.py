@@ -218,3 +218,64 @@ def test_archive_checkpoints_survive_an_interrupted_run(registry, view, tmp_path
     # and the archive only grows, so a later checkpoint is never poorer than an earlier one
     early = list(csv.DictReader(files[0].open(encoding="utf-8")))
     assert len(rows) >= len(early)
+
+
+def test_skip_kernels_reproduces_the_trajectory_until_the_first_refusal(registry, view):
+    """Refusing a tree at EVALUATION time is not the same as removing its operator
+    from the vocabulary, and the difference is the whole point.
+
+    The generator draws operators from the vocabulary using the miner's RNG, so
+    dropping one shifts every subsequent draw: a re-run diverges from generation 1
+    and the factors found before the problem are gone with it. Keeping the
+    vocabulary intact and scoring the offending tree -inf unevaluated leaves the
+    draw sequence untouched, so every generation up to the first refusal is
+    reproduced exactly.
+
+    That is what lets a run poisoned at generation 14 by an expensive operator be
+    replayed: generations 1-13 come back identical, and only from 14 on does
+    selection differ -- this time without burning hours on the tree."""
+    from alphacube.label import Label
+    from alphacube.mining.pool import MsePool
+
+    target = Label("close", 1).compute(view)
+
+    def run(skip, dropped):
+        reg_specs = {s.name for s in registry.searchable()}
+        assert not dropped or dropped <= reg_specs
+        m = GPMiner(registry, view, target, MsePool(4, target), population_size=8, max_depth=3,
+                    min_depth=2, skip_kernels=skip, seed=5)
+        pops = []
+        orig = m.fitness
+
+        def spy(pop):
+            pops.append([e.key() for e in pop])
+            return orig(pop)
+
+        m.fitness = spy
+        m.mine(40)
+        return pops, m
+
+    base_pops, base = run(frozenset(), set())
+    assert base.skipped == 0
+
+    # Refuse something the search actually uses, so there IS a first refusal.
+    used = [k for pop in base_pops for k in pop]
+    victim = next(n for n in ("day_mean", "day_std", "cs_rank", "ts_mean")
+                  if any(f"O:{n}(" in k for k in used))
+    skip_pops, skipped = run(frozenset({victim}), {victim})
+    assert skipped.skipped > 0, "the victim must actually have been bred and refused"
+
+    first_hit = next(i for i, pop in enumerate(base_pops)
+                     if any(f"O:{victim}(" in k for k in pop))
+    assert base_pops[:first_hit + 1] == skip_pops[:first_hit + 1], \
+        "every generation up to and including the first refusal must be identical"
+
+    # ... and dropping the operator from the vocabulary instead diverges immediately
+    dropped = GPMiner(registry, view, target, MsePool(4, target), population_size=8, max_depth=3,
+                      min_depth=2, seed=5)
+    dropped.generator.specs = [s for s in dropped.generator.specs if s.name != victim]
+    for key in list(dropped.generator._producers):
+        dropped.generator._producers[key] = [s for s in dropped.generator._producers[key]
+                                             if s.name != victim]
+    first = [e.key() for e in dropped.generator.generate_population(8)]
+    assert first != base_pops[0], "removing it from the vocabulary must shift the very first draw"

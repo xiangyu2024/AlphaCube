@@ -63,7 +63,8 @@ class GPMiner:
                  cull_rel_threshold: float = 0.5, merge_threshold: float = 0.8, panel_cache_items: int = 512,
                  device: str = "cpu", chunk_symbols: Optional[int] = None, chunk_days: Optional[int] = None,
                  fields: Optional[Sequence[str]] = None, allow_boolean_ops: bool = False,
-                 allow_resource_risk: bool = False, checkpoint_dir: Optional[os.PathLike] = None,
+                 allow_resource_risk: bool = False, skip_kernels: "frozenset[str]" = frozenset(),
+                 checkpoint_dir: Optional[os.PathLike] = None,
                  checkpoint_every: int = 0,
                  workdir: Optional[os.PathLike] = None, seed: int = 0) -> None:
         self.registry = registry
@@ -87,6 +88,16 @@ class GPMiner:
         # interrupted before then leaves nothing at all -- no expressions, no scores.
         # checkpoint_every writes the ranked archive after every Nth generation so the
         # work so far is always recoverable.
+        # Kernels the search may BREED but must never EVALUATE. This is not the same
+        # as leaving them out of the vocabulary, and the difference matters when you
+        # want to reproduce an earlier run: the generator draws from the vocabulary
+        # with the miner's RNG, so removing an operator shifts every later draw and
+        # the whole trajectory diverges from generation 1. Keeping the vocabulary
+        # intact and refusing the tree at evaluation time instead leaves the draws
+        # untouched, so every generation up to the first refusal is reproduced
+        # exactly, and only from there on does selection differ.
+        self.skip_kernels = frozenset(skip_kernels)
+        self.skipped = 0
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
         self.checkpoint_every = max(0, int(checkpoint_every))
         if self.checkpoint_dir and self.checkpoint_every:
@@ -108,10 +119,18 @@ class GPMiner:
         self.evaluated = 0
 
     # -- fitness ---------------------------------------------------------------------
+    def _refused(self, expr: Expression) -> bool:
+        if not self.skip_kernels:
+            return False
+        return any(n.spec is not None and n.spec.name in self.skip_kernels for n in expr.nodes())
+
     def _panels(self, population: Sequence[Expression]) -> List[Optional[np.ndarray]]:
         out: List[Optional[np.ndarray]] = [None] * len(population)
         todo: Dict[str, List[int]] = {}
         for i, e in enumerate(population):
+            if self._refused(e):          # bred, but never handed to the engine
+                self.skipped += 1
+                continue
             k = e.key()
             if k in self._panel_cache:
                 out[i] = self._panel_cache[k]

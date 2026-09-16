@@ -117,6 +117,7 @@ def run_mining(
     presqueeze: Optional[dict] = None,
     allow_boolean_ops: bool = False,
     allow_resource_risk: bool = False,
+    skip_kernels: Sequence[str] = (),
     checkpoint_every: int = 0,
     workdir: Optional[Union[str, Path]] = None,
     gp_params: Optional[dict] = None,
@@ -179,7 +180,8 @@ def run_mining(
         m = GPMiner(reg, view, target, pool_obj, seed=seed, device=device, min_coverage=min_coverage,
                     chunk_symbols=chunk_symbols, chunk_days=chunk_days,
                     allow_boolean_ops=allow_boolean_ops, allow_resource_risk=allow_resource_risk,
-                    checkpoint_dir=ckpt_dir, checkpoint_every=checkpoint_every, workdir=workdir, **gp)
+                    skip_kernels=frozenset(skip_kernels), checkpoint_dir=ckpt_dir,
+                    checkpoint_every=checkpoint_every, workdir=workdir, **gp)
         rep = m.mine(budget, on_generation=lambda g, n, s: progress(g, n, s))
         added, evaluated, engine_s = rep.added, rep.evaluated, rep.engine_seconds
         summary = f"{rep.generations} generations, archive {rep.archive_size}, best |IC| {rep.best_fitness:+.4f}"
