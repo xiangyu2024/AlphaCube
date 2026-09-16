@@ -122,3 +122,63 @@ def test_trivial_boolean_ops_are_out_of_the_action_set_by_default(registry):
     on = TypedTreeGenerator(registry, n_minutes=24, seed=6, allow_boolean_ops=True)
     assert any(n.spec.name in boolean for e in on.generate_population(200)
                for n in e.nodes() if n.spec is not None), "the switch must actually let them back in"
+
+
+def test_panel_cache_is_configurable_and_bounded(registry, view):
+    """A cache miss re-reads every field the tree touches -- 9.1 GB each on the
+    production cube -- so the cache size is the difference between a 4-minute
+    generation and a 50-minute one. It was reachable only by constructing GPMiner
+    directly; `cli mine --panel-cache` and train.py's gp_params now set it."""
+    from alphacube.label import Label
+    from alphacube.mining.pool import MsePool
+
+    target = Label("close", 1).compute(view)
+    miner = GPMiner(registry, view, target, MsePool(4, target), population_size=6,
+                    max_depth=3, panel_cache_items=5, seed=1)
+    miner.mine(24)
+    assert len(miner._panel_cache) <= 5, "the LRU bound must hold"
+    assert miner._panel_cache_items == 5
+
+    big = GPMiner(registry, view, target, MsePool(4, target), population_size=6,
+                  max_depth=3, panel_cache_items=500, seed=1)
+    big.mine(24)
+    # same seed, same answer -- the cache is a speed device, never a semantic one
+    assert len(big._panel_cache) > len(miner._panel_cache)
+    assert big.pool.size == miner.pool.size
+
+
+def test_resource_risk_ops_are_out_of_the_action_set_by_default(registry):
+    """calculate.py has always refused to compute a factor containing ts_pearson,
+    nt_ts_pearson, nt_ts_spearman or in_multireg without --allow-resource-risk,
+    because their cost grows super-linearly in the stock count -- the NT pair
+    kernels correlate every stock against every other, once per day, which on the
+    production cube is 5219^2 pairs x 1942 days.
+
+    The search vocabulary did not have that guard, so GP was free to breed one.
+    On a full-market run it did, in generation 14, and that generation was still
+    running 78 minutes later against a 4-minute norm. Both paths now read the same
+    set, so they cannot drift apart again."""
+    from alphacube.calculate import DEFERRED_RESOURCE_OPERATORS
+    from alphacube.catalog import RESOURCE_RISK_KERNELS
+    from alphacube.mining.tokens import Vocabulary
+
+    assert DEFERRED_RESOURCE_OPERATORS is RESOURCE_RISK_KERNELS, "one definition, not two"
+    risky = {s.name for s in registry.list_all() if s.resource_risk}
+    assert risky and risky <= RESOURCE_RISK_KERNELS
+
+    # Registry.searchable() itself answers "what exists"; the opting out happens at
+    # the miner, the same way include_boolean does, so that a caller asking the
+    # registry a question is never silently given a filtered answer.
+    gated = {s.name for s in registry.searchable(include_boolean=False, include_resource_risk=False)}
+    assert gated.isdisjoint(risky)
+    assert risky <= {s.name for s in registry.searchable()}
+
+    for flag in (False, True):
+        gen = TypedTreeGenerator(registry, n_minutes=24, seed=7, max_depth=5, allow_resource_risk=flag)
+        vocab = Vocabulary(registry, n_minutes=24, allow_resource_risk=flag)
+        assert (({s.name for s in gen.specs} & risky) == risky) is flag
+        assert (({s.name for s in vocab.operators} & risky) == risky) is flag
+
+    off = TypedTreeGenerator(registry, n_minutes=24, seed=8, max_depth=5, allow_resource_risk=False)
+    assert not any(n.spec.name in risky for e in off.generate_population(300)
+                   for n in e.nodes() if n.spec is not None)

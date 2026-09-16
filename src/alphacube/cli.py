@@ -107,7 +107,8 @@ def cmd_calculate(a) -> int:
 def cmd_mine(a) -> int:
     from .pipeline import run_mining
 
-    gp = dict(population_size=a.population, max_depth=a.max_depth, min_depth=a.min_depth, top_k=a.top_k)
+    gp = dict(population_size=a.population, max_depth=a.max_depth, min_depth=a.min_depth, top_k=a.top_k,
+              panel_cache_items=a.panel_cache)
     res = run_mining(
         a.store, start=a.start, end=a.end, max_symbols=a.max_symbols, warmup=a.warmup, label=a.label,
         label_params=_kv(a.label_param), horizon=a.horizon, miner=a.miner, budget=a.budget, seed=a.seed,
@@ -115,7 +116,8 @@ def cmd_mine(a) -> int:
         pool_capacity=a.pool_capacity, dedup=a.dedup, min_coverage=a.min_coverage, meanstd_lr=a.meanstd_lr,
         meanstd_steps=a.meanstd_steps, dynamic_window=a.dynamic_window, seed_library=a.seed_library,
         presqueeze=(dict(n_iterations=a.presqueeze) if a.presqueeze else None), gp_params=gp,
-        allow_boolean_ops=a.allow_boolean_ops, workdir=a.workdir,
+        allow_boolean_ops=a.allow_boolean_ops, allow_resource_risk=a.allow_resource_risk,
+        workdir=a.workdir,
         max_expr_len=a.max_expr_len, combine_methods=tuple(x for x in a.combine.split(",") if x),
         combine_train_frac=a.combine_train_frac, out_root=a.out, run_id=a.run_id,
     )
@@ -179,6 +181,11 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--max-depth", type=int, default=4)
     m.add_argument("--max-expr-len", type=int, default=20, help="RL token budget per expression")
     m.add_argument("--pool-capacity", type=int, default=10)
+    m.add_argument("--panel-cache", type=int, default=512,
+                   help="how many evaluated (D, S) panels GP keeps, LRU. A miss costs a full re-read of "
+                        "every field the tree touches -- 9.1 GB each on the production cube -- so on a big "
+                        "machine this is the cheapest speed knob there is. One panel is n_days x n_symbols x 4 "
+                        "bytes (40 MB at 1942 x 5219), so 512 is ~21 GB and 2048 is ~83 GB")
     m.add_argument("--top-k", type=int, default=None)
     m.add_argument("--dedup", type=float, default=0.99)
     m.add_argument("--min-coverage", type=float, default=0.5)
@@ -189,6 +196,10 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--seed", type=int, default=0)
     m.add_argument("--seed-library", default=None, help="seed the pool from a seed_alpha_library yaml first")
     m.add_argument("--presqueeze", type=int, default=0, help="feature-boosting pre-squeeze iterations before mining (0 = off)")
+    m.add_argument("--allow-resource-risk", action="store_true",
+                   help="let the search use ts_pearson / nt_ts_pearson / nt_ts_spearman, whose cost is "
+                        "super-linear in the stock count (the NT pair kernels are 5219^2 pairs x 1942 days "
+                        "on the production cube). Off by default; calculate.py has always deferred them")
     m.add_argument("--allow-boolean-ops", action="store_true",
                    help="let the search use the 29 strictly-0/1 operators (eq, is_gt0, cs_quantile_q50, ...). "
                         "Off by default: they cannot be a root, but arithmetic launders them into one "

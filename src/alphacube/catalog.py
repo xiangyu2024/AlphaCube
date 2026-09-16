@@ -39,6 +39,13 @@ WINDOWS = {
 CONSTANTS = (-5.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 5.0)
 
 LOOKAHEAD_KERNELS = frozenset({"ts_shift", "cross_shift", "in_local_mean"})
+# Kernels whose cost grows super-linearly in the stock count. ``ts_pearson`` and
+# friends correlate every column against every other, so on the NT face -- called
+# once per day on a (minutes, stocks) face -- that is 5219^2 pairs x 1942 days on
+# the production cube. calculate.py has always deferred these; the search
+# vocabulary did not, and one of them landed in generation 14 of a full-market run
+# and was still going 78 minutes later, against a 4-minute norm.
+RESOURCE_RISK_KERNELS = frozenset({"ts_pearson", "nt_ts_pearson", "nt_ts_spearman", "in_multireg"})
 # Kernels deliberately left out of the registry (recorded in Registry.skipped):
 EXCLUDED_KERNELS = {
     "rank": "duplicate of cs_rank (same percentile rank across stocks); keep one name",
@@ -262,7 +269,8 @@ class Registry:
     def by_face(self, face: str) -> List[OpSpec]:
         return [s for s in self._ops.values() if s.face == face]
 
-    def searchable(self, include_boolean: bool = True) -> List[OpSpec]:
+    def searchable(self, include_boolean: bool = True,
+                   include_resource_risk: bool = True) -> List[OpSpec]:
         """Operators a search vocabulary may use: everything not forward-looking.
 
         ``include_boolean=False`` also drops the operators flagged
@@ -279,7 +287,8 @@ class Registry:
         cannot collapse, so they carry real cross-sectional information and are
         worth searching."""
         return [s for s in self._ops.values() if not s.lookahead
-                and (include_boolean or not s.trivial_boolean)]
+                and (include_boolean or not s.trivial_boolean)
+                and (include_resource_risk or not s.resource_risk)]
 
 
 CUBE_FIELDS = ("Open", "High", "Low", "Close", "Volume", "Vwap", "Ret", "Amt")
@@ -302,6 +311,7 @@ def _make_spec(name: str, face: str, family: str, category: str, meta: dict,
         lookahead=(kernel_id.split(".")[-1] in LOOKAHEAD_KERNELS),
         boolean_output=(distinct <= 2), coarse_output=(2 < distinct <= 3),
         trivial_boolean=(distinct <= 2 and _probe_constant_capable(fn, category, restores)),
+        resource_risk=(name in RESOURCE_RISK_KERNELS or kernel_id.split(".")[-1] in RESOURCE_RISK_KERNELS),
         windows=WINDOWS.get(face, ()),
     )
 

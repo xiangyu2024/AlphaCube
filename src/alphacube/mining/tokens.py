@@ -74,13 +74,14 @@ class Vocabulary:
     def __init__(self, registry: Registry, fields: Optional[Sequence[str]] = None,
                  constants: Optional[Sequence[float]] = None, windows: Optional[Sequence[int]] = None,
                  n_minutes: int = 241, include_lookahead: bool = False,
-                 allow_boolean_ops: bool = False) -> None:
+                 allow_boolean_ops: bool = False, allow_resource_risk: bool = False) -> None:
         self.registry = registry
         self.n_minutes = int(n_minutes)
         self.fields = list(fields) if fields is not None else list(registry.fields)
         self.constants = [float(c) for c in (constants if constants is not None else registry.constants)]
         specs = (registry.list_all() if include_lookahead
-                 else registry.searchable(include_boolean=allow_boolean_ops))
+                 else registry.searchable(include_boolean=allow_boolean_ops,
+                                          include_resource_risk=allow_resource_risk))
         self.allow_boolean_ops = bool(allow_boolean_ops)
         self.operators: List[OpSpec] = sorted(specs, key=lambda s: s.name)
         if windows is None:

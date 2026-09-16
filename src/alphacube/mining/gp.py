@@ -62,6 +62,7 @@ class GPMiner:
                  cull_rel_threshold: float = 0.5, merge_threshold: float = 0.8, panel_cache_items: int = 512,
                  device: str = "cpu", chunk_symbols: Optional[int] = None, chunk_days: Optional[int] = None,
                  fields: Optional[Sequence[str]] = None, allow_boolean_ops: bool = False,
+                 allow_resource_risk: bool = False,
                  workdir: Optional[os.PathLike] = None, seed: int = 0) -> None:
         self.registry = registry
         self.view = view
@@ -81,7 +82,8 @@ class GPMiner:
         self._rng = random.Random(seed)
         self.generator = TypedTreeGenerator(registry, fields=fields, n_minutes=view.n_minutes,
                                             min_depth=min_depth, max_depth=max_depth,
-                                            allow_boolean_ops=allow_boolean_ops, rng=self._rng)
+                                            allow_boolean_ops=allow_boolean_ops,
+                                            allow_resource_risk=allow_resource_risk, rng=self._rng)
         self.engine = CubeEngine(view, device=device, chunk_symbols=chunk_symbols, chunk_days=chunk_days,
                                  workdir=workdir)
         self.target = np.asarray(target, dtype=np.float64)

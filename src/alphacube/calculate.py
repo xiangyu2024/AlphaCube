@@ -28,9 +28,9 @@ from .expression import Expression, max_window
 from .research import inline_references, parse_many, safe_names, warmed_view
 from .store import CubeStore, SegmentedCubeStore, open_cube_store
 
-# Operators whose full-market memory footprint is super-linear in the stock
-# count; deferred until explicitly allowed (same policy as the previous project).
-DEFERRED_RESOURCE_OPERATORS = frozenset({"ts_pearson", "nt_ts_pearson", "nt_ts_spearman", "in_multireg"})
+# One definition, shared with the search vocabulary (catalog.Registry.searchable
+# drops these unless asked), so the production path and the miner cannot drift.
+from .catalog import RESOURCE_RISK_KERNELS as DEFERRED_RESOURCE_OPERATORS
 STATUS_ORDER = ("SUCCESS", "EVAL_FAILED", "NOT_DAILY", "PARSE_FAILED", "DEFERRED_RESOURCE_RISK")
 
 

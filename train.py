@@ -42,9 +42,16 @@ if __name__ == "__main__":
         device="cpu",                # "cuda" 上服务器;跨设备不承诺逐 bit
         chunk_symbols=None,          # None = 按 2 GB 预算自动定块
         chunk_days=None,
-        gp_params=dict(population_size=24, max_depth=4, min_depth=2, top_k=None),
+        gp_params=dict(population_size=24, max_depth=4, min_depth=2, top_k=None,
+                       # 一张面板 = n_days x n_symbols x 4 字节(全市场 1942x5219 约 40 MB)。
+                       # 缓存未命中要把这棵树碰到的每个字段重读一遍(每个 9.1 GB),
+                       # 所以内存大的机器上这是最便宜的提速手段。512 约 21 GB。
+                       panel_cache_items=512),
         rl_params=dict(),            # 例:dict(episodes_per_update=8) / dict(tail_alpha=0.9)
         max_expr_len=20,             # RL 每条表达式的 token 上限
+        allow_resource_risk=False,   # 是否允许 ts_pearson / nt_ts_pearson / nt_ts_spearman 进入搜索。
+                                     # 它们的代价随股票数超线性(NT 面是逐日 5219^2 对 x 1942 天),
+                                     # 全市场上一棵这样的树就能让一代从 4 分钟变成 78 分钟以上
         allow_boolean_ops=False,     # 是否让搜索使用 29 个严格 0/1 的算子(eq / is_gt0 / cs_quantile_q50 …)。
                                      # 默认否:它们本就不能当根,但 pow_05(eq(a, b)) 这类算术会把它们洗成合法根,
                                      # 得到的近似常数指示变量会拿到虚高的 IC

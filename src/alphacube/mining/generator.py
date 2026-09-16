@@ -54,6 +54,7 @@ class TypedTreeGenerator:
                  min_depth: int = 2, max_depth: int = 4, feature_leaf_prob: float = 0.8,
                  grow_leaf_prob: float = 0.3, max_retries: int = 16,
                  include_lookahead: bool = False, allow_boolean_ops: bool = False,
+                 allow_resource_risk: bool = False,
                  rng: Optional[random.Random] = None, seed: int = 0) -> None:
         self.registry = registry
         self.fields = list(fields) if fields is not None else list(registry.fields)
@@ -66,7 +67,8 @@ class TypedTreeGenerator:
         self.max_retries = int(max_retries)
         self._rng = rng if rng is not None else random.Random(seed)
         specs = (registry.list_all() if include_lookahead
-                 else registry.searchable(include_boolean=allow_boolean_ops))
+                 else registry.searchable(include_boolean=allow_boolean_ops,
+                                          include_resource_risk=allow_resource_risk))
         self.allow_boolean_ops = bool(allow_boolean_ops)
         self.specs: List[OpSpec] = specs
         # operators grouped by what they can produce

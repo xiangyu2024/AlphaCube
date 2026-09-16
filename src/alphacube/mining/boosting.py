@@ -41,9 +41,11 @@ def default_field_groups(fields: Sequence[str]) -> Dict[str, List[str]]:
     return {k: v for k, v in groups.items() if v}
 
 
-def default_operator_groups(registry: Registry, allow_boolean_ops: bool = False) -> Dict[str, List[str]]:
+def default_operator_groups(registry: Registry, allow_boolean_ops: bool = False,
+                            allow_resource_risk: bool = False) -> Dict[str, List[str]]:
     groups: Dict[str, List[str]] = {}
-    for s in registry.searchable(include_boolean=allow_boolean_ops):
+    for s in registry.searchable(include_boolean=allow_boolean_ops,
+                                 include_resource_risk=allow_resource_risk):
         groups.setdefault(f"{s.face}_{s.family}", []).append(s.name)
     return groups
 
@@ -54,6 +56,7 @@ class PresqueezeConfig:
     candidates_per_iteration_cap: int = 200
     top_k_per_iteration: int = 8
     allow_boolean_ops: bool = False
+    allow_resource_risk: bool = False
     carry_unscored: int = 12            # full-width candidates carried forward as operands
     seed: int = 0
     pairing: str = "random"             # "random" | "heuristic"
@@ -132,7 +135,7 @@ def feature_boosting_presqueeze(registry: Registry, engine: CubeEngine, target: 
     config = config or PresqueezeConfig()
     fields = list(registry.fields)
     field_groups = config.field_groups or default_field_groups(fields)
-    operator_groups = config.operator_groups or default_operator_groups(registry, config.allow_boolean_ops)
+    operator_groups = config.operator_groups or default_operator_groups(registry, config.allow_boolean_ops, config.allow_resource_risk)
     if not field_groups or not operator_groups:
         raise ValueError("no field/operator groups to pre-squeeze")
     rng = random.Random(config.seed)
