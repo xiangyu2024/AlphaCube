@@ -164,7 +164,7 @@ QCM 回放池预热)、`GPMiner`(需求驱动的类型化生成器,面均衡抽�
 |corr| 去重、事务性;`test_ensemble` 用 label 的可执行收益作 P&L 腿。
 
 **奖励目标**:`open_vwap15`(生产 label:t+1 日开盘 15 分钟 VWAP 进、t+1+h 出,直接从立方体
-算)、`close`,以及 `models.targets` 的 volatility / downside_volatility / rank / class /
+算;**价格空间见 §12**)、`close`,以及 `models.targets` 的 volatility / downside_volatility / rank / class /
 spike / crash(`cli.make_label`)。
 
 ## 8. legacy 表达式:GeneralCall 与 1498 条历史因子
@@ -243,6 +243,28 @@ API 变化:`FactorGCLCombiner.fit(panels, target, epochs, train_days=)` / `predi
   ~1e-7 的差异)。`--root` 分支本身已由 tests/test_compare_daily_store.py 覆盖:日频 store 的
   两个轴都造得比视图宽(前后补日期、交错插入多余股票),逼出**按标签而不是按位置对齐**;
   轴对不上、字段缺失、字段被污染各有一条用例,退出码 0/1 可直接作服务器上的判据。
+
+## 11.5 价格空间:复权价与原始成交额不能混用
+
+2026-09-15 在真实 store 上首跑,GP 连续 20 代 `valid 0`。逐层定位(`scripts/diagnose_run.py`)
+落在 label:`open_vwap15` 原先用 `Amt / Volume` 当价格,再用当日 `High`/`Low` 做区间校验,
+**校验筛掉了 100% 的股票日**,label 全 NaN,于是每个候选的 IC 都是 NaN。
+
+根因不是缺数据,是**价格空间**:生产 store 里 `Open/High/Low/Close/Vwap` 是**后复权价**,
+而 `Amt`/`Volume` 是**原始成交额与股数**。判据是比值 `Close/(Amt/Vol)` 跨股票从 2.5 到 113
+(差 45 倍),但**每只票内部变异系数只有 1%~2%** —— 单位换算会是一个全局常数,复权因子才会
+每只票一个值。生产日频 store 自己也印证:它的 `Vwap/Close = 0.99994`、100% 落在 `[Low, High]`
+内,而 `Amount/Volume` 是 0.108×Close。
+
+**结论:`Amt` 只能用于成交额类因子,永远不要除以 `Volume` 去得到价格。** 两处按此改正:
+
+- `label.open_vwap15`:改为对分钟 `Vwap` 字段按 `Volume` 加权。分子分母**共用一个掩码** ——
+  有 5.5% 的分钟有成交量却没有 Vwap,只把它们的成交量计入分母会让结果系统性偏低(中位 5%)。
+  同时不再要求窗口内 15 分钟全齐:生产数据上全齐只占 67.33%,而 ≥5 分钟占 99.98%
+  且没有任何股票日少于 3 分钟,故 `OPEN_VWAP_MIN_MINUTES = 5`。改后价格腿有限占比 0% → 99.98%。
+- `daily.DAILY_FIELD_EXPRESSIONS["Vwap"]` 与 `scripts/compare_daily_store.py` 的参照同样改正。
+  表达式里用 `mul(0.0, ...)` 表达那个掩码:`0 * NaN = NaN`,缺 Vwap 的分钟因此从 NaN 安全的
+  `day_sum` 里掉出去,其余分钟贡献 `Volume - 0`。
 
 ## 11. 与服务器数据的关系
 

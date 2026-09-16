@@ -22,7 +22,15 @@ DAILY_FIELD_EXPRESSIONS: Dict[str, str] = {
     "Close": "day_last(Close)",
     "Volume": "day_sum(Volume)",
     "Amount": "day_sum(Amt)",
-    "Vwap": "div(day_sum(Amt), day_sum(Volume))",
+    # NOT Amt/Volume: in the production store the price fields are back-adjusted
+    # while Amt and Volume are raw, so their ratio is a price in another space
+    # (median 0.108x Close, and the daily store's own Vwap is the adjusted one).
+    # The average is over the minute Vwap field, weighted by Volume. The
+    # denominator has to skip the 5.5% of minutes that carry volume but no Vwap,
+    # or it is biased low by a median 5%; ``mul(0.0, ...)`` is how the expression
+    # language says that -- 0 * NaN is NaN, so those minutes drop out of the
+    # NaN-aware day_sum, and every other minute contributes Volume - 0.
+    "Vwap": "div(day_sum(mul(Vwap, Volume)), day_sum(sub(Volume, mul(0.0, mul(Vwap, Volume)))))",
     "Return": "sub(div(day_last(Close), ts_delay(day_last(Close), 1)), 1)",
 }
 

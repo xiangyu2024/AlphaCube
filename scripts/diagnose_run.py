@@ -7,7 +7,8 @@ GP 的 fitness 只在三种情况下留 -inf:面板求值失败、IC 非有限�
 
   1 store 轴与字段
   2 每个字段的有限值占比(以及开盘前 16 分钟单独看一眼 —— open_vwap15 只看这一段)
-  3 label 的价格腿:open_vwap15 的三道闸各自筛掉多少(complete / 成交量>0 / 高低价区间)
+  3 label 的价格腿:open_vwap15 的两道闸各自筛掉多少(可用分钟数 / 高低价区间),
+    外加一条对照 —— 若改用 Amt/Volume 作价格会剩多少(暴露复权价与原始成交额混用)
   4 label 的收益腿:forward_return 之后还剩多少
   5 一批最简单的因子:覆盖率与 IC 各是多少
 
@@ -42,7 +43,7 @@ def main() -> int:
     a = ap.parse_args()
 
     from alphacube.engine.engine import CubeEngine
-    from alphacube.label import OPEN_VWAP_WINDOW, Label, daily_close
+    from alphacube.label import OPEN_VWAP_MIN_MINUTES, OPEN_VWAP_WINDOW, Label, daily_close
     from alphacube.metrics import MIN_PAIRS, batched_ic
     from alphacube.parser import parse
     from alphacube.store import open_cube_store
@@ -71,20 +72,33 @@ def main() -> int:
 
     print(f"\n[3] label 价格腿 ({a.label})")
     if a.label == "open_vwap15":
+        use_vwap = "Vwap" in set(view.fields)
         vol = view.read_s("Volume", 0, view.n_symbols)[..., lo_m:hi_m].astype(np.float64)
-        amt = view.read_s("Amt", 0, view.n_symbols)[..., lo_m:hi_m].astype(np.float64)
-        complete = (np.isfinite(vol).all(-1) & np.isfinite(amt).all(-1)).T
-        tv = np.where(complete.T, vol.sum(-1), np.nan).T
-        ta = np.where(complete.T, amt.sum(-1), np.nan).T
+        px = (view.read_s("Vwap", 0, view.n_symbols)[..., lo_m:hi_m].astype(np.float64) if use_vwap
+              else np.where(vol > 0, view.read_s("Amt", 0, view.n_symbols)[..., lo_m:hi_m].astype(np.float64)
+                            / np.where(vol > 0, vol, np.nan), np.nan))
+        good = np.isfinite(px) & np.isfinite(vol) & (vol > 0)
+        n_ok = good.sum(-1).T
+        print(f"    价格口径: {'Vwap 字段(与 High/Low 同一价格空间)' if use_vwap else 'Amt/Volume(无 Vwap 字段时的回退)'}")
+        print(f"    闸1 窗口内可用分钟数 >= {OPEN_VWAP_MIN_MINUTES}   {pct(((n_ok >= OPEN_VWAP_MIN_MINUTES) & trad).sum() / cells)}"
+              f"   (中位数 {int(np.median(n_ok[trad]))} / {hi_m - lo_m} 分钟)")
         with np.errstate(all="ignore"):
-            v = np.where(tv > 0, ta / tv, np.nan)
-        print(f"    闸1 窗口内 Volume/Amt 整段有限   {pct((complete & trad).sum() / cells)}")
-        print(f"    闸2 且窗口成交量 > 0             {pct((np.isfinite(v) & trad).sum() / cells)}")
-        if {"High", "Low"} <= set(view.fields):
-            hi_p = np.nanmax(view.read_s("High", 0, view.n_symbols)[..., lo_m:hi_m].astype(np.float64), -1).T
-            lo_p = np.nanmin(view.read_s("Low", 0, view.n_symbols)[..., lo_m:hi_m].astype(np.float64), -1).T
-            v2 = np.where((v >= lo_p) & (v <= hi_p), v, np.nan)
-            print(f"    闸3 且落在窗口 High/Low 之间     {pct((np.isfinite(v2) & trad).sum() / cells)}")
+            num = np.where(good, px * vol, 0.0).sum(-1)
+            den = np.where(good, vol, 0.0).sum(-1)
+            v = np.where((den > 0) & (good.sum(-1) >= OPEN_VWAP_MIN_MINUTES), num / den, np.nan).T
+        hi_p = np.nanmax(view.read_s("High", 0, view.n_symbols)[..., lo_m:hi_m].astype(np.float64), -1).T
+        lo_p = np.nanmin(view.read_s("Low", 0, view.n_symbols)[..., lo_m:hi_m].astype(np.float64), -1).T
+        print(f"    闸2 且落在窗口 High/Low 之间  "
+              f"{pct((np.isfinite(np.where((v >= lo_p) & (v <= hi_p), v, np.nan)) & trad).sum() / cells)}")
+        if use_vwap and {"Amt"} <= set(view.fields):
+            # 对照:把 Amt/Volume 当价格用会怎样。若这一行远低于上一行,就是复权价与
+            # 原始成交额混用 —— OHLC/Vwap 是复权的,Amt/Volume 不是。
+            with np.errstate(all="ignore"):
+                raw = (view.read_s("Amt", 0, view.n_symbols)[..., lo_m:hi_m].astype(np.float64).sum(-1)
+                       / vol.sum(-1)).T
+            print(f"    对照 若改用 Amt/Volume 作价格  "
+                  f"{pct((np.isfinite(np.where((raw >= lo_p) & (raw <= hi_p), raw, np.nan)) & trad).sum() / cells)}"
+                  f"   <-- 远低于上一行 = 价格空间不一致")
         price = Label(a.label, a.horizon).price(view)
     else:
         price = daily_close(view)

@@ -9,9 +9,19 @@ Exit code 0 means every field agreed to ``--tol`` relative to its own scale;
 1 means a field disagreed, a field was missing, or the store's axes did not
 line up with the view.
 
-The V2 conventions (qmt_ingest): Open = first bar's open, High = max, Low =
-min, Close = last bar's close, Volume/Amount = sums, Vwap = Amount/Volume,
-Return = Close[t]/Close[t-1] - 1 over adjacent trading days (both tradable).
+The V2 conventions: Open = first bar's open, High = max, Low = min, Close =
+last bar's close, Volume/Amount = sums, Return = Close[t]/Close[t-1] - 1 over
+adjacent trading days (both tradable).
+
+Vwap is NOT Amount/Volume, though the ingest docstring reads that way. The
+production store's price fields are back-adjusted and Amount/Volume is not, so
+that ratio comes out at a median 0.108x Close while the store's own Vwap sits
+inside [Low, High] on 100% of stock-days. The reference below therefore averages
+the minute Vwap field weighted by Volume, with one mask shared by numerator and
+denominator (5.5% of minutes carry volume but no Vwap; counting their volume
+only in the denominator biases the result low by a median 5%). That reproduces
+the production Vwap to a median 8e-05 relative, 1.1e-02 at worst -- close, but
+not the exact formula, which is still unknown.
 """
 import argparse
 import json
@@ -48,7 +58,13 @@ def reference_daily(view):
             vs, as_ = np.nansum(v, -1), np.nansum(a, -1)
             out["Volume"][:, lo:hi] = np.where(any_, vs, np.nan).T
             out["Amount"][:, lo:hi] = np.where(any_, as_, np.nan).T
-            out["Vwap"][:, lo:hi] = np.where(any_ & (vs > 0), as_ / vs, np.nan).T
+            if "Vwap" in view.fields:
+                w = view.read_s("Vwap", lo, hi).astype(np.float64)
+                ok = np.isfinite(w) & np.isfinite(v)
+                num, den = np.where(ok, w * v, 0.0).sum(-1), np.where(ok, v, 0.0).sum(-1)
+                out["Vwap"][:, lo:hi] = np.where(any_ & (den > 0), num / np.where(den > 0, den, 1.0), np.nan).T
+            else:
+                out["Vwap"][:, lo:hi] = np.where(any_ & (vs > 0), as_ / vs, np.nan).T
     trad = view.tradable().T
     for k in out:
         out[k][~trad] = np.nan
