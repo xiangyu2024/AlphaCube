@@ -100,6 +100,21 @@ def test_run_mining_pipeline(tmp_path):
     assert r.pool_size >= 1 and r.run_dir == tmp_path / "runs" / "p" and (r.run_dir / "members.csv").exists()
     assert r.combination is not None and {"equal", "ic"} <= set(r.combination.index)
     assert any("pool:" in s for s in logs)
+
+    # members.csv carries return-based metrics PER FACTOR, not only for the pool and
+    # the combinations. An IC earned on a handful of days, or on one corner of the
+    # universe, reads as a Sharpe that does not match its IC -- which is the whole
+    # point of having both columns side by side.
+    import pandas as pd
+    members = pd.read_csv(r.run_dir / "members.csv")
+    for col in ("ic_mean", "icir", "rank_ic", "coverage", "n_days",
+                "annualized_return", "sharpe", "max_drawdown"):
+        assert col in members.columns, col
+    assert len(members) == r.pool_size
+    finite = members["sharpe"].notna()
+    assert finite.any(), "at least one member must have a computable Sharpe"
+    assert (members.loc[finite, "max_drawdown"] <= 0).all(), "a drawdown is never positive"
+    assert any("sharpe=" in s for s in logs), "the per-member log line shows it too"
     r2 = run_mining(st, start=st.dates[5], label="volatility", horizon=5, miner="alphasage", budget=16,
                     pool="dynamic", pool_capacity=3, rl_params=dict(trajectories_per_update=8), max_expr_len=12,
                     combine_methods=(), log=None)

@@ -131,7 +131,7 @@ def run_mining(
 ) -> RunResult:
     from .catalog import default_registry
     from .engine.engine import CubeEngine
-    from .metrics import ic_summary
+    from .metrics import backtest_metrics, cs_pearson, ic_summary
     from .mining import (AlphaForgeMiner, AlphaGenMiner, AlphaQCMMiner, AlphaSAGEMiner, BatchRewarder, GPMiner,
                          PPOWarmStartQCMMiner, Vocabulary)
     from .research import warmed_view
@@ -211,12 +211,22 @@ def run_mining(
     say("pool: " + "  ".join(f"{k} {v:+.4f}" for k, v in ens.items()))
     rows = []
     panels = panels_of(pool_obj.exprs())
+    realized = np.asarray(pool_obj.realized, dtype=np.float64)[trim:]
     for i, (mem, p) in enumerate(zip(pool_obj.members, panels)):
         row = {"index": i, "expression": repr(mem.expr), "weight": float(pool_obj.weights[i])}
         if p is not None:
-            row.update(ic_summary(p[trim:].astype(float), target[trim:]))
+            pan = p[trim:].astype(float)
+            row.update(ic_summary(pan, target[trim:]))
+            # Return-based metrics per factor, not only for the pool and the
+            # combinations: a high IC earned on a handful of days, or on a corner of
+            # the universe, shows up here as a Sharpe that does not match. Same
+            # function and same top_frac as the pool line, so the numbers are
+            # directly comparable. Diagnostic only -- one holding period, no costs.
+            bt = backtest_metrics(cs_pearson(pan, target[trim:]), pan, realized)
+            row.update({k: bt[k] for k in ("annualized_return", "sharpe", "max_drawdown") if k in bt})
         rows.append(row)
-        say(f"  [{i:2d}] w={row['weight']:+.4f} IC={row.get('ic_mean', float('nan')):+.4f}  {row['expression']}")
+        say(f"  [{i:2d}] w={row['weight']:+.4f} IC={row.get('ic_mean', float('nan')):+.4f}"
+            f" sharpe={row.get('sharpe', float('nan')):+.2f}  {row['expression']}")
 
     table = None
     if combine_methods:
