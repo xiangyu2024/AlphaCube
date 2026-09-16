@@ -117,6 +117,7 @@ def cmd_mine(a) -> int:
         meanstd_steps=a.meanstd_steps, dynamic_window=a.dynamic_window, seed_library=a.seed_library,
         presqueeze=(dict(n_iterations=a.presqueeze) if a.presqueeze else None), gp_params=gp,
         allow_boolean_ops=a.allow_boolean_ops, allow_resource_risk=a.allow_resource_risk,
+        checkpoint_every=a.checkpoint_every,
         workdir=a.workdir,
         max_expr_len=a.max_expr_len, combine_methods=tuple(x for x in a.combine.split(",") if x),
         combine_train_frac=a.combine_train_frac, out_root=a.out, run_id=a.run_id,
@@ -181,6 +182,10 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--max-depth", type=int, default=4)
     m.add_argument("--max-expr-len", type=int, default=20, help="RL token budget per expression")
     m.add_argument("--pool-capacity", type=int, default=10)
+    m.add_argument("--checkpoint-every", type=int, default=0,
+                   help="write the ranked archive to <run>/checkpoints/archive_gen<N>.csv every N "
+                        "generations. Without it the expressions exist only in memory until the whole "
+                        "budget is spent, so an interrupted run leaves nothing")
     m.add_argument("--panel-cache", type=int, default=512,
                    help="how many evaluated (D, S) panels GP keeps, LRU. A miss costs a full re-read of "
                         "every field the tree touches -- 9.1 GB each on the production cube -- so on a big "

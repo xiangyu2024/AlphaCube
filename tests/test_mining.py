@@ -182,3 +182,33 @@ def test_resource_risk_ops_are_out_of_the_action_set_by_default(registry):
     off = TypedTreeGenerator(registry, n_minutes=24, seed=8, max_depth=5, allow_resource_risk=False)
     assert not any(n.spec.name in risky for e in off.generate_population(300)
                    for n in e.nodes() if n.spec is not None)
+
+
+def test_archive_checkpoints_survive_an_interrupted_run(registry, view, tmp_path):
+    """The archive lives in memory and only reaches disk in _commit(), so a
+    full-market run killed at hour ten leaves no expressions at all -- which is
+    exactly what happened. checkpoint_every writes the ranked archive as it goes."""
+    from alphacube.label import Label
+    from alphacube.mining.pool import MsePool
+
+    target = Label("close", 1).compute(view)
+    ckpt = tmp_path / "checkpoints"
+    miner = GPMiner(registry, view, target, MsePool(4, target), population_size=6, max_depth=3,
+                    checkpoint_dir=ckpt, checkpoint_every=1, seed=2)
+    miner.mine(24)
+
+    files = sorted(ckpt.glob("archive_gen*.csv"))
+    assert len(files) >= 3, files
+    assert not list(ckpt.glob("*.tmp")), "the write is atomic; no partial file may survive"
+
+    import csv
+    rows = list(csv.DictReader(files[-1].open(encoding="utf-8")))
+    assert rows, "a checkpoint must carry the archive, not just a header"
+    fits = [float(r["fitness"]) for r in rows]
+    assert fits == sorted(fits, reverse=True), "ranked best first"
+    assert all(parse(r["expression"]).key() for r in rows), "every row must parse back"
+    assert len(rows) == len(miner.archive())
+
+    # and the archive only grows, so a later checkpoint is never poorer than an earlier one
+    early = list(csv.DictReader(files[0].open(encoding="utf-8")))
+    assert len(rows) >= len(early)

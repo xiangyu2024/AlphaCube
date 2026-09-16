@@ -117,6 +117,7 @@ def run_mining(
     presqueeze: Optional[dict] = None,
     allow_boolean_ops: bool = False,
     allow_resource_risk: bool = False,
+    checkpoint_every: int = 0,
     workdir: Optional[Union[str, Path]] = None,
     gp_params: Optional[dict] = None,
     rl_params: Optional[dict] = None,
@@ -169,13 +170,16 @@ def run_mining(
         extra = "  ".join(f"{k} {v:+.4f}" if isinstance(v, float) else f"{k} {v}" for k, v in s.items())
         say(f"  {n:5d}/{b}  {extra}")
 
+    ckpt_dir = None
+    if out_root and checkpoint_every:
+        ckpt_dir = Path(out_root) / (run_id or datetime.now().strftime("%Y%m%d_%H%M%S")) / "checkpoints"
     if miner == "gp":
         gp = dict(population_size=24, max_depth=4, min_depth=2, top_k=None)
         gp.update(gp_params or {})
         m = GPMiner(reg, view, target, pool_obj, seed=seed, device=device, min_coverage=min_coverage,
                     chunk_symbols=chunk_symbols, chunk_days=chunk_days,
                     allow_boolean_ops=allow_boolean_ops, allow_resource_risk=allow_resource_risk,
-                    workdir=workdir, **gp)
+                    checkpoint_dir=ckpt_dir, checkpoint_every=checkpoint_every, workdir=workdir, **gp)
         rep = m.mine(budget, on_generation=lambda g, n, s: progress(g, n, s))
         added, evaluated, engine_s = rep.added, rep.evaluated, rep.engine_seconds
         summary = f"{rep.generations} generations, archive {rep.archive_size}, best |IC| {rep.best_fitness:+.4f}"

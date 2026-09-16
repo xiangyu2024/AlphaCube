@@ -22,6 +22,7 @@ import math
 import os
 import random
 import time
+from pathlib import Path
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -62,7 +63,8 @@ class GPMiner:
                  cull_rel_threshold: float = 0.5, merge_threshold: float = 0.8, panel_cache_items: int = 512,
                  device: str = "cpu", chunk_symbols: Optional[int] = None, chunk_days: Optional[int] = None,
                  fields: Optional[Sequence[str]] = None, allow_boolean_ops: bool = False,
-                 allow_resource_risk: bool = False,
+                 allow_resource_risk: bool = False, checkpoint_dir: Optional[os.PathLike] = None,
+                 checkpoint_every: int = 0,
                  workdir: Optional[os.PathLike] = None, seed: int = 0) -> None:
         self.registry = registry
         self.view = view
@@ -80,6 +82,15 @@ class GPMiner:
         # same threshold, so the fitness ranking and the commit gate agree).
         self.min_coverage = float(min_coverage)
         self._rng = random.Random(seed)
+        # The archive lives in memory and only reaches disk in _commit(), i.e. when the
+        # whole budget is spent. On a full-market run that is many hours, and a run
+        # interrupted before then leaves nothing at all -- no expressions, no scores.
+        # checkpoint_every writes the ranked archive after every Nth generation so the
+        # work so far is always recoverable.
+        self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
+        self.checkpoint_every = max(0, int(checkpoint_every))
+        if self.checkpoint_dir and self.checkpoint_every:
+            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.generator = TypedTreeGenerator(registry, fields=fields, n_minutes=view.n_minutes,
                                             min_depth=min_depth, max_depth=max_depth,
                                             allow_boolean_ops=allow_boolean_ops,
@@ -207,6 +218,8 @@ class GPMiner:
                 on_generation(g + 1, n_gen, {"best": best, "gen_best": float(finite.max()) if finite.size else float("nan"),
                                              "gen_mean": float(finite.mean()) if finite.size else float("nan"),
                                              "archive": len(self._archive), "valid": int(finite.size)})
+            if self.checkpoint_every and self.checkpoint_dir and (g + 1) % self.checkpoint_every == 0:
+                self.write_checkpoint(g + 1)
         report = self._commit()
         report.generations = n_gen
         report.evaluated = self.evaluated
@@ -241,6 +254,23 @@ class GPMiner:
 
     def archive(self) -> List[Tuple[Expression, float]]:
         return sorted(self._archive.values(), key=lambda t: t[1], reverse=True)
+
+    def write_checkpoint(self, generation: int) -> Optional[Path]:
+        """Ranked archive -> ``archive_gen<N>.csv``, written atomically so a kill
+        during the write cannot leave a half file. Fitness only; the pool metrics
+        in members.csv need the panels, which is what _commit() is for."""
+        if self.checkpoint_dir is None:
+            return None
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        path = self.checkpoint_dir / f"archive_gen{generation:03d}.csv"
+        tmp = path.with_suffix(".csv.tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write("rank,fitness,expression\n")
+            for i, (expr, fit) in enumerate(self.archive()):
+                text = repr(expr).replace('"', '""')
+                fh.write(f'{i},{fit:.6f},"{text}"\n')
+        os.replace(tmp, path)
+        return path
 
 
 __all__ = ["GPMiner", "MiningReport"]
