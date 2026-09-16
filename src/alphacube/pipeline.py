@@ -119,6 +119,7 @@ def run_mining(
     allow_resource_risk: bool = False,
     skip_kernels: Sequence[str] = (),
     checkpoint_every: int = 0,
+    engine_progress_every: float = 0.0,
     workdir: Optional[Union[str, Path]] = None,
     gp_params: Optional[dict] = None,
     rl_params: Optional[dict] = None,
@@ -167,6 +168,21 @@ def run_mining(
         say(f"pre-squeeze: {res.candidates_generated_total} candidates, {res.candidates_evaluated_total} scored, "
             f"{len(res.survivors)} survivors, {len(rewards)} entered the pool")
 
+    _last_tick = [0.0]
+
+    def engine_progress(d):
+        """Inside-a-generation progress. Throttled: the engine calls back per chunk,
+        which on the production cube is hundreds of times per round."""
+        now = time.time()
+        if now - _last_tick[0] < engine_progress_every:
+            return
+        _last_tick[0] = now
+        eta = d["eta"]
+        eta_s = "?" if eta != eta else f"{eta / 60:.0f}m"
+        say(f"      ... {d['trees']} trees ({d['cached']} cached)  round {d['round']}/{d['rounds']}"
+            f"  {d['done']}/{d['total']} chunks  {100 * d['frac']:.0f}%"
+            f"  elapsed {d['elapsed'] / 60:.0f}m  eta {eta_s}")
+
     def progress(n, b, s):
         extra = "  ".join(f"{k} {v:+.4f}" if isinstance(v, float) else f"{k} {v}" for k, v in s.items())
         say(f"  {n:5d}/{b}  {extra}")
@@ -181,6 +197,7 @@ def run_mining(
                     chunk_symbols=chunk_symbols, chunk_days=chunk_days,
                     allow_boolean_ops=allow_boolean_ops, allow_resource_risk=allow_resource_risk,
                     skip_kernels=frozenset(skip_kernels), checkpoint_dir=ckpt_dir,
+                    on_engine_progress=(engine_progress if engine_progress_every > 0 else None),
                     checkpoint_every=checkpoint_every, workdir=workdir, **gp)
         rep = m.mine(budget, on_generation=lambda g, n, s: progress(g, n, s))
         added, evaluated, engine_s = rep.added, rep.evaluated, rep.engine_seconds

@@ -64,6 +64,7 @@ class GPMiner:
                  device: str = "cpu", chunk_symbols: Optional[int] = None, chunk_days: Optional[int] = None,
                  fields: Optional[Sequence[str]] = None, allow_boolean_ops: bool = False,
                  allow_resource_risk: bool = False, skip_kernels: "frozenset[str]" = frozenset(),
+                 on_engine_progress: Optional[Callable[[dict], None]] = None,
                  checkpoint_dir: Optional[os.PathLike] = None,
                  checkpoint_every: int = 0,
                  workdir: Optional[os.PathLike] = None, seed: int = 0) -> None:
@@ -98,6 +99,10 @@ class GPMiner:
         # exactly, and only from there on does selection differ.
         self.skip_kernels = frozenset(skip_kernels)
         self.skipped = 0
+        # A generation is ONE engine call, so without this the log goes silent for
+        # however long that call takes -- 58 minutes for a cold population on the
+        # production cube, and there was no way to tell progress from a hang.
+        self.on_engine_progress = on_engine_progress
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
         self.checkpoint_every = max(0, int(checkpoint_every))
         if self.checkpoint_dir and self.checkpoint_every:
@@ -139,7 +144,19 @@ class GPMiner:
                 todo.setdefault(k, []).append(i)
         if todo:
             exprs = [population[idx[0]] for idx in todo.values()]
-            res = self.engine.evaluate(exprs, tolerant=True)
+            cb = None
+            if self.on_engine_progress is not None:
+                n_new, n_cached = len(exprs), len(population) - len(exprs)
+                started = time.perf_counter()
+
+                def cb(r_idx, n_rounds, done, total, _n=n_new, _c=n_cached, _t=started):
+                    frac = (done / total) if total else 0.0
+                    el = time.perf_counter() - _t
+                    self.on_engine_progress({"trees": _n, "cached": _c, "round": r_idx + 1,
+                                             "rounds": n_rounds, "done": done, "total": total,
+                                             "frac": frac, "elapsed": el,
+                                             "eta": (el / frac - el) if frac > 0.01 else float("nan")})
+            res = self.engine.evaluate(exprs, tolerant=True, on_progress=cb)
             self.engine_seconds += res.seconds
             self.evaluated += len(exprs)
             for (k, idx), p in zip(todo.items(), res.panels):

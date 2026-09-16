@@ -70,6 +70,8 @@ if __name__ == "__main__":
         # ---------------- 输出 ----------------
         workdir=PROJECT_ROOT / "tmp",   # 落盘中间量:一个边界文件就是整块 (S, D, M) float32
                                        # (5219x1942x241 = 9.8 GB),绝不能落在小的系统盘上
+        engine_progress_every=60,    # 每 N 秒打印一行"代内进度"(轮次/分块/百分比/ETA)。
+                                     # 一代就是一次引擎调用,不开这个的话日志会静默整整一代
         checkpoint_every=1,          # 每 N 代把排好序的 archive 写进 <run>/checkpoints/。
                                      # 不设的话表达式只存在于内存里,跑到最后才落盘,中途被打断就全丢
         out_root=PROJECT_ROOT / "mining_runs",

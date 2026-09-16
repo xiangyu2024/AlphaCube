@@ -117,7 +117,7 @@ def cmd_mine(a) -> int:
         meanstd_steps=a.meanstd_steps, dynamic_window=a.dynamic_window, seed_library=a.seed_library,
         presqueeze=(dict(n_iterations=a.presqueeze) if a.presqueeze else None), gp_params=gp,
         allow_boolean_ops=a.allow_boolean_ops, allow_resource_risk=a.allow_resource_risk,
-        checkpoint_every=a.checkpoint_every,
+        checkpoint_every=a.checkpoint_every, engine_progress_every=a.progress_every,
         skip_kernels=tuple(x for x in a.skip_kernels.split(",") if x),
         workdir=a.workdir,
         max_expr_len=a.max_expr_len, combine_methods=tuple(x for x in a.combine.split(",") if x),
@@ -183,6 +183,10 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--max-depth", type=int, default=4)
     m.add_argument("--max-expr-len", type=int, default=20, help="RL token budget per expression")
     m.add_argument("--pool-capacity", type=int, default=10)
+    m.add_argument("--progress-every", type=float, default=0.0,
+                   help="seconds between inside-a-generation progress lines (0 = off). A generation is one "
+                        "engine call, so without this the log is silent for its whole duration -- 58 minutes "
+                        "for a cold full-market population -- and a slow generation looks like a hang")
     m.add_argument("--skip-kernels", default="",
                    help="comma list of operators the search may BREED but never EVALUATE (scored -inf "
                         "unevaluated). Unlike dropping them from the vocabulary, this leaves every RNG "

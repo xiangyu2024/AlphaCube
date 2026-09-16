@@ -115,6 +115,23 @@ def test_run_mining_pipeline(tmp_path):
     assert finite.any(), "at least one member must have a computable Sharpe"
     assert (members.loc[finite, "max_drawdown"] <= 0).all(), "a drawdown is never positive"
     assert any("sharpe=" in s for s in logs), "the per-member log line shows it too"
+
+    # Inside-a-generation progress. A generation is ONE engine call, so without this
+    # the log says nothing for its whole duration -- 58 minutes for a cold
+    # full-market population -- and there is no way to tell slow from hung.
+    logs2 = []
+    run_mining(st, start=st.dates[5], label="close", miner="gp", budget=24, pool_capacity=3,
+               gp_params=dict(population_size=8, max_depth=3), combine_methods=(),
+               engine_progress_every=1e-9, log=logs2.append)
+    ticks = [s for s in logs2 if "trees" in s and "round" in s and "chunks" in s]
+    assert ticks, "expected inside-generation progress lines"
+    assert any("cached" in s for s in ticks) and any("eta" in s for s in ticks)
+
+    # and off by default, so an existing caller's log does not change shape
+    logs3 = []
+    run_mining(st, start=st.dates[5], label="close", miner="gp", budget=24, pool_capacity=3,
+               gp_params=dict(population_size=8, max_depth=3), combine_methods=(), log=logs3.append)
+    assert not [s for s in logs3 if "chunks" in s]
     r2 = run_mining(st, start=st.dates[5], label="volatility", horizon=5, miner="alphasage", budget=16,
                     pool="dynamic", pool_capacity=3, rl_params=dict(trajectories_per_update=8), max_expr_len=12,
                     combine_methods=(), log=None)
