@@ -147,32 +147,36 @@ def test_panel_cache_is_configurable_and_bounded(registry, view):
     assert big.pool.size == miner.pool.size
 
 
-def test_resource_risk_ops_are_out_of_the_action_set_by_default(registry):
-    """calculate.py has always refused to compute a factor containing ts_pearson,
-    nt_ts_pearson, nt_ts_spearman or in_multireg without --allow-resource-risk,
-    because their cost grows super-linearly in the stock count -- the NT pair
-    kernels correlate every stock against every other, once per day, which on the
-    production cube is 5219^2 pairs x 1942 days.
+def test_only_the_nt_face_pair_kernels_leave_the_action_set(registry):
+    """``ts_pearson`` and friends correlate every stock against every other, which
+    is O(windows x d x N^2) -- 27M pairs per window at N=5219. That cost is the
+    factor's definition, not a slow implementation: the pairwise observation count
+    is taken per pair, because stocks suspend and list on different days, so the
+    bilinear identity that would collapse agg="mean" to O(N) does not hold.
 
-    The search vocabulary did not have that guard, so GP was free to breed one.
-    On a full-market run it did, in generation 14, and that generation was still
-    running 78 minutes later against a 4-minute norm. Both paths now read the same
-    set, so they cannot drift apart again."""
+    What decides affordability is the face. The ND entry is evaluated once over
+    the whole (D, S) panel; its NT twin is evaluated once per day, 1942 times,
+    which is two orders of magnitude more. So the ND ones stay searchable and only
+    the NT twins are gated -- a blanket ban would throw away a whole family of
+    factors to avoid a cost that only one face actually carries.
+
+    A full-market run bred an NT one into generation 14, which then ran for 196
+    minutes against a 4-minute norm."""
     from alphacube.calculate import DEFERRED_RESOURCE_OPERATORS
-    from alphacube.catalog import RESOURCE_RISK_KERNELS
+    from alphacube.catalog import RESOURCE_RISK_KERNELS, SEARCH_FORBIDDEN_KERNELS
     from alphacube.mining.tokens import Vocabulary
 
     assert DEFERRED_RESOURCE_OPERATORS is RESOURCE_RISK_KERNELS, "one definition, not two"
-    risky = {s.name for s in registry.list_all() if s.resource_risk}
-    assert risky and risky <= RESOURCE_RISK_KERNELS
+    assert SEARCH_FORBIDDEN_KERNELS < RESOURCE_RISK_KERNELS, "the search bans a subset, not the lot"
 
-    # Registry.searchable() itself answers "what exists"; the opting out happens at
-    # the miner, the same way include_boolean does, so that a caller asking the
-    # registry a question is never silently given a filtered answer.
     gated = {s.name for s in registry.searchable(include_boolean=False, include_resource_risk=False)}
-    assert gated.isdisjoint(risky)
-    assert risky <= {s.name for s in registry.searchable()}
+    assert {"ts_pearson", "ts_spearman"} <= gated, "the ND face is affordable and must stay"
+    assert gated.isdisjoint({"nt_ts_pearson", "nt_ts_spearman"}), "the NT twins cost ~241x"
 
+    opened = {s.name for s in registry.searchable(include_boolean=False, include_resource_risk=True)}
+    assert {"nt_ts_pearson", "nt_ts_spearman"} <= opened, "the switch must let them back in"
+
+    risky = {s.name for s in registry.list_all() if s.resource_risk}
     for flag in (False, True):
         gen = TypedTreeGenerator(registry, n_minutes=24, seed=7, max_depth=5, allow_resource_risk=flag)
         vocab = Vocabulary(registry, n_minutes=24, allow_resource_risk=flag)
@@ -180,8 +184,10 @@ def test_resource_risk_ops_are_out_of_the_action_set_by_default(registry):
         assert (({s.name for s in vocab.operators} & risky) == risky) is flag
 
     off = TypedTreeGenerator(registry, n_minutes=24, seed=8, max_depth=5, allow_resource_risk=False)
-    assert not any(n.spec.name in risky for e in off.generate_population(300)
-                   for n in e.nodes() if n.spec is not None)
+    pop = off.generate_population(300)
+    assert not any(n.spec.name in risky for e in pop for n in e.nodes() if n.spec is not None)
+    assert any(n.spec.name == "ts_pearson" for e in off.generate_population(600)
+               for n in e.nodes() if n.spec is not None), "the ND entry must still be reachable"
 
 
 def test_archive_checkpoints_survive_an_interrupted_run(registry, view, tmp_path):

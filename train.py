@@ -49,9 +49,10 @@ if __name__ == "__main__":
                        panel_cache_items=512),
         rl_params=dict(),            # 例:dict(episodes_per_update=8) / dict(tail_alpha=0.9)
         max_expr_len=20,             # RL 每条表达式的 token 上限
-        allow_resource_risk=False,   # 是否允许 ts_pearson / nt_ts_pearson / nt_ts_spearman 进入搜索。
-                                     # 它们的代价随股票数超线性(NT 面是逐日 5219^2 对 x 1942 天),
-                                     # 全市场上一棵这样的树就能让一代从 4 分钟变成 78 分钟以上
+        allow_resource_risk=False,   # 是否允许 NT 面的配对核(nt_ts_pearson / nt_ts_spearman)与 in_multireg。
+                                     # 配对核都是 O(窗口数 x d x N^2)——全市场每窗口 2720 万对——但代价差在"面":
+                                     # ND 面的 ts_pearson / ts_spearman 整个面板算一次,默认保留;
+                                     # NT 面的双胞胎要逐日算 1942 次,约 241 倍,默认排除
         allow_boolean_ops=False,     # 是否让搜索使用 29 个严格 0/1 的算子(eq / is_gt0 / cs_quantile_q50 …)。
                                      # 默认否:它们本就不能当根,但 pow_05(eq(a, b)) 这类算术会把它们洗成合法根,
                                      # 得到的近似常数指示变量会拿到虚高的 IC

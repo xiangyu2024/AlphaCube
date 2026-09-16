@@ -202,9 +202,11 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--seed-library", default=None, help="seed the pool from a seed_alpha_library yaml first")
     m.add_argument("--presqueeze", type=int, default=0, help="feature-boosting pre-squeeze iterations before mining (0 = off)")
     m.add_argument("--allow-resource-risk", action="store_true",
-                   help="let the search use ts_pearson / nt_ts_pearson / nt_ts_spearman, whose cost is "
-                        "super-linear in the stock count (the NT pair kernels are 5219^2 pairs x 1942 days "
-                        "on the production cube). Off by default; calculate.py has always deferred them")
+                   help="let the search use the NT-face pair kernels (nt_ts_pearson, nt_ts_spearman) and "
+                        "in_multireg. Every pair kernel is O(windows x d x N^2) -- 27M pairs per window at "
+                        "N=5219 -- but the ND entries (ts_pearson, ts_spearman) run once over the panel and "
+                        "stay searchable by default, while the NT twins run once per day, ~241x more, and "
+                        "do not")
     m.add_argument("--allow-boolean-ops", action="store_true",
                    help="let the search use the 29 strictly-0/1 operators (eq, is_gt0, cs_quantile_q50, ...). "
                         "Off by default: they cannot be a root, but arithmetic launders them into one "

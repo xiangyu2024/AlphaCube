@@ -39,13 +39,23 @@ WINDOWS = {
 CONSTANTS = (-5.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 5.0)
 
 LOOKAHEAD_KERNELS = frozenset({"ts_shift", "cross_shift", "in_local_mean"})
-# Kernels whose cost grows super-linearly in the stock count. ``ts_pearson`` and
-# friends correlate every column against every other, so on the NT face -- called
-# once per day on a (minutes, stocks) face -- that is 5219^2 pairs x 1942 days on
-# the production cube. calculate.py has always deferred these; the search
-# vocabulary did not, and one of them landed in generation 14 of a full-market run
-# and was still going 78 minutes later, against a 4-minute norm.
+# Kernels that correlate every stock against every other, so their time is
+# O(windows x d x N^2) -- 5219^2 = 27M pairs per window on the production cube.
+# That is the factor's definition, not an implementation detail: the pairwise
+# count is taken per pair (stocks are suspended and listed on different days), so
+# the bilinear shortcut that would collapse agg="mean" to O(N) does not apply.
+#
+# What decides whether it is affordable is the FACE it runs on, and the two
+# differ by two orders of magnitude:
+#
+#   ts_pearson     ND (D, S)  evaluated once over the whole panel      1x
+#   nt_ts_pearson  NT (M, S)  evaluated once PER DAY, 1942 of them  ~241x
+#
+# So the ND ones stay in the search vocabulary and the NT twins do not. The whole
+# set is still what calculate.py defers, which is a different (memory) question.
 RESOURCE_RISK_KERNELS = frozenset({"ts_pearson", "nt_ts_pearson", "nt_ts_spearman", "in_multireg"})
+# Of those, the ones a full-market search must not breed: same kernels, NT face.
+SEARCH_FORBIDDEN_KERNELS = frozenset({"nt_ts_pearson", "nt_ts_spearman", "in_multireg"})
 # Kernels deliberately left out of the registry (recorded in Registry.skipped):
 EXCLUDED_KERNELS = {
     "rank": "duplicate of cs_rank (same percentile rank across stocks); keep one name",
@@ -311,7 +321,7 @@ def _make_spec(name: str, face: str, family: str, category: str, meta: dict,
         lookahead=(kernel_id.split(".")[-1] in LOOKAHEAD_KERNELS),
         boolean_output=(distinct <= 2), coarse_output=(2 < distinct <= 3),
         trivial_boolean=(distinct <= 2 and _probe_constant_capable(fn, category, restores)),
-        resource_risk=(name in RESOURCE_RISK_KERNELS or kernel_id.split(".")[-1] in RESOURCE_RISK_KERNELS),
+        resource_risk=(name in SEARCH_FORBIDDEN_KERNELS),
         windows=WINDOWS.get(face, ()),
     )
 
