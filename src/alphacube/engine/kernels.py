@@ -150,13 +150,28 @@ def _pre_collapse(spec: OpSpec, vals: List) -> List:
     return vals
 
 
+def _materialise(t: torch.Tensor) -> torch.Tensor:
+    """Give the minute axis real elements before a kernel reduces over it.
+
+    A value broadcast across minutes (``in_first``/``in_last`` fanning one value
+    over the row, a width-1 operand widened by ``_align_widths``) reaches here as
+    a stride-0 view. torch will happily reduce over a stride-0 axis, but which
+    reduction path it picks depends on the tensor's overall size, so the same row
+    summed inside a 180-row chunk and inside a 600-row one can land one ULP
+    apart -- which breaks the chunk-invariance the engine promises (found by
+    tests/test_engine.py::test_chunk_invariance_over_random_population on
+    ``day_mean(in_first(Amt))``). Copying costs what every other full-width
+    intermediate already costs."""
+    return t.contiguous() if t.dim() > 0 and t.shape[-1] > 1 and t.stride(-1) == 0 else t
+
+
 def _per_row_view(vals: List, A: int, B: int) -> List:
     out = []
     for v in vals:
         if isinstance(v, torch.Tensor):
-            out.append(v.reshape(A * B, v.shape[-1]))
+            out.append(_materialise(v.reshape(A * B, v.shape[-1])))
         elif isinstance(v, list):
-            out.append([t.reshape(A * B, t.shape[-1]) for t in v])
+            out.append([_materialise(t.reshape(A * B, t.shape[-1])) for t in v])
         else:
             out.append(v)
     return out

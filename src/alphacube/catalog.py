@@ -147,6 +147,46 @@ _VARIANT_DEFS: Tuple[Tuple[str, str, Callable], ...] = (
 
 # ---- output-cardinality probe ------------------------------------------------
 
+def _probe_constant_capable(fn: Callable, category: str, restores: bool) -> bool:
+    """Can some plausible input make this operator's output a single constant?
+
+    That is the difference between a boolean worth searching and one that is not.
+    A predicate against a FIXED threshold collapses whenever the data sits on one
+    side of it -- ``is_gt0`` on an all-positive panel is all ones, ``eq`` on two
+    unrelated panels is all zeros, ``logical_and`` on positive data is all ones --
+    and a constant panel carries no cross-sectional information, yet scores a
+    spurious IC once arithmetic launders it into a legal root. A predicate against
+    the data's OWN distribution cannot collapse: ``cs_quantile_q50`` splits its
+    input in half whatever the input is, ``in_top_quantile_flag_q10`` always flags
+    a tenth. So the question is asked empirically, over input families chosen to
+    put the data wholly on one side of any fixed threshold."""
+    g = torch.Generator().manual_seed(11)
+    base = torch.rand((40, 9), generator=g) + 0.5           # strictly positive
+    other = torch.rand((40, 9), generator=g) + 0.5
+    families = [(base, other), (-base, -other), (base, base),
+                (torch.randn((40, 9), generator=g), torch.randn((40, 9), generator=g))]
+    for x, y in families:
+        if restores:
+            x = x[:, :1]
+        try:
+            with torch.no_grad():
+                if category == "unary":
+                    out = fn(x)
+                elif category == "binary":
+                    out = fn(x, y)
+                elif category == "rolling":
+                    out = fn(x, 5)
+                else:
+                    out = fn(x, y, 5)
+            flat = out.float().reshape(-1)
+            flat = flat[torch.isfinite(flat)]
+        except Exception:                                    # noqa: BLE001 - a family it cannot take
+            continue
+        if flat.numel() == 0 or int(torch.unique(flat).numel()) <= 1:
+            return True
+    return False
+
+
 def _probe_distinct_values(fn: Callable, category: str, reduces: bool, restores: bool) -> int:
     """Distinct finite output values on a random normal panel (rows 40, cols 9)."""
     g = torch.Generator().manual_seed(7)
@@ -222,9 +262,24 @@ class Registry:
     def by_face(self, face: str) -> List[OpSpec]:
         return [s for s in self._ops.values() if s.face == face]
 
-    def searchable(self) -> List[OpSpec]:
-        """Operators a search vocabulary may use: everything not forward-looking."""
-        return [s for s in self._ops.values() if not s.lookahead]
+    def searchable(self, include_boolean: bool = True) -> List[OpSpec]:
+        """Operators a search vocabulary may use: everything not forward-looking.
+
+        ``include_boolean=False`` also drops the operators flagged
+        ``trivial_boolean`` -- 0/1 outputs that some input collapses to a single
+        constant (``eq``, ``is_gt0``, ``is_lt0``, ``logical_and/or``, ...). They
+        are already barred from being a factor's root, but that rule is checked
+        one node at a time, so a search launders one through any arithmetic
+        operator: ``pow_05(eq(a, b))`` is a legal root made of a near-constant
+        indicator, and it took the top of the population on the production store
+        with a spurious |IC| of 0.58 while the pool recorded its IC as NaN.
+
+        Booleans that split the data by its own distribution (``cs_quantile_q50``,
+        ``in_top_quantile_flag_q10``, the outlier flags) are NOT dropped: they
+        cannot collapse, so they carry real cross-sectional information and are
+        worth searching."""
+        return [s for s in self._ops.values() if not s.lookahead
+                and (include_boolean or not s.trivial_boolean)]
 
 
 CUBE_FIELDS = ("Open", "High", "Low", "Close", "Volume", "Vwap", "Ret", "Amt")
@@ -246,6 +301,7 @@ def _make_spec(name: str, face: str, family: str, category: str, meta: dict,
         reduces_m=reduces, restores_m=restores,
         lookahead=(kernel_id.split(".")[-1] in LOOKAHEAD_KERNELS),
         boolean_output=(distinct <= 2), coarse_output=(2 < distinct <= 3),
+        trivial_boolean=(distinct <= 2 and _probe_constant_capable(fn, category, restores)),
         windows=WINDOWS.get(face, ()),
     )
 

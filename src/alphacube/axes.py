@@ -79,6 +79,7 @@ class OpSpec:
     restores_m: bool = False             # in_expand: (.., 1) -> (.., M)
     lookahead: bool = False              # uses data after t: never in a search vocabulary
     boolean_output: bool = False         # strictly 0/1 output: never a factor root
+    trivial_boolean: bool = False        # 0/1 output that some input collapses to one constant
     coarse_output: bool = False          # <= 3 distinct values: never a factor root
     windows: Tuple[int, ...] = field(default_factory=tuple)
 

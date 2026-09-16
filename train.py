@@ -45,6 +45,9 @@ if __name__ == "__main__":
         gp_params=dict(population_size=24, max_depth=4, min_depth=2, top_k=None),
         rl_params=dict(),            # 例:dict(episodes_per_update=8) / dict(tail_alpha=0.9)
         max_expr_len=20,             # RL 每条表达式的 token 上限
+        allow_boolean_ops=False,     # 是否让搜索使用 29 个严格 0/1 的算子(eq / is_gt0 / cs_quantile_q50 …)。
+                                     # 默认否:它们本就不能当根,但 pow_05(eq(a, b)) 这类算术会把它们洗成合法根,
+                                     # 得到的近似常数指示变量会拿到虚高的 IC
         # ---------------- 因子池 ----------------
         pool="mse",                  # mse / meanstd / dynamic
         pool_capacity=10,

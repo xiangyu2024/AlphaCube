@@ -228,6 +228,16 @@ API 变化:`FactorGCLCombiner.fit(panels, target, epochs, train_days=)` / `predi
   `day_last(in_regbeta(Ret, nt_cs_mean(Ret), 10))` 在一个 D 轮内求值且与逐日参考逐 bit 相同
   (tests/test_production.py::test_two_axis_factor_by_composition)。
 - 语料里 11 条括号错位与 8 条 `merge_and_forward_fill` 无法计算(库里没有该函数)。
+- **已知破绽:`sliding_{top,bottom}_{sum,mean}_masked_p5` 不满足分块不变性**。它们声明为 `dt/in`
+  (分钟轴),但底层 `_sliding_windows` 沿 **dim 0** 滚动,而引擎在 dt/in 面喂进来的 `(A·B, M)` 里
+  dim 0 是**股票日**——于是一只票的窗口会混进上一只票的行,结果随分块而变(首个差异恰好出现在
+  第二个分块的第一只股票)。这不是 ULP 级差异。已用 strict xfail 钉住
+  (tests/test_engine.py::test_sliding_masked_family_is_chunk_invariant),
+  因为随机种群是否抽到这四个算子取决于词表大小,不能靠运气覆盖。修法待定:改核函数的滚动轴,
+  或把它们改注册到 ND 面,或从注册表剔除。
+- 引擎侧已修:归约前把**分钟轴的 stride-0 广播**落实(`engine/kernels._materialise`)。
+  `in_first`/`in_last` 这类把一个值摊开的算子会产生 stride-0 视图,torch 在广播轴上归约时
+  走哪条路径取决于张量整体大小,同一个股票日在 180 行与 600 行的块里会差一个 ULP。
 - **加速器路径已在本机 MPS 上实跑**,不再是"只有脚本":`scripts/validate_gpu_parity.py --device mps`
   在 16×30×241 合成立方体上跑完全部 **238 个可搜索算子**,结果是
   **0 个只在加速器上失败、0 个后端缺核、0 处有限/NaN 版图变化**;值差异只有 `in_rank` 一处不属于
@@ -243,6 +253,29 @@ API 变化:`FactorGCLCombiner.fit(panels, target, epochs, train_days=)` / `predi
   ~1e-7 的差异)。`--root` 分支本身已由 tests/test_compare_daily_store.py 覆盖:日频 store 的
   两个轴都造得比视图宽(前后补日期、交错插入多余股票),逼出**按标签而不是按位置对齐**;
   轴对不上、字段缺失、字段被污染各有一条用例,退出码 0/1 可直接作服务器上的判据。
+
+## 11.4 平凡布尔算子不进有效动作集
+
+根节点不得是布尔/近常数算子,但这条规则是**逐节点**检查的,于是搜索可以用任意算术把它洗白:
+`pow_05(eq(day_ar1_coefficient(Vwap), day_cov(High, Vwap)))` 是合法的根,面板却几乎是常数指示量。
+真实数据上它以 |IC| 0.58 占据种群第一,而它在池里记录的 IC 是 `nan`,并把 `equal`/`ic`/`icir`/
+`lstsq` 四种组合方法的覆盖率全部拖成 0。
+
+要挡的只是**会坍缩**的那一类。判据按算子的性质而不是一次采样的结果来定
+(`catalog._probe_constant_capable`,喂全正、全负、混号、两操作数相同四组输入,任一组让输出变成
+单一常数即判为平凡):
+
+- **平凡(22 个,默认挡掉)**:对**固定阈值**取真假的谓词 —— 数据整体落在阈值一侧就全真或全假。
+  `eq` / `greater` / `less` / `is_gt0` / `is_lt0` / `logical_{and,or,not,xor}` / `sign` /
+  `*_sustain*` / `in_{is,no}_neighbor` / `in_left_one_distance_*` / `*_outlier_33`。
+- **非平凡(7 个,保留)**:对**数据自身分布**取真假的谓词,无论输入如何都会把数据切开,
+  因而携带真实截面信息 —— `cs_quantile_q{25,50,75}` / `nt_cs_quantile_q{25,50,75}` /
+  `in_top_quantile_flag_q10`。
+
+开关:`run_mining(allow_boolean_ops=...)` / `cli mine --allow-boolean-ops` / `train.py` 同名参数,
+默认 `False`。GP 生成器、RL 词表、Feature Boosting 三处共用。真实数据实测(60 只,2023,GP):
+挡掉后 best |IC| 从 0.58 回到 0.0422,池内成员 IC 全部有限,六种组合方法全部出数,
+池 ICIR 从 +0.218 升到 +0.310。
 
 ## 11.5 价格空间:复权价与原始成交额不能混用
 

@@ -80,3 +80,45 @@ def test_gp_populates_pool(registry, store):
     assert rep.archive_size >= pool.size
     assert rep.evaluated < 12 * 5                        # panel cache saved re-evaluations of elites/parents
     assert all(is_valid_root(e) for e in rep.added)
+
+
+def test_trivial_boolean_ops_are_out_of_the_action_set_by_default(registry):
+    """A strictly-0/1 operator cannot be a factor's root, but that rule is checked
+    one node at a time, so arithmetic launders one through: ``pow_05(eq(a, b))``
+    is a legal root whose panel is a near-constant indicator, and on the
+    production store such a tree took the top of the population with a spurious
+    |IC| of 0.58 while the pool recorded its IC as NaN.
+
+    What gets dropped is only the booleans that can COLLAPSE -- predicates against
+    a fixed threshold, which go all-true or all-false as soon as the data sits on
+    one side of it. A predicate against the data's own distribution cannot
+    collapse and stays in the vocabulary: ``cs_quantile_q50`` splits its input in
+    half whatever the input is."""
+    from alphacube.mining.tokens import Vocabulary
+
+    trivial = {s.name for s in registry.searchable() if s.trivial_boolean}
+    kept = {s.name for s in registry.searchable() if s.boolean_output and not s.trivial_boolean}
+    assert {"eq", "greater", "less", "is_gt0", "is_lt0", "logical_and", "logical_or",
+            "logical_not", "sign"} <= trivial, "fixed-threshold predicates must be droppable"
+    assert {"cs_quantile_q50", "cs_quantile_q25", "in_top_quantile_flag_q10"} <= kept, \
+        "distribution-relative flags carry information and must survive"
+    assert trivial.isdisjoint(kept)
+
+    boolean = trivial
+    assert {s.name for s in registry.searchable(include_boolean=False)}.isdisjoint(boolean)
+    assert len(registry.searchable(include_boolean=False)) == len(registry.searchable()) - len(boolean)
+
+    for allow in (False, True):
+        gen = TypedTreeGenerator(registry, n_minutes=24, seed=5, allow_boolean_ops=allow)
+        vocab = Vocabulary(registry, n_minutes=24, allow_boolean_ops=allow)
+        in_gen = {s.name for s in gen.specs} & boolean
+        in_vocab = {s.name for s in vocab.operators} & boolean
+        assert (in_gen == boolean) is allow and (in_vocab == boolean) is allow
+
+    # and nothing boolean reaches a generated tree, at any depth, when it is off
+    off = TypedTreeGenerator(registry, n_minutes=24, seed=6, allow_boolean_ops=False)
+    pop = off.generate_population(200)
+    assert not any(n.spec.name in boolean for e in pop for n in e.nodes() if n.spec is not None)
+    on = TypedTreeGenerator(registry, n_minutes=24, seed=6, allow_boolean_ops=True)
+    assert any(n.spec.name in boolean for e in on.generate_population(200)
+               for n in e.nodes() if n.spec is not None), "the switch must actually let them back in"

@@ -14,7 +14,11 @@ from alphacube.parser import parse
 
 @pytest.fixture(scope="module")
 def vocab(registry):
-    return Vocabulary(registry, n_minutes=24)
+    """The FULL vocabulary. These tests are about the grammar -- which token may
+    follow which -- so they need every operator, including the trivially-boolean
+    ones the mining default leaves out (see
+    tests/test_mining.py::test_trivial_boolean_ops_are_out_of_the_action_set_by_default)."""
+    return Vocabulary(registry, n_minutes=24, allow_boolean_ops=True)
 
 
 def test_vocabulary_layout(vocab, registry):

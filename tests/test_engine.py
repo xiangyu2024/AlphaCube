@@ -178,3 +178,21 @@ def test_chunk_invariance_over_random_population(registry, view):
     for e, x, y in zip(pop, a.panels, b.panels):
         if x is not None:
             assert np.array_equal(x, y, equal_nan=True), e
+
+
+@pytest.mark.xfail(strict=True, reason="_sliding_windows rolls along dim 0, which the engine fills with "
+                                       "stock-days, so sliding_*_masked_p5 mixes one stock's window into "
+                                       "another's and the answer moves with the chunking. Registered dt/in "
+                                       "(minute axis) but not computed on it -- see docs/design.md section 5.")
+def test_sliding_masked_family_is_chunk_invariant(view):
+    """Pinned as a known break rather than left to chance: whether the random
+    population in test_chunk_invariance_over_random_population happens to draw one
+    of these four operators depends on the vocabulary size, so it silently stopped
+    covering them when the trivially-boolean operators left the action set."""
+    exprs = [parse(f"day_last({op}(Low, Ret, 10))") for op in
+             ("sliding_top_sum_masked_p5", "sliding_bottom_sum_masked_p5",
+              "sliding_top_mean_masked_p5", "sliding_bottom_mean_masked_p5")]
+    a = CubeEngine(view, chunk_symbols=3, chunk_days=7).evaluate(exprs, tolerant=True)
+    b = CubeEngine(view).evaluate(exprs, tolerant=True)
+    for e, x, y in zip(exprs, a.panels, b.panels):
+        assert x is None or np.array_equal(x, y, equal_nan=True), e

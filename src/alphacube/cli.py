@@ -115,6 +115,7 @@ def cmd_mine(a) -> int:
         pool_capacity=a.pool_capacity, dedup=a.dedup, min_coverage=a.min_coverage, meanstd_lr=a.meanstd_lr,
         meanstd_steps=a.meanstd_steps, dynamic_window=a.dynamic_window, seed_library=a.seed_library,
         presqueeze=(dict(n_iterations=a.presqueeze) if a.presqueeze else None), gp_params=gp,
+        allow_boolean_ops=a.allow_boolean_ops,
         max_expr_len=a.max_expr_len, combine_methods=tuple(x for x in a.combine.split(",") if x),
         combine_train_frac=a.combine_train_frac, out_root=a.out, run_id=a.run_id,
     )
@@ -184,6 +185,10 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--seed", type=int, default=0)
     m.add_argument("--seed-library", default=None, help="seed the pool from a seed_alpha_library yaml first")
     m.add_argument("--presqueeze", type=int, default=0, help="feature-boosting pre-squeeze iterations before mining (0 = off)")
+    m.add_argument("--allow-boolean-ops", action="store_true",
+                   help="let the search use the 29 strictly-0/1 operators (eq, is_gt0, cs_quantile_q50, ...). "
+                        "Off by default: they cannot be a root, but arithmetic launders them into one "
+                        "(pow_05(eq(a, b))) and the near-constant indicator that results scores a spurious IC")
     m.add_argument("--combine", default="equal,ic,icir,lstsq,ridge,gbdt",
                    help="comma list of combination methods for the out-of-sample leaderboard ('' to skip)")
     m.add_argument("--combine-train-frac", type=float, default=0.7)

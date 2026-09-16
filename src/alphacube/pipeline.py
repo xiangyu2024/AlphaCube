@@ -115,6 +115,7 @@ def run_mining(
     dynamic_window: int = 60,
     seed_library: Optional[Union[str, Path]] = None,
     presqueeze: Optional[dict] = None,
+    allow_boolean_ops: bool = False,
     gp_params: Optional[dict] = None,
     rl_params: Optional[dict] = None,
     max_expr_len: int = 20,
@@ -154,7 +155,8 @@ def run_mining(
         say(f"seeded pool with {len(rewards)} of {len(exprs)} library factors ({len(errs)} failed to parse)")
     if presqueeze is not None:
         from .mining.boosting import PresqueezeConfig, feature_boosting_presqueeze, seed_pool_from_presqueeze
-        res = feature_boosting_presqueeze(reg, engine, target, PresqueezeConfig(**presqueeze))
+        res = feature_boosting_presqueeze(reg, engine, target,
+                                          PresqueezeConfig(allow_boolean_ops=allow_boolean_ops, **presqueeze))
         rewards = seed_pool_from_presqueeze(pool_obj, res, engine)
         say(f"pre-squeeze: {res.candidates_generated_total} candidates, {res.candidates_evaluated_total} scored, "
             f"{len(res.survivors)} survivors, {len(rewards)} entered the pool")
@@ -167,7 +169,8 @@ def run_mining(
         gp = dict(population_size=24, max_depth=4, min_depth=2, top_k=None)
         gp.update(gp_params or {})
         m = GPMiner(reg, view, target, pool_obj, seed=seed, device=device, min_coverage=min_coverage,
-                    chunk_symbols=chunk_symbols, chunk_days=chunk_days, **gp)
+                    chunk_symbols=chunk_symbols, chunk_days=chunk_days,
+                    allow_boolean_ops=allow_boolean_ops, **gp)
         rep = m.mine(budget, on_generation=lambda g, n, s: progress(g, n, s))
         added, evaluated, engine_s = rep.added, rep.evaluated, rep.engine_seconds
         summary = f"{rep.generations} generations, archive {rep.archive_size}, best |IC| {rep.best_fitness:+.4f}"
@@ -176,7 +179,7 @@ def run_mining(
     else:
         if miner not in MINERS:
             raise ValueError(f"unknown miner {miner!r}; choose from {MINERS}")
-        vocab = Vocabulary(reg, n_minutes=view.n_minutes)
+        vocab = Vocabulary(reg, n_minutes=view.n_minutes, allow_boolean_ops=allow_boolean_ops)
         rew = BatchRewarder(engine, pool_obj)
         cls = {"alphagen": AlphaGenMiner, "alphaqcm": AlphaQCMMiner, "alphaforge": AlphaForgeMiner,
                "alphasage": AlphaSAGEMiner, "warmstart": PPOWarmStartQCMMiner}[miner]
