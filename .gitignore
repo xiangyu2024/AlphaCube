@@ -6,3 +6,5 @@ mining_runs/
 factor_runs/
 *.egg-info/
 .venv/
+tmp/
+*.log

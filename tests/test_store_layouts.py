@@ -93,3 +93,39 @@ def test_d_major_mirror(layouts, tmp_path):
     b = CubeEngine(mono.view(), chunk_days=5).evaluate(exprs)
     for x, y in zip(a.panels, b.panels):
         assert np.array_equal(x, y, equal_nan=True)
+
+
+def test_boundary_files_never_land_on_the_system_temp_dir(view, tmp_path, monkeypatch):
+    """A boundary is a whole (S, D, M) float32 cube -- 9.8 GB on the production
+    universe -- and the default used to be the system temp directory, which on the
+    server is a 30 GB overlay shared with conda and the IDE server. A full-market
+    run filled it and was killed with nothing in the log. The default now follows
+    the project tree, and $ALPHACUBE_WORKDIR overrides it."""
+    import tempfile
+    from pathlib import Path
+
+    from alphacube.engine.engine import CubeEngine, default_workdir
+
+    monkeypatch.delenv("ALPHACUBE_WORKDIR", raising=False)
+    project = Path(__file__).resolve().parents[1]
+    assert default_workdir() == project / "tmp"
+    assert Path(tempfile.gettempdir()) not in (default_workdir() or Path("/")).parents
+
+    monkeypatch.setenv("ALPHACUBE_WORKDIR", str(tmp_path / "wd"))
+    assert default_workdir() == tmp_path / "wd" and (tmp_path / "wd").is_dir()
+
+    # and the engine actually writes its boundaries there
+    seen = []
+    real = tempfile.TemporaryDirectory
+
+    def spy(*a, **kw):
+        seen.append(kw.get("dir"))
+        return real(*a, **kw)
+
+    monkeypatch.setattr(tempfile, "TemporaryDirectory", spy)
+    # a full-width value wanted by both an S-mode round (cross_*) and a D-mode one
+    # (nt_cs_*) has to be written out between them -- that is the boundary
+    expr = parse("day_mean(nt_cs_rank(in_mean_rolling(cross_delay(Close, 2), 3)))")
+    res = CubeEngine(view, chunk_symbols=3, chunk_days=7).evaluate([expr], tolerant=True)
+    assert res.plan.boundaries, "expected this tree to materialise a boundary"
+    assert seen and all(d == tmp_path / "wd" for d in seen), seen

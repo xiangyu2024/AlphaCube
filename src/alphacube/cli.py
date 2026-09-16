@@ -115,7 +115,7 @@ def cmd_mine(a) -> int:
         pool_capacity=a.pool_capacity, dedup=a.dedup, min_coverage=a.min_coverage, meanstd_lr=a.meanstd_lr,
         meanstd_steps=a.meanstd_steps, dynamic_window=a.dynamic_window, seed_library=a.seed_library,
         presqueeze=(dict(n_iterations=a.presqueeze) if a.presqueeze else None), gp_params=gp,
-        allow_boolean_ops=a.allow_boolean_ops,
+        allow_boolean_ops=a.allow_boolean_ops, workdir=a.workdir,
         max_expr_len=a.max_expr_len, combine_methods=tuple(x for x in a.combine.split(",") if x),
         combine_train_frac=a.combine_train_frac, out_root=a.out, run_id=a.run_id,
     )
@@ -145,6 +145,10 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--label-param", action="append", default=[], metavar="KEY=VALUE")
     common.add_argument("--horizon", type=int, default=1)
     common.add_argument("--device", default="cpu")
+    common.add_argument("--workdir", default=None,
+                        help="where boundary memmaps go. One boundary is a whole (S, D, M) float32 cube "
+                             "(9.8 GB at 5219x1942x241), so this must NOT land on a small system disk. "
+                             "Defaults to $ALPHACUBE_WORKDIR, else <project>/tmp")
     common.add_argument("--chunk-symbols", type=int, default=None)
     common.add_argument("--chunk-days", type=int, default=None)
     common.add_argument("--out", default=None, help="run directory parent")

@@ -9,7 +9,8 @@ through ``is_gt0`` or a NaN-aware reducer), and hands results on:
 - roots and degenerate nodes crossing modes -> in-memory ``(S, D)`` panels
   (column 0; exact for minute-degenerate values);
 - full-width nodes crossing modes -> a ``(S, D, M)`` memmap in ``workdir``
-  (deleted at the end).
+  (deleted at the end). ``workdir`` defaults to ``<project>/tmp``, never the
+  system temp dir -- see ``default_workdir``.
 
 Panel rounds run whole ``(D, S)`` tensors on ``device``. ``dtype="float64"``
 widens the whole path for a reference run (see the constructor).
@@ -35,6 +36,29 @@ from .kernels import apply_cube, apply_panel
 from .schedule import Plan, Round, plan_rounds
 
 ProgressFn = Callable[[int, int, int, int], None]   # (round_idx, n_rounds, done_units, total_units)
+
+
+def default_workdir() -> Optional[Path]:
+    """Where boundary memmaps go when the caller does not say.
+
+    NOT the system temp directory. One boundary is a whole ``(S, D, M)`` float32
+    cube -- 9.8 GB at 5219 x 1942 x 241 -- and a run that materialises a few of
+    them filled the container's system disk, which is small and shared, while the
+    data sits on a separate volume. Order of preference: ``$ALPHACUBE_WORKDIR``,
+    then ``<project>/tmp`` when the source tree is writable (so everything a run
+    generates stays under the project directory), then the system temp dir.
+    """
+    env = os.environ.get("ALPHACUBE_WORKDIR")
+    if env:
+        p = Path(env)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    root = Path(__file__).resolve().parents[3]          # src/alphacube/engine/engine.py -> project
+    if (root / "src" / "alphacube").is_dir() and os.access(root, os.W_OK):
+        p = root / "tmp"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    return None
 
 
 @dataclass
@@ -81,7 +105,7 @@ class CubeEngine:
         self.chunk_bytes = int(chunk_bytes)
         self.apply_mask = bool(apply_mask)
         self.mask_policy = mask_policy
-        self.workdir = None if workdir is None else Path(workdir)
+        self.workdir = Path(workdir) if workdir is not None else default_workdir()
         if torch_threads is not None:
             torch.set_num_threads(int(torch_threads))
         self._tradable = torch.from_numpy(view.tradable()).to(self.device)   # (S, D) bool
@@ -325,4 +349,4 @@ class CubeEngine:
                 panels[n.key] = np.ascontiguousarray(out.detach().cpu().numpy().T, dtype=self.np_dtype)
 
 
-__all__ = ["CubeEngine", "EvalResult"]
+__all__ = ["CubeEngine", "EvalResult", "default_workdir"]

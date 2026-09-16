@@ -116,6 +116,7 @@ def run_mining(
     seed_library: Optional[Union[str, Path]] = None,
     presqueeze: Optional[dict] = None,
     allow_boolean_ops: bool = False,
+    workdir: Optional[Union[str, Path]] = None,
     gp_params: Optional[dict] = None,
     rl_params: Optional[dict] = None,
     max_expr_len: int = 20,
@@ -146,7 +147,8 @@ def run_mining(
     reg = default_registry()
     pool_obj = build_pool(pool, pool_capacity, target, realized, dedup, min_coverage, meanstd_lr, meanstd_steps,
                           dynamic_window)
-    engine = CubeEngine(view, device=device, chunk_symbols=chunk_symbols, chunk_days=chunk_days)
+    engine = CubeEngine(view, device=device, chunk_symbols=chunk_symbols, chunk_days=chunk_days,
+                        workdir=workdir)
     if seed_library:
         from .legacy import load_seed_library, seed_pool
         exprs, errs = load_seed_library(seed_library, n_minutes=view.n_minutes)
@@ -170,7 +172,7 @@ def run_mining(
         gp.update(gp_params or {})
         m = GPMiner(reg, view, target, pool_obj, seed=seed, device=device, min_coverage=min_coverage,
                     chunk_symbols=chunk_symbols, chunk_days=chunk_days,
-                    allow_boolean_ops=allow_boolean_ops, **gp)
+                    allow_boolean_ops=allow_boolean_ops, workdir=workdir, **gp)
         rep = m.mine(budget, on_generation=lambda g, n, s: progress(g, n, s))
         added, evaluated, engine_s = rep.added, rep.evaluated, rep.engine_seconds
         summary = f"{rep.generations} generations, archive {rep.archive_size}, best |IC| {rep.best_fitness:+.4f}"

@@ -60,6 +60,8 @@ if __name__ == "__main__":
         combine_methods=("equal", "ic", "icir", "lstsq", "ridge", "gbdt"),
         combine_train_frac=0.7,
         # ---------------- 输出 ----------------
+        workdir=PROJECT_ROOT / "tmp",   # 落盘中间量:一个边界文件就是整块 (S, D, M) float32
+                                       # (5219x1942x241 = 9.8 GB),绝不能落在小的系统盘上
         out_root=PROJECT_ROOT / "mining_runs",
         run_id=None,
         save_values=True,
