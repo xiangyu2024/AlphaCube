@@ -8,8 +8,11 @@ def test_registry_faces_and_twins(registry):
     faces = {}
     for s in registry.list_all():
         faces[s.face] = faces.get(s.face, 0) + 1
-    assert faces["dt"] == 121 and faces["nd"] == 48 and faces["nt"] == 48 and faces["shared"] == 25
-    assert "rank" not in registry and "indneutralize" not in registry and len(registry) == 242
+    # shared went 25 -> 27 when pow_1_5 / pow_2_5 were baked: the exponent is a
+    # parameter of the operator, never an operand the search can fill with a tensor
+    # (see _VARIANT_DEFS and test_pow_exponent_is_baked_never_searched).
+    assert faces["dt"] == 121 and faces["nd"] == 48 and faces["nt"] == 48 and faces["shared"] == 27
+    assert "rank" not in registry and "indneutralize" not in registry and len(registry) == 244
     nd = {s.name: s for s in registry.by_face("nd")}
     nt = {s.name: s for s in registry.by_face("nt")}
     assert set(nt) == {f"nt_{n}" for n in nd}

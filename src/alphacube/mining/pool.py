@@ -25,7 +25,8 @@ import numpy as np
 import torch
 
 from ..expression import Expression
-from ..metrics import backtest_metrics, cs_pearson, nanmean_quiet, sampled_abs_corr, zscore_rows
+from ..metrics import (MIN_PAIRS, backtest_metrics, cs_pearson, nanmean_quiet, sampled_abs_corr,
+                       zscore_rows)
 
 
 class DuplicateFactorError(ValueError):
@@ -42,6 +43,7 @@ class Member:
 class PoolBase(ABC):
     def __init__(self, capacity: int, target: np.ndarray, dedup_threshold: Optional[float] = 0.99,
                  dedup_sample_days: int = 250, min_coverage: float = 0.5,
+                 min_scored_days: float = 0.5,
                  realized_returns: Optional[np.ndarray] = None) -> None:
         if capacity < 1:
             raise ValueError("capacity must be >= 1")
@@ -50,6 +52,17 @@ class PoolBase(ABC):
         self.dedup_threshold = dedup_threshold
         self.dedup_sample_days = int(dedup_sample_days)
         self.min_coverage = float(min_coverage)
+        # Share of the label's days on which the factor must actually produce an IC.
+        # coverage asks "is the cell finite", which a degenerate panel passes: a
+        # factor that is identically 0 everywhere is finite everywhere. What it
+        # cannot do is vary across stocks, so cs_pearson returns NaN for the day and
+        # the |IC| ends up computed from whatever handful of days did vary. On the
+        # production cube `signedpower(pow(0.5, ts_quantile_q75(day_close(Volume), 50)))`
+        # came top of a generation that way -- 0.5**1e5 underflows to exactly 0 in
+        # float32 -- with coverage 0.81 and an IC drawn from 329 days out of 1893.
+        # This gate asks the question coverage cannot: does it separate stocks, and
+        # on how many days.
+        self.min_scored_days = float(min_scored_days)
         # P&L leg for test_ensemble: the label itself when it is a return.
         self.realized = self.target if realized_returns is None else np.asarray(realized_returns, dtype=np.float64)
         self.members: List[Member] = []
@@ -103,13 +116,19 @@ class PoolBase(ABC):
         """Add, refit, prune the weakest if over capacity, refit; return the pool IC.
         Any failure restores the pool exactly and re-raises."""
         z = zscore_rows(panel)
-        ic = nanmean_quiet(cs_pearson(panel, self.target))
+        ic_series = cs_pearson(panel, self.target)
+        ic = nanmean_quiet(ic_series)
         if not np.isfinite(ic):
             raise ValueError("candidate has no finite IC")
         cells = max(int(np.isfinite(self.target).sum()), 1)
         coverage = float((np.isfinite(panel) & np.isfinite(self.target)).sum() / cells)
         if coverage < self.min_coverage:
             raise ValueError(f"coverage {coverage:.2f} below min_coverage {self.min_coverage}")
+        usable = max(int((np.isfinite(self.target).sum(axis=1) >= MIN_PAIRS).sum()), 1)
+        scored = float(np.isfinite(ic_series).sum() / usable)
+        if scored < self.min_scored_days:
+            raise ValueError(f"scored on {scored:.2f} of usable days, below min_scored_days "
+                             f"{self.min_scored_days} (finite everywhere but no cross-sectional spread)")
         saved_members, saved_weights = list(self.members), self.weights
         try:
             if self.dedup_threshold is not None:

@@ -76,10 +76,11 @@ def make_label(kind: str, horizon: int, params: Optional[Dict[str, float]] = Non
 
 def build_pool(kind: str, capacity: int, target, realized, dedup: Optional[float] = 0.99,
                min_coverage: float = 0.5, meanstd_lr: float = 0.05, meanstd_steps: int = 200,
-               dynamic_window: int = 60):
+               dynamic_window: int = 60, min_scored_days: float = 0.5):
     from .mining.pool import DynamicRollingPool, MeanStdPool, MsePool
 
-    kw = dict(dedup_threshold=dedup, min_coverage=min_coverage, realized_returns=realized)
+    kw = dict(dedup_threshold=dedup, min_coverage=min_coverage, min_scored_days=min_scored_days,
+              realized_returns=realized)
     if kind == "mse":
         return MsePool(capacity, target, **kw)
     if kind == "meanstd":
@@ -110,6 +111,7 @@ def run_mining(
     pool_capacity: int = 10,
     dedup: Optional[float] = 0.99,
     min_coverage: float = 0.5,
+    min_scored_days: float = 0.5,
     meanstd_lr: float = 0.05,
     meanstd_steps: int = 200,
     dynamic_window: int = 60,
@@ -150,7 +152,7 @@ def run_mining(
         f"{view.n_symbols} symbols (warm-up {trim}); label {lab.describe()}; tradable {view.tradable().mean():.1%}")
     reg = default_registry()
     pool_obj = build_pool(pool, pool_capacity, target, realized, dedup, min_coverage, meanstd_lr, meanstd_steps,
-                          dynamic_window)
+                          dynamic_window, min_scored_days=min_scored_days)
     engine = CubeEngine(view, device=device, chunk_symbols=chunk_symbols, chunk_days=chunk_days,
                         workdir=workdir)
     if seed_library:
@@ -199,6 +201,7 @@ def run_mining(
         gp = dict(population_size=24, max_depth=4, min_depth=2, top_k=None)
         gp.update(gp_params or {})
         m = GPMiner(reg, view, target, pool_obj, seed=seed, device=device, min_coverage=min_coverage,
+                    min_scored_days=min_scored_days,
                     chunk_symbols=chunk_symbols, chunk_days=chunk_days,
                     allow_boolean_ops=allow_boolean_ops, allow_resource_risk=allow_resource_risk,
                     skip_kernels=frozenset(skip_kernels), checkpoint_dir=ckpt_dir,

@@ -54,6 +54,12 @@ LOOKAHEAD_KERNELS = frozenset({"ts_shift", "cross_shift", "in_local_mean"})
 # So the ND ones stay in the search vocabulary and the NT twins do not. The whole
 # set is still what calculate.py defers, which is a different (memory) question.
 RESOURCE_RISK_KERNELS = frozenset({"ts_pearson", "nt_ts_pearson", "nt_ts_spearman", "in_multireg"})
+# Operators whose operand positions are not all interchangeable: the search has no
+# way to say "a tensor belongs here but a literal belongs there", so a binary
+# ``pow`` invites pow(constant, tensor) and its float32 underflow (see _VARIANT_DEFS).
+# The baked unary variants cover every exponent worth searching. Still reachable by
+# name for research and the legacy corpus -- only the SEARCH vocabulary drops it.
+POSITIONALLY_UNSAFE_KERNELS = frozenset({"pow"})
 # Of those, the ones a full-market search must not breed: same kernels, NT face.
 SEARCH_FORBIDDEN_KERNELS = frozenset({"nt_ts_pearson", "nt_ts_spearman", "in_multireg"})
 # Kernels deliberately left out of the registry (recorded in Registry.skipped):
@@ -127,8 +133,18 @@ def _validate(name: str, meta: dict) -> Tuple[Optional[str], Optional[str]]:
 
 # ---- parameter-baked variants (unchanged from the previous project) ----------
 _VARIANT_DEFS: Tuple[Tuple[str, str, Callable], ...] = (
+    # Exponents are BAKED, never searched as an operand. A binary pow lets the
+    # search put a tensor in the exponent -- pow(0.5, volume) -- and in float32
+    # 0.5**x underflows to exactly 0 for x > 126, so a daily volume of 1e5 gives a
+    # panel that is identically zero. It is finite everywhere (coverage looks
+    # healthy) but has no cross-sectional variance, so cs_pearson returns NaN on
+    # almost every day and the |IC| is computed from the handful that survive. That
+    # is how such a tree reached rank 1 of a full-market generation with |IC| 0.0741
+    # and a Sharpe of 0.53. The exponent is not a thing a factor searches over.
     ("pow_05", "pow_", lambda f: (lambda x: f(x, 0.5))),
+    ("pow_1_5", "pow_", lambda f: (lambda x: f(x, 1.5))),
     ("pow_2", "pow_", lambda f: (lambda x: f(x, 2.0))),
+    ("pow_2_5", "pow_", lambda f: (lambda x: f(x, 2.5))),
     ("pow_3", "pow_", lambda f: (lambda x: f(x, 3.0))),
     ("is_gt0", "is_gt", lambda f: (lambda x: f(x, 0.0))),
     ("is_lt0", "is_lt", lambda f: (lambda x: f(x, 0.0))),
@@ -321,7 +337,7 @@ def _make_spec(name: str, face: str, family: str, category: str, meta: dict,
         lookahead=(kernel_id.split(".")[-1] in LOOKAHEAD_KERNELS),
         boolean_output=(distinct <= 2), coarse_output=(2 < distinct <= 3),
         trivial_boolean=(distinct <= 2 and _probe_constant_capable(fn, category, restores)),
-        resource_risk=(name in SEARCH_FORBIDDEN_KERNELS),
+        resource_risk=(name in SEARCH_FORBIDDEN_KERNELS or name in POSITIONALLY_UNSAFE_KERNELS),
         windows=WINDOWS.get(face, ()),
     )
 

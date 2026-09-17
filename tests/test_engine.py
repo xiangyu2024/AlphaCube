@@ -171,7 +171,16 @@ def test_chunk_invariance_over_random_population(registry, view):
     bit-identical under any chunking."""
     from alphacube.mining.generator import TypedTreeGenerator
 
-    pop = TypedTreeGenerator(registry, n_minutes=view.n_minutes, seed=9, max_depth=4).generate_population(150)
+    # sliding_*_masked_p5 rolls along dim 0, which the engine fills with stock-days,
+    # so it is chunk-dependent by construction -- pinned separately as a strict xfail
+    # in test_sliding_masked_family_is_chunk_invariant. Excluded here so that this
+    # test measures the ENGINE and does not flip to red whenever a vocabulary change
+    # reshuffles the draw into one of them.
+    broken = {"sliding_top_sum_masked_p5", "sliding_bottom_sum_masked_p5",
+              "sliding_top_mean_masked_p5", "sliding_bottom_mean_masked_p5"}
+    gen = TypedTreeGenerator(registry, n_minutes=view.n_minutes, seed=9, max_depth=4)
+    pop = [e for e in gen.generate_population(200)
+           if not any(n.spec is not None and n.spec.name in broken for n in e.nodes())][:150]
     a = CubeEngine(view, chunk_symbols=3, chunk_days=7).evaluate(pop, tolerant=True)
     b = CubeEngine(view).evaluate(pop, tolerant=True)
     assert set(a.errors) == set(b.errors)

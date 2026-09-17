@@ -33,7 +33,7 @@ import torch
 from ..catalog import Registry
 from ..engine.engine import CubeEngine
 from ..expression import Expression, is_valid_root
-from ..metrics import batched_ic
+from ..metrics import MIN_PAIRS, batched_ic, cs_pearson
 from ..store import CubeView
 from .clustering import cluster_population, cull_clusters
 from .generator import TypedTreeGenerator
@@ -60,6 +60,7 @@ class GPMiner:
                  population_size: int = 24, tournament_size: int = 3, crossover_rate: float = 0.7,
                  mutation_rate: float = 0.3, elitism: int = 1, min_depth: int = 2, max_depth: int = 4,
                  top_k: Optional[int] = None, fitness_signed: bool = False, min_coverage: float = 0.5,
+                 min_scored_days: float = 0.5,
                  cull_rel_threshold: float = 0.5, merge_threshold: float = 0.8, panel_cache_items: int = 512,
                  device: str = "cpu", chunk_symbols: Optional[int] = None, chunk_days: Optional[int] = None,
                  fields: Optional[Sequence[str]] = None, allow_boolean_ops: bool = False,
@@ -83,6 +84,11 @@ class GPMiner:
         # score it -inf below this share of the label's finite cells (the pool applies the
         # same threshold, so the fitness ranking and the commit gate agree).
         self.min_coverage = float(min_coverage)
+        # Same gate as the pool: coverage says the cell is finite, this says the day
+        # actually produced an IC. A panel that is identically zero is finite
+        # everywhere and separates nothing, and its |IC| comes from the few days that
+        # happened to vary -- which is how it climbs to rank 1. See LinearPool.
+        self.min_scored_days = float(min_scored_days)
         self._rng = random.Random(seed)
         # The archive lives in memory and only reaches disk in _commit(), i.e. when the
         # whole budget is spent. On a full-market run that is many hours, and a run
@@ -117,6 +123,7 @@ class GPMiner:
         self._target_t = torch.from_numpy(np.ascontiguousarray(self.target)).float()
         self._target_finite = np.isfinite(self.target)
         self._target_cells = max(int(self._target_finite.sum()), 1)
+        self._usable_days = max(int((self._target_finite.sum(axis=1) >= MIN_PAIRS).sum()), 1)
         self._panel_cache: "OrderedDict[str, np.ndarray]" = OrderedDict()
         self._panel_cache_items = int(panel_cache_items)
         self._archive: Dict[str, Tuple[Expression, float]] = {}
@@ -182,6 +189,10 @@ class GPMiner:
                 cov = float((np.isfinite(panels[i]) & self._target_finite).sum() / self._target_cells)
                 if cov < self.min_coverage:
                     continue
+                if self.min_scored_days > 0:
+                    scored = np.isfinite(cs_pearson(panels[i].astype(float), self.target)).sum()
+                    if scored / self._usable_days < self.min_scored_days:
+                        continue
                 fit[i] = ic if self.fitness_signed else abs(ic)
         return fit
 

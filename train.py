@@ -61,6 +61,9 @@ if __name__ == "__main__":
         pool_capacity=10,
         dedup=0.99,                  # 与任一成员 |corr| 超过此值即拒绝;None 关闭
         min_coverage=0.5,            # 候选在可交易股票日上的有限值占比下限
+        min_scored_days=0.5,         # 候选必须在多大比例的可用交易日上真的算得出 IC。
+                                     # min_coverage 只问"格点是不是有限值",一个恒为 0 的面板照样通过;
+                                     # 这一条问的是"当天到底有没有截面区分度"            # 候选在可交易股票日上的有限值占比下限
         meanstd_lr=0.05, meanstd_steps=200, dynamic_window=60,
         seed_library=None,           # 例:PROJECT_ROOT / "configs" / "seed_alpha_library_dt.yaml"
         presqueeze=None,             # 例:dict(n_iterations=4, top_k_per_iteration=8)

@@ -287,3 +287,65 @@ def test_skip_kernels_reproduces_the_trajectory_until_the_first_refusal(registry
                                              if s.name != victim]
     first = [e.key() for e in dropped.generator.generate_population(8)]
     assert first != base_pops[0], "removing it from the vocabulary must shift the very first draw"
+
+
+def test_scored_days_gate_rejects_a_panel_that_separates_nothing(registry, view):
+    """coverage asks whether a cell is finite; this asks whether the day produced an
+    IC at all. A panel that is identically zero passes the first and fails the
+    second: finite everywhere, varying nowhere, so cs_pearson returns NaN for the
+    day and the |IC| ends up drawn from whatever handful of days did vary.
+
+    On the production cube that is not hypothetical --
+    ``signedpower(pow(0.5, ts_quantile_q75(day_close(Volume), 50)))`` came top of a
+    generation with |IC| 0.0741 and a Sharpe of 0.53, because 0.5**1e5 underflows to
+    exactly 0 in float32 and its IC came from 329 days out of 1893."""
+    import numpy as np
+
+    from alphacube.label import Label
+    from alphacube.mining.pool import MsePool
+
+    target = Label("close", 1).compute(view)
+    D, S = target.shape
+
+    rng = np.random.default_rng(0)
+    real = np.where(np.isfinite(target), rng.normal(size=(D, S)), np.nan)
+
+    # A panel that is degenerate on EVERY day was already refused -- its mean IC is
+    # NaN. The one that got through is the partial case: constant on most days, with
+    # a spread on a few, so the mean IC is finite and comes from those few. That is
+    # the real factor's shape, 329 scored days out of 1893.
+    with pytest.raises(ValueError, match="no finite IC"):
+        MsePool(4, target, min_scored_days=0.5).try_add(parse("day_mean(Close)"), np.zeros((D, S)))
+
+    sparse = np.where(np.arange(D)[:, None] % 10 == 0, real, 0.0)
+    with pytest.raises(ValueError, match="scored on"):
+        MsePool(4, target, min_scored_days=0.5).try_add(parse("day_max(High)"), sparse)
+
+    # the threshold is what decides, not some incidental property of the data
+    MsePool(4, target, min_scored_days=0.05).try_add(parse("day_max(High)"), sparse)
+
+    pool = MsePool(4, target, min_scored_days=0.5)
+    pool.try_add(parse("day_std(Ret)"), real)     # a panel that varies every day gets in
+    assert pool.size == 1
+
+
+def test_pow_exponent_is_baked_never_searched(registry):
+    """A binary pow lets the search put a tensor in the exponent, and in float32
+    0.5**x underflows to exactly 0 above x=126 -- so pow(0.5, volume) is a panel of
+    zeros wearing a healthy coverage number. Exponents are baked variants instead;
+    the binary form stays reachable by name for research and the legacy corpus."""
+    searchable = {s.name for s in registry.searchable(include_boolean=False,
+                                                      include_resource_risk=False)}
+    everything = {s.name for s in registry.list_all()}
+
+    assert "pow" not in searchable, "a searchable binary pow invites pow(const, tensor)"
+    assert "pow" in everything, "research and the legacy corpus still need it by name"
+    assert {"pow_05", "pow_1_5", "pow_2", "pow_2_5", "pow_3"} <= searchable
+
+    import torch
+    binary = registry.get("pow").fn
+    assert binary(torch.tensor([[0.5]]), torch.tensor([[1e5]])).item() == 0.0, \
+        "this is the underflow the gate exists for"
+    for name, exp in (("pow_05", 0.5), ("pow_2", 2.0), ("pow_3", 3.0)):
+        got = registry.get(name).fn(torch.tensor([[4.0]])).item()
+        assert abs(got - 4.0 ** exp) < 1e-4, name
