@@ -114,11 +114,11 @@ def cmd_mine(a) -> int:
         label_params=_kv(a.label_param), horizon=a.horizon, miner=a.miner, budget=a.budget, seed=a.seed,
         device=a.device, chunk_symbols=a.chunk_symbols, chunk_days=a.chunk_days, pool=a.pool,
         pool_capacity=a.pool_capacity, dedup=a.dedup, min_coverage=a.min_coverage,
-        min_scored_days=a.min_scored_days, meanstd_lr=a.meanstd_lr,
+        min_scored_days=a.min_scored_days, cost_per_side=a.cost_per_side, turnover_cap=a.turnover_cap, meanstd_lr=a.meanstd_lr,
         meanstd_steps=a.meanstd_steps, dynamic_window=a.dynamic_window, seed_library=a.seed_library,
         presqueeze=(dict(n_iterations=a.presqueeze) if a.presqueeze else None), gp_params=gp,
         allow_boolean_ops=a.allow_boolean_ops, allow_resource_risk=a.allow_resource_risk,
-        checkpoint_every=a.checkpoint_every, engine_progress_every=a.progress_every,
+        checkpoint_every=a.checkpoint_every, rolling_block=a.rolling_block, ban_top_n=a.ban_top_n, engine_progress_every=a.progress_every,
         skip_kernels=tuple(x for x in a.skip_kernels.split(",") if x),
         workdir=a.workdir,
         max_expr_len=a.max_expr_len, combine_methods=tuple(x for x in a.combine.split(",") if x),
@@ -194,6 +194,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "draw where it was, so a run reproduces an earlier one exactly up to the first "
                         "refusal -- use it with --allow-resource-risk to replay a run that was poisoned "
                         "by an expensive operator")
+    m.add_argument("--rolling-block", type=int, default=0,
+                   help="restart the population every N generations (0 = off, one long run). A single run "
+                        "converges onto one primitive and spends the rest of its budget re-wrapping it")
+    m.add_argument("--ban-top-n", type=int, default=0,
+                   help="at each rolling restart, forbid the N depth-1 substructures the finished block "
+                        "used most, e.g. day_ar1_coefficient(Volume). Banned everywhere -- fresh trees, "
+                        "mutations and crossovers -- so the next block has to look elsewhere")
     m.add_argument("--checkpoint-every", type=int, default=0,
                    help="write the ranked archive to <run>/checkpoints/archive_gen<N>.csv every N "
                         "generations. Without it the expressions exist only in memory until the whole "
@@ -205,7 +212,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "bytes (40 MB at 1942 x 5219), so 512 is ~21 GB and 2048 is ~83 GB")
     m.add_argument("--top-k", type=int, default=None)
     m.add_argument("--dedup", type=float, default=0.99)
-    m.add_argument("--min-coverage", type=float, default=0.5)
+    m.add_argument("--min-coverage", type=float, default=0.5,
+                   help="share of the label's finite cells on which the factor must be finite")
+    m.add_argument("--cost-per-side", type=float, default=0.0,
+                   help="one-way trading cost as a fraction (0.0015 = 15bp). Every unit of weight that "
+                        "moves pays it, buy or sell, so a full round trip of the book costs twice this. "
+                        "0 keeps the old cost-free numbers")
+    m.add_argument("--turnover-cap", type=float, default=None,
+                   help="also report the same factors under a daily turnover ceiling (0.3 = 30%% of the "
+                        "book). When the full trade to target would exceed it, the book is blended toward "
+                        "the target instead -- path dependent, so today's holding starts tomorrow's trade")
+    m.add_argument("--min-scored-days", type=float, default=0.5,
+                   help="share of usable days on which the factor must actually PRODUCE an IC. "
+                        "--min-coverage only asks whether the cell is finite, which a panel of zeros "
+                        "passes everywhere; this asks whether the day had any cross-sectional spread")
     m.add_argument("--meanstd-lr", type=float, default=0.05)
     m.add_argument("--meanstd-steps", type=int, default=200)
     m.add_argument("--dynamic-window", type=int, default=60)

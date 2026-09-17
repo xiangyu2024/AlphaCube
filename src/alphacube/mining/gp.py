@@ -65,6 +65,7 @@ class GPMiner:
                  device: str = "cpu", chunk_symbols: Optional[int] = None, chunk_days: Optional[int] = None,
                  fields: Optional[Sequence[str]] = None, allow_boolean_ops: bool = False,
                  allow_resource_risk: bool = False, skip_kernels: "frozenset[str]" = frozenset(),
+                 rolling_block: int = 0, ban_top_n: int = 0,
                  on_engine_progress: Optional[Callable[[dict], None]] = None,
                  checkpoint_dir: Optional[os.PathLike] = None,
                  checkpoint_every: int = 0,
@@ -108,6 +109,16 @@ class GPMiner:
         # A generation is ONE engine call, so without this the log goes silent for
         # however long that call takes -- 58 minutes for a cold population on the
         # production cube, and there was no way to tell progress from a hang.
+        # Rolling restart: every ``rolling_block`` generations, throw the population
+        # away, ban the ``ban_top_n`` depth-1 primitives the block leaned on hardest,
+        # and start again. A single long run converges onto one primitive and spends
+        # the rest of its budget re-wrapping it -- 179 of 364 archived expressions
+        # shared one. Banning what the last block exhausted is what makes the next
+        # block search somewhere else instead of rediscovering the same thing.
+        # 0 disables it and the miner behaves exactly as before.
+        self.rolling_block = max(0, int(rolling_block))
+        self.ban_top_n = max(0, int(ban_top_n))
+        self.blocks: List[dict] = []
         self.on_engine_progress = on_engine_progress
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
         self.checkpoint_every = max(0, int(checkpoint_every))
@@ -196,6 +207,23 @@ class GPMiner:
                 fit[i] = ic if self.fitness_signed else abs(ic)
         return fit
 
+    def _roll(self, population, fit, generation: int) -> List[str]:
+        """End of a block: ban what it leaned on, record what it found, start over."""
+        from collections import Counter
+        from .generator import one_layer_keys
+
+        counts: "Counter[str]" = Counter()
+        for e, f in zip(population, fit):
+            if np.isfinite(f):
+                counts.update(one_layer_keys(e))
+        banned = [k for k, _ in counts.most_common(self.ban_top_n)] if self.ban_top_n else []
+        if banned:
+            self.generator.ban(banned)
+        self.blocks.append({"generation": generation, "banned": banned,
+                            "counts": counts.most_common(10),
+                            "banned_total": len(self.generator.banned_substructures)})
+        return banned
+
     def _archive_update(self, population, fit) -> None:
         for e, f in zip(population, fit):
             if not np.isfinite(f):
@@ -213,10 +241,14 @@ class GPMiner:
         return population[max(idx, key=lambda i: fit[i])]
 
     def _mutate(self, expr: Expression) -> Expression:
-        kinds = ["subtree", "window", "constant"]
+        # Five kinds, not three: operator-swap refines a structure instead of
+        # discarding it, and hoist is the only move that makes a tree SHORTER --
+        # without it a population drifts toward deep wrappers around one primitive.
+        kinds = ["subtree", "operator", "hoist", "window", "constant"]
         self._rng.shuffle(kinds)
         for k in kinds:
-            child = {"subtree": self.generator.mutate_subtree, "window": self.generator.mutate_window,
+            child = {"subtree": self.generator.mutate_subtree, "operator": self.generator.mutate_operator,
+                     "hoist": self.generator.mutate_hoist, "window": self.generator.mutate_window,
                      "constant": self.generator.mutate_constant}[k](expr)
             if child is not None:
                 return child
@@ -267,6 +299,16 @@ class GPMiner:
                                              "archive": len(self._archive), "valid": int(finite.size)})
             if self.checkpoint_every and self.checkpoint_dir and (g + 1) % self.checkpoint_every == 0:
                 self.write_checkpoint(g + 1)
+            if self.rolling_block and (g + 1) % self.rolling_block == 0 and g + 1 < n_gen:
+                banned = self._roll(population, fit, g + 1)
+                population = self.generator.generate_population(self.population_size)
+                fit = self.fitness(population)
+                self._archive_update(population, fit)
+                if on_generation is not None:
+                    on_generation(g + 1, n_gen, {"best": best, "gen_best": float("nan"),
+                                                 "gen_mean": float("nan"),
+                                                 "archive": len(self._archive),
+                                                 "valid": 0, "rolled": len(banned)})
         report = self._commit()
         report.generations = n_gen
         report.evaluated = self.evaluated

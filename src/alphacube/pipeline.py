@@ -112,6 +112,8 @@ def run_mining(
     dedup: Optional[float] = 0.99,
     min_coverage: float = 0.5,
     min_scored_days: float = 0.5,
+    cost_per_side: float = 0.0,
+    turnover_cap: Optional[float] = None,
     meanstd_lr: float = 0.05,
     meanstd_steps: int = 200,
     dynamic_window: int = 60,
@@ -121,6 +123,8 @@ def run_mining(
     allow_resource_risk: bool = False,
     skip_kernels: Sequence[str] = (),
     checkpoint_every: int = 0,
+    rolling_block: int = 0,
+    ban_top_n: int = 0,
     engine_progress_every: float = 0.0,
     workdir: Optional[Union[str, Path]] = None,
     gp_params: Optional[dict] = None,
@@ -204,7 +208,8 @@ def run_mining(
                     min_scored_days=min_scored_days,
                     chunk_symbols=chunk_symbols, chunk_days=chunk_days,
                     allow_boolean_ops=allow_boolean_ops, allow_resource_risk=allow_resource_risk,
-                    skip_kernels=frozenset(skip_kernels), checkpoint_dir=ckpt_dir,
+                    skip_kernels=frozenset(skip_kernels), rolling_block=rolling_block, ban_top_n=ban_top_n,
+                    checkpoint_dir=ckpt_dir,
                     on_engine_progress=(engine_progress if engine_progress_every > 0 else None),
                     checkpoint_every=checkpoint_every, workdir=workdir, **gp)
         rep = m.mine(budget, on_generation=lambda g, n, s: progress(g, n, s))
@@ -249,8 +254,10 @@ def run_mining(
             # the universe, shows up here as a Sharpe that does not match. Same
             # function and same top_frac as the pool line, so the numbers are
             # directly comparable. Diagnostic only -- one holding period, no costs.
-            bt = backtest_metrics(cs_pearson(pan, target[trim:]), pan, realized)
-            row.update({k: bt[k] for k in ("annualized_return", "sharpe", "max_drawdown") if k in bt})
+            bt = backtest_metrics(cs_pearson(pan, target[trim:]), pan, realized,
+                                  cost_per_side=cost_per_side, turnover_cap=turnover_cap)
+            row.update({k: v for k, v in bt.items()
+                        if k.startswith(("annualized_return", "sharpe", "max_drawdown", "turnover"))})
         rows.append(row)
         say(f"  [{i:2d}] w={row['weight']:+.4f} IC={row.get('ic_mean', float('nan')):+.4f}"
             f" sharpe={row.get('sharpe', float('nan')):+.2f}  {row['expression']}")

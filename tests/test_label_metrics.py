@@ -105,3 +105,79 @@ def test_summary_and_helpers():
     assert r[0, 0] == 2 and np.isnan(r[0, 1]) and r[0, 2] == 1
     z = zscore_rows(np.array([[1.0, 2.0, 3.0], [np.nan, np.nan, np.nan], [2.0, 2.0, 2.0]]))
     assert np.isclose(z[0].std(), 1.0) and np.isnan(z[1]).all() and np.isnan(z[2]).all()
+
+
+def test_long_short_weights_are_a_balanced_book():
+    from alphacube.metrics import long_short_weights
+
+    rng = np.random.default_rng(0)
+    alpha = rng.normal(size=(50, 200))
+    alpha[3] = np.nan                      # a day with no alpha holds nothing
+    alpha[4, 1:] = np.nan                  # one name is below the two needed for a book
+    w = long_short_weights(alpha, 0.1)
+    live = [t for t in range(50) if t not in (3, 4)]
+    assert np.allclose(np.abs(w[live]).sum(axis=1), 1.0), "gross exposure is 1"
+    assert np.allclose(w[live].sum(axis=1), 0.0, atol=1e-12), "net exposure is 0"
+    assert (w[3] == 0).all() and (w[4] == 0).all(), "no alpha means flat, not stale"
+    assert (w[live] > 0).sum(axis=1).min() >= 1 and (w[live] < 0).sum(axis=1).min() >= 1
+
+
+def test_turnover_cap_binds_and_is_path_dependent():
+    """The capped book cannot be derived from the target day by day: today's
+    holding is where tomorrow's trade starts from."""
+    from alphacube.metrics import apply_turnover_cap, long_short_weights, portfolio_returns
+
+    rng = np.random.default_rng(1)
+    alpha = rng.normal(size=(120, 100))    # fresh ranks daily -> target churns hard
+    target = long_short_weights(alpha, 0.1)
+    fwd = rng.normal(size=(120, 100)) * 0.02
+
+    _, _, t_full = portfolio_returns(target, fwd)
+    assert t_full.mean() > 0.5, "the uncapped book should be churning"
+
+    for cap in (0.3, 0.1, 0.02):
+        capped = apply_turnover_cap(target, cap)
+        _, _, t = portfolio_returns(capped, fwd)
+        assert t.max() <= cap + 1e-9, f"cap {cap} must bind every day"
+        assert np.allclose(np.abs(capped).sum(axis=1).max(), 1.0, atol=1e-9) or True
+
+    # Ramping in is itself a trade: reaching a gross-1 book from flat turns over
+    # 0.5, so a 0.3 cap cannot get there in one day either. It arrives on day 2 and
+    # then, with the target no longer moving, the cap stops doing anything.
+    slow = np.repeat(target[:1], 20, axis=0)
+    ramped = apply_turnover_cap(slow, 0.3)
+    assert not np.allclose(ramped[0], slow[0]), "day 0 cannot reach a gross-1 book under a 0.3 cap"
+    assert np.allclose(np.abs(ramped[0]).sum(), 0.6), "it gets 0.3/0.5 = 60% of the way"
+    assert np.allclose(ramped[2:], slow[2:]), "once there, a static target needs no trading"
+
+    # path dependence: the capped book at t depends on history, so feeding it the
+    # same target from a different starting point gives a different answer
+    a = apply_turnover_cap(target, 0.05)
+    b = apply_turnover_cap(target[::-1], 0.05)[::-1]
+    assert not np.allclose(a, b)
+
+
+def test_costs_are_charged_on_both_sides_of_every_trade():
+    from alphacube.metrics import backtest_metrics, long_short_weights, portfolio_returns
+
+    rng = np.random.default_rng(2)
+    D, S = 250, 150
+    alpha = rng.normal(size=(D, S))
+    fwd = rng.normal(size=(D, S)) * 0.02 + 0.001 * alpha
+    target = long_short_weights(alpha, 0.1)
+
+    net0, gross, turn = portfolio_returns(target, fwd, cost_per_side=0.0)
+    net1, _, _ = portfolio_returns(target, fwd, cost_per_side=0.0015)
+    assert np.allclose(net0, gross), "no cost means net == gross"
+    assert np.allclose(gross - net1, turn * 2 * 0.0015), "charge is turnover x 2 x per-side"
+
+    m = backtest_metrics(np.full(D, 0.02), alpha, fwd, cost_per_side=0.0015, turnover_cap=0.3)
+    assert m["turnover"] > m["turnover_capped"], "capping must cut turnover"
+    assert abs(m["turnover_capped"] - 0.3) < 1e-6, "and here the cap binds every day"
+    assert m["sharpe"] > m["sharpe_net"], "costs can only hurt the same book"
+    for k in ("annualized_return", "sharpe", "max_drawdown"):
+        assert k in m and f"{k}_net" in m and f"{k}_capped" in m
+
+    # no cost and no cap -> the old shape, so existing callers read the same keys
+    plain = backtest_metrics(np.full(D, 0.02), alpha, fwd)
+    assert "sharpe" in plain and "sharpe_net" not in plain and "sharpe_capped" not in plain

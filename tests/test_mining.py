@@ -349,3 +349,72 @@ def test_pow_exponent_is_baked_never_searched(registry):
     for name, exp in (("pow_05", 0.5), ("pow_2", 2.0), ("pow_3", 3.0)):
         got = registry.get(name).fn(torch.tensor([[4.0]])).item()
         assert abs(got - 4.0 ** exp) < 1e-4, name
+
+
+def test_one_layer_keys_are_the_primitives_not_the_wrappers(registry):
+    from alphacube.mining.generator import one_layer_keys
+
+    assert one_layer_keys(parse("ts_decay_linear(sigmoid(pow_2(day_ar1_coefficient(Volume))), 5)")) == \
+        {"O:day_ar1_coefficient(F:Volume)"}, "wrappers are not primitives; the leaf-fed node is"
+    assert one_layer_keys(parse("ts_min(ts_reg_fvalue(day_std(High), day_cov(Volume, Low), 40), 5)")) == \
+        {"O:day_std(F:High)", "O:day_cov(F:Volume,F:Low)"}, "a tree can rest on more than one"
+    assert one_layer_keys(parse("day_mean(Close)")) == {"O:day_mean(F:Close)"}
+
+
+def test_banned_substructures_cannot_enter_by_any_route(registry):
+    """Banning has to hold at every acceptance point -- fresh trees, mutations and
+    crossovers alike -- or the primitive walks back in through breeding."""
+    from alphacube.mining.generator import TypedTreeGenerator, one_layer_keys
+
+    free = TypedTreeGenerator(registry, n_minutes=24, seed=4, max_depth=4)
+    pop = free.generate_population(200)
+    victim = max((k for e in pop for k in one_layer_keys(e)),
+                 key=lambda k: sum(k in one_layer_keys(e) for e in pop))
+
+    gen = TypedTreeGenerator(registry, n_minutes=24, seed=4, max_depth=4,
+                             banned_substructures={victim})
+    fresh = gen.generate_population(200)
+    assert not any(victim in one_layer_keys(e) for e in fresh)
+
+    carrier = next(e for e in pop if victim in one_layer_keys(e))
+    for _ in range(40):
+        for fn in (gen.mutate_subtree, gen.mutate_operator, gen.mutate_hoist,
+                   gen.mutate_window, gen.mutate_constant):
+            child = fn(carrier)
+            assert child is None or victim not in one_layer_keys(child), fn.__name__
+        crossed = gen.crossover(carrier, fresh[0])
+        assert crossed is None or victim not in one_layer_keys(crossed)
+
+
+def test_initial_population_does_not_repeat_itself(registry):
+    from alphacube.mining.generator import TypedTreeGenerator
+
+    gen = TypedTreeGenerator(registry, n_minutes=24, seed=6, max_depth=4)
+    pop = gen.generate_population(64)
+    assert len({e.key() for e in pop}) >= 60, "a population of 64 should not be 40 distinct trees"
+
+
+def test_rolling_restart_bans_what_the_block_leaned_on(registry, view):
+    """A long run converges on one primitive and spends the rest of the budget
+    re-wrapping it. Rolling restarts end each block by banning the primitives that
+    block used most, so the next one has to look elsewhere."""
+    from alphacube.label import Label
+    from alphacube.mining.generator import one_layer_keys
+    from alphacube.mining.pool import MsePool
+
+    target = Label("close", 1).compute(view)
+    m = GPMiner(registry, view, target, MsePool(5, target), population_size=12, max_depth=4,
+                rolling_block=3, ban_top_n=2, seed=3)
+    m.mine(12 * 9)
+
+    assert len(m.blocks) >= 2, "nine generations in blocks of three must roll at least twice"
+    for b in m.blocks:
+        assert len(b["banned"]) <= 2 and b["counts"], b
+    banned = m.generator.banned_substructures
+    assert banned, "each roll should have banned something"
+    assert not any(banned & one_layer_keys(e) for e in m.generator.generate_population(150))
+
+    # off by default: same seed, no rolls, and the old three mutation kinds still work
+    plain = GPMiner(registry, view, target, MsePool(5, target), population_size=12, max_depth=4, seed=3)
+    plain.mine(12 * 9)
+    assert plain.blocks == [] and not plain.generator.banned_substructures

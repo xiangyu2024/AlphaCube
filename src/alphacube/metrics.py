@@ -171,6 +171,76 @@ def combine_panels(panels: Sequence[np.ndarray], weights: Sequence[float], nan_a
     return out
 
 
+def long_short_weights(alpha: np.ndarray, top_frac: float) -> np.ndarray:
+    """(D, S) alpha -> (D, S) target weights: equal-weight long the top ``top_frac``,
+    short the bottom, gross exposure 1 (so +0.5 long / -0.5 short) and net 0.
+    Days with too few names are all-zero rather than NaN, so a gap in the alpha
+    means "hold nothing", not "hold the previous book forever"."""
+    D, S = alpha.shape
+    w = np.zeros((D, S), dtype=np.float64)
+    for t in range(D):
+        a = alpha[t]
+        m = np.isfinite(a)
+        n = int(m.sum())
+        if n < 2:
+            continue
+        idx = np.flatnonzero(m)
+        k = max(1, int(np.floor(n * top_frac)))
+        order = idx[np.argsort(a[idx])]
+        w[t, order[-k:]] = 0.5 / k
+        w[t, order[:k]] = -0.5 / k
+    return w
+
+
+def apply_turnover_cap(target: np.ndarray, cap: Optional[float]) -> np.ndarray:
+    """Walk the book forward, never trading more than ``cap`` in a day.
+
+    Turnover is ``0.5 * sum|w_new - w_old|`` -- the share of a gross-1 book that
+    changes hands. Blending the old book toward the target is linear in that
+    measure, so ``w = w_old + lam * (target - w_old)`` turns over exactly
+    ``lam * full_turnover`` and the needed ``lam`` is ``cap / full_turnover``,
+    clipped at 1.
+
+    This is path dependent by construction: today's book is the starting point
+    for tomorrow's trade, so it cannot be computed day by day in isolation --
+    which is the whole reason a capped strategy is not just the target with a
+    smaller cost subtracted.
+    """
+    if cap is None:
+        return target
+    D = target.shape[0]
+    out = np.zeros_like(target)
+    held = np.zeros(target.shape[1], dtype=np.float64)
+    for t in range(D):
+        full = 0.5 * np.abs(target[t] - held).sum()
+        lam = 1.0 if full <= cap or full <= 0 else cap / full
+        held = held + lam * (target[t] - held)
+        out[t] = held
+    return out
+
+
+def portfolio_returns(weights: np.ndarray, fwd: np.ndarray, cost_per_side: float = 0.0):
+    """Daily P&L of a held book, after the cost of getting into it.
+
+    ``weights[t]`` is the book held into day ``t``'s forward return, and the trade
+    that establishes it is charged on the way in: every unit of weight that moves
+    pays ``cost_per_side`` whether it is a buy or a sell, so a round trip of the
+    whole book costs ``2 * cost_per_side``. Returns (net, gross, turnover)."""
+    D = weights.shape[0]
+    gross = np.full(D, np.nan)
+    turn = np.zeros(D)
+    prev = np.zeros(weights.shape[1], dtype=np.float64)
+    for t in range(D):
+        w, r = weights[t], fwd[t]
+        traded = np.abs(w - prev).sum()
+        turn[t] = 0.5 * traded
+        m = np.isfinite(r)
+        gross[t] = float((w[m] * r[m]).sum()) if m.any() else np.nan
+        prev = w
+    net = gross - turn * 2.0 * cost_per_side
+    return net, gross, turn
+
+
 def _long_short_returns(alpha: np.ndarray, fwd: np.ndarray, top_frac: float) -> np.ndarray:
     n_days = alpha.shape[0]
     out = np.full(n_days, np.nan)
@@ -187,12 +257,35 @@ def _long_short_returns(alpha: np.ndarray, fwd: np.ndarray, top_frac: float) -> 
     return out
 
 
+def _curve_stats(v: np.ndarray, periods_per_year: int) -> Dict[str, float]:
+    f = v[np.isfinite(v)]
+    if f.size < 2:
+        return {"annualized_return": float("nan"), "sharpe": float("nan"), "max_drawdown": float("nan")}
+    mean, std = float(f.mean()), float(f.std())
+    cum = np.cumprod(1.0 + f)
+    dd = cum / np.maximum.accumulate(cum) - 1.0
+    return {"annualized_return": float((1.0 + mean) ** periods_per_year - 1.0),
+            "sharpe": float(mean / std * np.sqrt(periods_per_year)) if std > 0 else float("nan"),
+            "max_drawdown": float(dd.min())}
+
+
 def backtest_metrics(ic_series: np.ndarray, alpha_values: Optional[np.ndarray] = None,
                      forward_returns: Optional[np.ndarray] = None, top_frac: float = 0.1,
-                     periods_per_year: int = 252) -> Dict[str, float]:
-    """ICIR from the IC series plus, when alpha/returns are given, an equal-weight
-    top-minus-bottom ``top_frac`` portfolio's annualised return / Sharpe / max
-    drawdown (diagnostic: one holding period, no costs, no limits)."""
+                     periods_per_year: int = 252, cost_per_side: float = 0.0,
+                     turnover_cap: Optional[float] = None) -> Dict[str, float]:
+    """ICIR from the IC series, plus an equal-weight top-minus-bottom ``top_frac``
+    portfolio measured two ways when ``cost_per_side`` or ``turnover_cap`` is given:
+
+    - **full**: rebalance all the way to the target book every day. Maximum
+      responsiveness, maximum turnover -- and at A-share costs the turnover is
+      what decides whether a daily-rebalanced factor survives at all.
+    - **capped**: never trade more than ``turnover_cap`` of the book in a day,
+      blending toward the target when the full trade would exceed it. Path
+      dependent: today's holding is tomorrow's starting point.
+
+    Both are still diagnostics -- one holding period, no borrow, no limits, no
+    market impact beyond the linear cost -- but with costs charged they are at
+    least the right shape for deciding between factors."""
     ic = np.asarray(ic_series, dtype=np.float64)
     f = ic[np.isfinite(ic)]
     ic_mean = float(f.mean()) if f.size else float("nan")
@@ -200,21 +293,28 @@ def backtest_metrics(ic_series: np.ndarray, alpha_values: Optional[np.ndarray] =
     out: Dict[str, float] = {"ic_mean": ic_mean, "ic_std": ic_std,
                              "icir": float(ic_mean / ic_std) if ic_std > 0 else float("nan")}
     if alpha_values is not None and forward_returns is not None:
-        port = _long_short_returns(np.asarray(alpha_values, dtype=np.float64),
-                                   np.asarray(forward_returns, dtype=np.float64), top_frac)
-        v = port[np.isfinite(port)]
-        if v.size:
-            mean, std = float(v.mean()), float(v.std())
-            cum = np.cumprod(1.0 + v)
-            dd = cum / np.maximum.accumulate(cum) - 1.0
-            out.update({"annualized_return": float((1.0 + mean) ** periods_per_year - 1.0),
-                        "sharpe": float(mean / std * np.sqrt(periods_per_year)) if std > 0 else float("nan"),
-                        "max_drawdown": float(dd.min())})
-        else:
-            out.update({"annualized_return": float("nan"), "sharpe": float("nan"), "max_drawdown": float("nan")})
+        alpha = np.asarray(alpha_values, dtype=np.float64)
+        fwd = np.asarray(forward_returns, dtype=np.float64)
+        target = long_short_weights(alpha, top_frac)
+
+        net, gross, turn = portfolio_returns(target, fwd, cost_per_side)
+        out.update(_curve_stats(gross, periods_per_year))          # the no-cost headline, unchanged
+        out["turnover"] = float(np.nanmean(turn))
+        if cost_per_side > 0:
+            for k, v in _curve_stats(net, periods_per_year).items():
+                out[f"{k}_net"] = v
+
+        if turnover_cap is not None:
+            capped = apply_turnover_cap(target, turnover_cap)
+            c_net, c_gross, c_turn = portfolio_returns(capped, fwd, cost_per_side)
+            src = c_net if cost_per_side > 0 else c_gross
+            for k, v in _curve_stats(src, periods_per_year).items():
+                out[f"{k}_capped"] = v
+            out["turnover_capped"] = float(np.nanmean(c_turn))
     return out
 
 
-__all__ = ["MIN_PAIRS", "cs_pearson", "cross_sectional_pearson", "rank_rows", "zscore_rows", "nanmean_quiet",
+__all__ = ["MIN_PAIRS", "long_short_weights", "apply_turnover_cap", "portfolio_returns",
+           "cs_pearson", "cross_sectional_pearson", "rank_rows", "zscore_rows", "nanmean_quiet",
            "ic_summary", "quantile_longshort", "batched_ic", "sampled_abs_corr", "daily_returns_from_close",
            "combine_panels", "backtest_metrics"]

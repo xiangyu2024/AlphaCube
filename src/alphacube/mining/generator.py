@@ -48,13 +48,31 @@ def collect(expr: Expression) -> List[Tuple[Expression, Optional[Expression]]]:
     return out
 
 
+def one_layer_keys(expr: Expression) -> set:
+    """Keys of ``expr``'s depth-1 subtrees -- an operator whose operands are all
+    leaves, e.g. ``day_ar1_coefficient(Volume)`` or ``day_cov(Volume, Low)``.
+
+    This is the unit a search actually latches onto. A run that finds one good
+    primitive will spend the rest of its budget wrapping it: the same
+    ``day_ar1_coefficient(Volume)`` appeared in 179 of 364 archived expressions
+    under sixteen different jackets, all scoring within noise of each other,
+    because the wrappers were monotone and barely moved the ranks. Counting these
+    keys is how a later block knows what the previous one exhausted.
+    """
+    out = set()
+    for n in expr.nodes():
+        if n.spec is not None and all(getattr(x, "spec", None) is None for x in n.operands):
+            out.add(n.key())
+    return out
+
+
 class TypedTreeGenerator:
     def __init__(self, registry: Registry, fields: Optional[Sequence[str]] = None,
                  constants: Optional[Sequence[float]] = None, n_minutes: int = 241,
                  min_depth: int = 2, max_depth: int = 4, feature_leaf_prob: float = 0.8,
                  grow_leaf_prob: float = 0.3, max_retries: int = 16,
                  include_lookahead: bool = False, allow_boolean_ops: bool = False,
-                 allow_resource_risk: bool = False,
+                 allow_resource_risk: bool = False, banned_substructures: frozenset = frozenset(),
                  rng: Optional[random.Random] = None, seed: int = 0) -> None:
         self.registry = registry
         self.fields = list(fields) if fields is not None else list(registry.fields)
@@ -70,6 +88,10 @@ class TypedTreeGenerator:
                  else registry.searchable(include_boolean=allow_boolean_ops,
                                           include_resource_risk=allow_resource_risk))
         self.allow_boolean_ops = bool(allow_boolean_ops)
+        # Depth-1 subtrees this generator refuses to build (see one_layer_keys).
+        # Checked at every acceptance point -- initial trees, mutations, crossovers
+        # -- so a banned primitive cannot re-enter through breeding either.
+        self.banned_substructures = frozenset(banned_substructures)
         self.specs: List[OpSpec] = specs
         # operators grouped by what they can produce
         self._producers: Dict[str, List[OpSpec]] = {
@@ -82,6 +104,15 @@ class TypedTreeGenerator:
         self._root_ops = [s for s in self._producers["daily"] if not s.non_root]
 
     # -- public --------------------------------------------------------------------
+    def acceptable(self, tree: Expression) -> bool:
+        """A legal root that carries no banned primitive."""
+        if not is_valid_root(tree):
+            return False
+        return not (self.banned_substructures and (self.banned_substructures & one_layer_keys(tree)))
+
+    def ban(self, keys) -> None:
+        self.banned_substructures = self.banned_substructures | frozenset(keys)
+
     def generate(self, depth: Optional[int] = None) -> Expression:
         d = depth if depth is not None else self._rng.randint(self.min_depth, self.max_depth)
         for _ in range(self.max_retries * 4):
@@ -89,13 +120,34 @@ class TypedTreeGenerator:
                 tree = self._gen("daily", d, full=self._rng.random() < 0.5, root=True)
             except ShapeError:
                 continue
-            if is_valid_root(tree):
+            if self.acceptable(tree):
                 return tree
         return self._collapse_leaf(self._pick(self._root_ops_of("reduce")))
 
-    def generate_population(self, n: int) -> List[Expression]:
+    def generate_population(self, n: int, unique: bool = True, tries_per_slot: int = 6) -> List[Expression]:
+        """Ramped half-and-half with de-duplication.
+
+        The old version walked the depth ladder two slots at a time and kept
+        whatever came back, so a population could carry the same tree several
+        times over and start the search narrower than its size suggests.
+        Retrying a slot until its key is new costs nothing and buys real
+        diversity; after ``tries_per_slot`` misses it accepts a duplicate rather
+        than loop forever on a small grammar."""
         depths = list(range(self.min_depth, self.max_depth + 1))
-        return [self.generate(depths[(i // 2) % len(depths)]) for i in range(n)]
+        out: List[Expression] = []
+        seen: set = set()
+        for i in range(n):
+            d = depths[i % len(depths)]
+            best = None
+            for _ in range(tries_per_slot if unique else 1):
+                cand = self.generate(d)
+                best = best or cand
+                if not unique or cand.key() not in seen:
+                    best = cand
+                    break
+            seen.add(best.key())
+            out.append(best)
+        return out
 
     def subtree(self, req: str, depth: Optional[int] = None) -> Expression:
         d = depth if depth is not None else self._rng.randint(1, self.max_depth - 1)
@@ -115,8 +167,51 @@ class TypedTreeGenerator:
                 child = replace(expr, node, new)
             except ShapeError:
                 continue
-            if is_valid_root(child):
+            if self.acceptable(child):
                 return child
+        return None
+
+    def mutate_operator(self, expr: Expression) -> Optional[Expression]:
+        """Swap one node's operator for another that accepts the same operands.
+
+        Subtree mutation throws a whole branch away; this keeps the branch and
+        changes only what is done to it, which is the small move a search needs to
+        refine a structure rather than restart it."""
+        nodes = [n for n, _ in collect(expr) if n.spec is not None]
+        if not nodes:
+            return None
+        for _ in range(self.max_retries):
+            node = self._rng.choice(nodes)
+            alts = [s for s in self.specs
+                    if s.name != node.spec.name and s.category == node.spec.category
+                    and s.arity == node.spec.arity and s.face == node.spec.face
+                    and s.family == node.spec.family]
+            if not alts:
+                continue
+            spec = self._pick(alts)
+            w = node.window
+            if spec.requires_window and (w is None or (spec.windows and w not in spec.windows)):
+                w = self._pick(list(spec.windows)) if spec.windows else w
+            try:
+                swapped = make_node(spec, tuple(node.operands), w)
+                child = replace(expr, node, swapped)
+            except ShapeError:
+                continue
+            if self.acceptable(child):
+                return child
+        return None
+
+    def mutate_hoist(self, expr: Expression) -> Optional[Expression]:
+        """Promote one of the tree's own subtrees to be the whole tree.
+
+        The counterweight to growth: without it trees only ever get deeper, and a
+        population of sixteen-layer wrappers around one primitive is what that
+        looks like."""
+        cands = [n for n, parent in collect(expr) if parent is not None and n.spec is not None]
+        self._rng.shuffle(cands)
+        for node in cands[: self.max_retries]:
+            if self.acceptable(node):
+                return node
         return None
 
     def mutate_window(self, expr: Expression) -> Optional[Expression]:
@@ -159,7 +254,7 @@ class TypedTreeGenerator:
                 child = replace(a, na, nb)
             except ShapeError:
                 continue
-            if is_valid_root(child):
+            if self.acceptable(child):
                 return child
         return None
 

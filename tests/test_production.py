@@ -4,6 +4,8 @@ composition of a two-axis factor through face switching."""
 
 import json
 
+import re
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -89,6 +91,35 @@ def test_feature_boosting_finds_planted_signal(registry, tmp_path):
     rewards = seed_pool_from_presqueeze(pool, res, engine)
     assert pool.size >= 1 and pool.pool_ic() > 0.15
     assert res.per_iteration_log[0]["operator_group"] in ("dt_day", "dt_in")
+
+
+def test_cli_mine_accepts_every_run_mining_knob():
+    """The CLI is not covered by the pipeline tests -- they call run_mining directly
+    -- so a parameter threaded into run_mining and cmd_mine but never declared as an
+    argument fails only at launch. That happened: `cli mine --min-scored-days 0.5`
+    died with "unrecognized arguments" after a full-market run had already been
+    stopped to make way for it."""
+    import argparse
+
+    from alphacube.cli import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(["mine", "--store", "x", "--min-scored-days", "0.4",
+                              "--min-coverage", "0.3", "--checkpoint-every", "1",
+                              "--progress-every", "30", "--panel-cache", "64",
+                              "--skip-kernels", "nt_ts_pearson", "--allow-resource-risk",
+                              "--allow-boolean-ops", "--workdir", "/tmp/x"])
+    assert args.min_scored_days == 0.4 and args.min_coverage == 0.3
+    assert args.checkpoint_every == 1 and args.progress_every == 30 and args.panel_cache == 64
+    assert args.skip_kernels == "nt_ts_pearson" and args.allow_resource_risk and args.allow_boolean_ops
+
+    # every name cmd_mine reads off the namespace must exist on it
+    import inspect
+
+    from alphacube import cli
+    src = inspect.getsource(cli.cmd_mine)
+    for name in re.findall(r"\ba\.([a-z_]+)", src):
+        assert hasattr(args, name), f"cmd_mine reads a.{name}, which the parser never defines"
 
 
 def test_run_mining_pipeline(tmp_path):
