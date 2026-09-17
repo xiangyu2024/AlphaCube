@@ -179,8 +179,13 @@ def run_mining(
         _last_tick[0] = now
         eta = d["eta"]
         eta_s = "?" if eta != eta else f"{eta / 60:.0f}m"
+        # "units", not "chunks": the engine counts a round's progress in symbols
+        # (S-mode) or days (D-mode), so the total is sum(S or D over rounds) -- e.g.
+        # 2 S-rounds + 1 D-round + 3 panel rounds on the production cube is
+        # 2*5219 + 1942 + 3 = 12383, which is not a chunk count and reads very wrong
+        # as one.
         say(f"      ... {d['trees']} trees ({d['cached']} cached)  round {d['round']}/{d['rounds']}"
-            f"  {d['done']}/{d['total']} chunks  {100 * d['frac']:.0f}%"
+            f"  {d['done']}/{d['total']} units  {100 * d['frac']:.0f}%"
             f"  elapsed {d['elapsed'] / 60:.0f}m  eta {eta_s}")
 
     def progress(n, b, s):
