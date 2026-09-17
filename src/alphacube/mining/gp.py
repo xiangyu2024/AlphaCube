@@ -291,20 +291,38 @@ class GPMiner:
     def archive(self) -> List[Tuple[Expression, float]]:
         return sorted(self._archive.values(), key=lambda t: t[1], reverse=True)
 
-    def write_checkpoint(self, generation: int) -> Optional[Path]:
+    def write_checkpoint(self, generation: int, metrics_top_n: int = 10) -> Optional[Path]:
         """Ranked archive -> ``archive_gen<N>.csv``, written atomically so a kill
-        during the write cannot leave a half file. Fitness only; the pool metrics
-        in members.csv need the panels, which is what _commit() is for."""
+        during the write cannot leave a half file.
+
+        The top ``metrics_top_n`` rows also carry IC and return-based metrics when
+        their panel is still in the cache -- free, because the panel is already in
+        memory, and it is what makes a checkpoint readable mid-run rather than a
+        list of expressions with one number each. Deeper rows, and any row whose
+        panel has been evicted, carry fitness only; members.csv at the end is where
+        everything gets measured properly."""
         if self.checkpoint_dir is None:
             return None
+        from ..metrics import backtest_metrics, cs_pearson, ic_summary
+
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         path = self.checkpoint_dir / f"archive_gen{generation:03d}.csv"
         tmp = path.with_suffix(".csv.tmp")
+        cols = ["ic_mean", "icir", "rank_ic", "coverage", "n_days",
+                "annualized_return", "sharpe", "max_drawdown"]
         with tmp.open("w", encoding="utf-8") as fh:
-            fh.write("rank,fitness,expression\n")
+            fh.write("rank,fitness," + ",".join(cols) + ",expression\n")
             for i, (expr, fit) in enumerate(self.archive()):
+                vals = {}
+                if i < metrics_top_n:
+                    p = self._panel_cache.get(expr.key())
+                    if p is not None:
+                        pan = np.asarray(p, dtype=np.float64)
+                        vals.update(ic_summary(pan, self.target))
+                        vals.update(backtest_metrics(cs_pearson(pan, self.target), pan, self.target))
+                cells = ",".join("" if c not in vals else f"{vals[c]:.6f}" for c in cols)
                 text = repr(expr).replace('"', '""')
-                fh.write(f'{i},{fit:.6f},"{text}"\n')
+                fh.write(f'{i},{fit:.6f},{cells},"{text}"\n')
         os.replace(tmp, path)
         return path
 

@@ -212,6 +212,14 @@ def test_archive_checkpoints_survive_an_interrupted_run(registry, view, tmp_path
     assert rows, "a checkpoint must carry the archive, not just a header"
     fits = [float(r["fitness"]) for r in rows]
     assert fits == sorted(fits, reverse=True), "ranked best first"
+
+    # the top rows carry real metrics, computed from panels already in the cache,
+    # so a checkpoint is readable mid-run instead of being a list of bare numbers
+    for col in ("ic_mean", "icir", "rank_ic", "coverage", "sharpe", "max_drawdown"):
+        assert col in rows[0], col
+    scored = [r for r in rows if r["sharpe"]]
+    assert scored, "expected the leaders to be scored from cached panels"
+    assert all(float(r["max_drawdown"]) <= 0 for r in scored)
     assert all(parse(r["expression"]).key() for r in rows), "every row must parse back"
     assert len(rows) == len(miner.archive())
 
