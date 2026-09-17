@@ -125,6 +125,8 @@ def run_mining(
     checkpoint_every: int = 0,
     rolling_block: int = 0,
     ban_top_n: int = 0,
+    block_combine: bool = True,
+    block_combine_top: int = 120,
     engine_progress_every: float = 0.0,
     workdir: Optional[Union[str, Path]] = None,
     gp_params: Optional[dict] = None,
@@ -198,6 +200,59 @@ def run_mining(
         extra = "  ".join(f"{k} {v:+.4f}" if isinstance(v, float) else f"{k} {v}" for k, v in s.items())
         say(f"  {n:5d}/{b}  {extra}")
 
+    block_reports: List[dict] = []
+    miner_ref: List[Any] = []          # set before mine() so on_block can reach the panel cache
+
+    def score_archive(entries, label: str) -> Optional[dict]:
+        """Pool + out-of-sample combination over a set of archived expressions.
+
+        Panels come back through the miner's own cache where they are still
+        resident, so scoring a block costs little beyond what the search already
+        paid; the cumulative view reaches further back and may re-evaluate."""
+        from .combine.post_combine import compare, leaderboard
+
+        exprs = [e for e, _ in entries[:block_combine_top]]
+        if not exprs or not miner_ref:
+            return None
+        panels = miner_ref[0]._panels(exprs)
+        sub = build_pool(pool, pool_capacity, target, realized, dedup, min_coverage, meanstd_lr,
+                         meanstd_steps, dynamic_window, min_scored_days=min_scored_days)
+        kept = 0
+        for e, p in zip(exprs, panels):
+            if p is None:
+                continue
+            try:
+                sub.try_add(e, p.astype(np.float64))
+                kept += 1
+            except Exception:                                    # noqa: BLE001 - gate rejections are expected
+                continue
+        if sub.size == 0:
+            say(f"  [{label}] 池为空,跳过")
+            return None
+        res, signs = compare(sub.z_columns(), target, realized, methods=tuple(combine_methods),
+                             train_frac=combine_train_frac, align=True, seed=seed)
+        tbl = leaderboard(res)
+        cols = [c for c in ("ic_mean", "icir", "rank_ic", "sharpe", "sharpe_net", "sharpe_capped",
+                            "turnover", "coverage", "error") if c in tbl.columns]
+        say(f"  [{label}] 候选 {len(exprs)} -> 进池 {sub.size};样本外:")
+        say(tbl[cols].to_string(float_format=lambda v: f"{v:+.4f}"))
+        return {"label": label, "candidates": len(exprs), "pool_size": sub.size,
+                "table": tbl, "members": [repr(m.expr) for m in sub.members],
+                "pool_metrics": sub.test_ensemble()}
+
+    def on_block(info: dict) -> None:
+        i = info["index"]
+        say(f"\n=== 第 {i} 块结束(至第 {info['generation']} 代)===")
+        say(f"  封禁 {len(info['banned'])} 个一层结构,累计生效 {info['banned_total']} 个: "
+            + ", ".join(info["banned"]))
+        if not (block_combine and combine_methods):
+            return
+        entry = {"index": i, "generation": info["generation"], "banned": list(info["banned"])}
+        entry["block_only"] = score_archive(info["block_archive"], f"第{i}块 仅本块")
+        if i > 1:                                   # block 1 alone IS the cumulative view
+            entry["cumulative"] = score_archive(info["cumulative_archive"], f"第{i}块 累计1~{i}")
+        block_reports.append(entry)
+
     ckpt_dir = None
     if out_root and checkpoint_every:
         ckpt_dir = Path(out_root) / (run_id or datetime.now().strftime("%Y%m%d_%H%M%S")) / "checkpoints"
@@ -209,9 +264,11 @@ def run_mining(
                     chunk_symbols=chunk_symbols, chunk_days=chunk_days,
                     allow_boolean_ops=allow_boolean_ops, allow_resource_risk=allow_resource_risk,
                     skip_kernels=frozenset(skip_kernels), rolling_block=rolling_block, ban_top_n=ban_top_n,
+                    on_block=on_block,
                     checkpoint_dir=ckpt_dir,
                     on_engine_progress=(engine_progress if engine_progress_every > 0 else None),
                     checkpoint_every=checkpoint_every, workdir=workdir, **gp)
+        miner_ref.append(m)
         rep = m.mine(budget, on_generation=lambda g, n, s: progress(g, n, s))
         added, evaluated, engine_s = rep.added, rep.evaluated, rep.engine_seconds
         summary = f"{rep.generations} generations, archive {rep.archive_size}, best |IC| {rep.best_fitness:+.4f}"
@@ -243,7 +300,10 @@ def run_mining(
     say("pool: " + "  ".join(f"{k} {v:+.4f}" for k, v in ens.items()))
     rows = []
     panels = panels_of(pool_obj.exprs())
-    realized = np.asarray(pool_obj.realized, dtype=np.float64)[trim:]
+    # NOT `realized = ...`: that rebinds the outer name to a trimmed copy, and the
+    # final compare() below still passes full-length columns and target, so every
+    # combination died on an out-of-bounds day index.
+    realized_trim = np.asarray(pool_obj.realized, dtype=np.float64)[trim:]
     for i, (mem, p) in enumerate(zip(pool_obj.members, panels)):
         row = {"index": i, "expression": repr(mem.expr), "weight": float(pool_obj.weights[i])}
         if p is not None:
@@ -254,7 +314,7 @@ def run_mining(
             # the universe, shows up here as a Sharpe that does not match. Same
             # function and same top_frac as the pool line, so the numbers are
             # directly comparable. Diagnostic only -- one holding period, no costs.
-            bt = backtest_metrics(cs_pearson(pan, target[trim:]), pan, realized,
+            bt = backtest_metrics(cs_pearson(pan, target[trim:]), pan, realized_trim,
                                   cost_per_side=cost_per_side, turnover_cap=turnover_cap)
             row.update({k: v for k, v in bt.items()
                         if k.startswith(("annualized_return", "sharpe", "max_drawdown", "turnover"))})

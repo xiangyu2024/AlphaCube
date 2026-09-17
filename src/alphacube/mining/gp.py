@@ -66,6 +66,7 @@ class GPMiner:
                  fields: Optional[Sequence[str]] = None, allow_boolean_ops: bool = False,
                  allow_resource_risk: bool = False, skip_kernels: "frozenset[str]" = frozenset(),
                  rolling_block: int = 0, ban_top_n: int = 0,
+                 on_block: Optional[Callable[[dict], None]] = None,
                  on_engine_progress: Optional[Callable[[dict], None]] = None,
                  checkpoint_dir: Optional[os.PathLike] = None,
                  checkpoint_every: int = 0,
@@ -119,6 +120,12 @@ class GPMiner:
         self.rolling_block = max(0, int(rolling_block))
         self.ban_top_n = max(0, int(ban_top_n))
         self.blocks: List[dict] = []
+        # Called at each rolling boundary with the block's own findings AND
+        # everything found so far, so the caller can score both. A block searched
+        # under a different ban set than its predecessors, so "what did this block
+        # add" and "what do all blocks together give" are genuinely two questions.
+        self.on_block = on_block
+        self._block_seen: set = set()
         self.on_engine_progress = on_engine_progress
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
         self.checkpoint_every = max(0, int(checkpoint_every))
@@ -208,9 +215,15 @@ class GPMiner:
         return fit
 
     def _roll(self, population, fit, generation: int) -> List[str]:
-        """End of a block: ban what it leaned on, record what it found, start over."""
+        """End of a block: score what it found, ban what it leaned on, start over."""
         from collections import Counter
         from .generator import one_layer_keys
+
+        # What THIS block added, as opposed to what earlier blocks had already found.
+        block = [(e, f) for k, (e, f) in self._archive.items() if k not in self._block_seen]
+        block.sort(key=lambda t: t[1], reverse=True)
+        cumulative = self.archive()
+        self._block_seen = set(self._archive)
 
         counts: "Counter[str]" = Counter()
         for e, f in zip(population, fit):
@@ -219,9 +232,15 @@ class GPMiner:
         banned = [k for k, _ in counts.most_common(self.ban_top_n)] if self.ban_top_n else []
         if banned:
             self.generator.ban(banned)
-        self.blocks.append({"generation": generation, "banned": banned,
-                            "counts": counts.most_common(10),
-                            "banned_total": len(self.generator.banned_substructures)})
+
+        info = {"index": len(self.blocks) + 1, "generation": generation, "banned": banned,
+                "counts": counts.most_common(10),
+                "banned_total": len(self.generator.banned_substructures),
+                "block_archive": block, "cumulative_archive": cumulative}
+        self.blocks.append({k: v for k, v in info.items()
+                            if k not in ("block_archive", "cumulative_archive")})
+        if self.on_block is not None:
+            self.on_block(info)
         return banned
 
     def _archive_update(self, population, fit) -> None:
@@ -309,6 +328,8 @@ class GPMiner:
                                                  "gen_mean": float("nan"),
                                                  "archive": len(self._archive),
                                                  "valid": 0, "rolled": len(banned)})
+        if self.rolling_block and self.on_block is not None and len(self._archive) > len(self._block_seen):
+            self._roll(population, fit, n_gen)          # the final, unrolled block still gets scored
         report = self._commit()
         report.generations = n_gen
         report.evaluated = self.evaluated

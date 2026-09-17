@@ -147,6 +147,14 @@ def test_run_mining_pipeline(tmp_path):
     assert (members.loc[finite, "max_drawdown"] <= 0).all(), "a drawdown is never positive"
     assert any("sharpe=" in s for s in logs), "the per-member log line shows it too"
 
+    # The final combination must actually produce numbers. It silently stopped
+    # doing so once a trimmed `realized` shadowed the full-length one: every method
+    # came back with "index N is out of bounds", reported as a table of errors
+    # rather than raised, so a run looked finished while its headline was empty.
+    assert r.combination is not None
+    assert "error" not in r.combination.columns, r.combination.to_string()
+    assert r.combination["sharpe"].notna().any()
+
     # Inside-a-generation progress. A generation is ONE engine call, so without this
     # the log says nothing for its whole duration -- 58 minutes for a cold
     # full-market population -- and there is no way to tell slow from hung.
