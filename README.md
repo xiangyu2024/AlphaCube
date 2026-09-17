@@ -86,6 +86,7 @@ src/alphacube/
   operators/                  vendored 核函数库(仅一处自觉修改:排序加 stable,见 design.md §5)
 tests/                        精度契约、分块不变性、调度、掩码、文法、RL、legacy 语料、下游各阶段
 docs/design.md                设计文档
+docs/HANDOFF.md               交接说明:当前进展、服务器怎么连/怎么跑/怎么监控、踩过的坑
 ```
 
 ## 验证
