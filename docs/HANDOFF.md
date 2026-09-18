@@ -5,19 +5,23 @@
 
 ---
 
-## 0. 现在的状态(2026-09-18 09:20)
+## 0. 现在的状态(2026-09-18 09:30)
 
-**一个全市场挖掘任务正在跑**,别动它,除非你有理由停。**用户决定:让它跑完,下一次运行再用新代码。**
+**一个全市场挖掘任务正在跑**,别动它,除非你有理由停。
 
 ```
-run-id   gpu4              screen 会话 gpu4(任务)+ gpu4rep(每 15 分钟快照)
-pid      232124            06:54 启动,RSS 60~84 GB,显存 28.4 GB(稳定)
-配置     20 代 = 4 块 x 5 代,全市场 5220 只 x 20180102~20251231
-进度     第 1/2/3 代 08:09 / 08:31 / 08:56 落地,每代 22~25 分钟(第 1 代含启动 75 分钟)
-代码     **旧代码**(读取修复之前启动的;服务器上的 src 已同步为新代码,不影响它)
+run-id   gpu5              screen 会话 gpu5(任务)+ gpu5rep(每 15 分钟快照 -> gpu5_report.log)
+pid      246133            09:27 启动(scripts/gpu5.sh,与 gpu4.sh 只差 run-id)
+配置     20 代 = 4 块 x 5 代,全市场 5220 只 x 20180102~20251231,seed 0
+代码     **新代码**(读取修复之后,commit 2872ef5)
 ```
 
-第 5 代(第 1 块边界)会输出**第一份融合回测**,按最近每代 22~25 分钟估在 10 点前后。
+**gpu4 已停**(用户批准,09:26,SIGINT,临时目录已自动清掉):用旧代码跑到第 5 代中途,
+`mining_runs/gpu4/checkpoints/archive_gen001..004.csv` 与 `gpu4_run.log` 保留。gpu5 同配置同 seed,
+面板逐 bit 相同,所以**第 1~4 代的 archive 应当与 gpu4 逐行一致** —— 这是全量上验证读取修复的对照,
+也直接给出真实的每代耗时(gpu4:第 1 代含启动 75 分,之后每代 20~25 分)。
+
+第 5 代(第 1 块边界)会输出**第一份融合回测**。
 
 第 3 代头部 10 条已按 pipeline 口径补算扣成本回测(`_bench/eval_top.py`,结果 `_bench/top_gen003.json`):
 几乎全是**成交额水平**(低成交额 → 次日高收益,小盘/流动性溢价),能扛住 15bp 的只有低换手的平滑版
@@ -71,11 +75,17 @@ ssh -o BatchMode=yes -o ControlPath=none -p 29982 root@connect.westd.seetacloud.
 
 ```bash
 ssh -o BatchMode=yes -o ControlPath=none -p 29982 root@connect.westd.seetacloud.com \
-  'cd /root/autodl-tmp/AlphaCube && screen -dmS gpu5 bash -c "./scripts/gpu4.sh > gpu5_run.log 2>&1"'
+  'cd /root/autodl-tmp/AlphaCube && for f in "" _report; do cp scripts/gpu5$f.sh scripts/gpu6$f.sh;
+   sed -i s/gpu5/gpu6/g scripts/gpu6$f.sh; done &&
+   screen -dmS gpu6 bash -c "./scripts/gpu6.sh > gpu6_run.log 2>&1" &&
+   screen -dmS gpu6rep bash -c "./scripts/gpu6_report.sh"'
 ```
 
-`scripts/gpu4.sh` 是当前配置的样板,改参数复用。**长任务一律用 `screen`** —— 它与 ssh 连接无关,
-断网、关机、退出 IDE 都不影响。`nohup` 不够可靠,试过。
+`scripts/gpu5.sh` 是当前配置的样板(只在服务器上,不在 git 里),改参数复用。**脚本里写死了
+`--run-id`**:直接拿旧脚本起新任务会写进旧的 `mining_runs/<id>`,所以先复制再改名(上面那条命令就是)。
+**长任务一律用 `screen`** —— 它与 ssh 连接无关,断网、关机、退出 IDE 都不影响。`nohup` 不够可靠,试过。
+停任务用 `kill -INT <pid>`:KeyboardInterrupt 会走引擎的 `finally`,落盘临时目录会被清掉
+(SIGKILL 不会,9.8 GB 一个的边界文件会留在 `tmp/`)。
 
 ### 当前配置的含义
 
@@ -112,8 +122,8 @@ ssh -o BatchMode=yes -o ControlPath=none -p 29982 root@connect.westd.seetacloud.
 ```bash
 S='ssh -o BatchMode=yes -o ControlPath=none -p 29982 root@connect.westd.seetacloud.com'
 
-$S 'cd /root/autodl-tmp/AlphaCube && tail -20 gpu4_run.log'            # 进度
-$S 'cd /root/autodl-tmp/AlphaCube && ls mining_runs/gpu4/checkpoints'  # 每代产物
+$S 'cd /root/autodl-tmp/AlphaCube && tail -20 gpu5_run.log'            # 进度
+$S 'cd /root/autodl-tmp/AlphaCube && ls mining_runs/gpu5/checkpoints'  # 每代产物
 $S 'ps -eo pid,etime,pcpu,rss,args | grep "[c]li mine"'                # 活没活着
 $S 'nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv'   # GPU
 $S 'df -h / /root/autodl-tmp'                                          # 磁盘(系统盘必看)
