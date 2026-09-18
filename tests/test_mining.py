@@ -665,3 +665,27 @@ def test_a_family_is_rank_banned_when_any_member_used_the_banned_structure(regis
     banned = m._roll(order, m.fitness(order), 5)
     assert set(banned) == only_member
     assert m.blocks[-1]["exemplars_added"] == 1 and m._rank_ban.exemplars == [repr(rep)]
+
+
+def test_scoring_threads_follow_the_container_quota(tmp_path):
+    """torch sizes its pool from the host's cores (104 threads on the 208-core
+    server) while the container gets 25 CPUs; the fitness sort ran 4x slower
+    oversubscribed. The quota comes from cgroup v2 cpu.max; the pool size is
+    restored after scoring so the engine's own setting is left alone."""
+    import torch
+
+    from alphacube.mining.gp import cpu_quota, torch_threads
+
+    f = tmp_path / "cpu.max"
+    f.write_text("2500000 100000\n")
+    import os
+    assert cpu_quota(str(f)) == min(25, os.cpu_count())
+    f.write_text("max 100000\n")
+    assert cpu_quota(str(f)) is None
+    assert cpu_quota(str(tmp_path / "missing")) is None
+    before = torch.get_num_threads()
+    with torch_threads(1):
+        assert torch.get_num_threads() == 1
+    assert torch.get_num_threads() == before
+    with torch_threads(None):
+        assert torch.get_num_threads() == before

@@ -110,7 +110,7 @@ GP / 四个 RL miner / 因子池 / 组合 / 回测全跑在它上面。当前阶
 cd ~/Desktop/AlphaCube && PYTHONPATH=src ~/.venvs/alphacube/bin/python -m pytest tests -q
 ```
 
-当前 **353 passed, 8 skipped, 1 xfailed**(约 2 分钟)。改完必跑。
+当前 **354 passed, 8 skipped, 1 xfailed**(约 2 分钟)。改完必跑。
 
 ### 5.2 同步到服务器
 
@@ -367,9 +367,13 @@ cd ~/Desktop/AlphaCube && PYTHONPATH=src ~/.venvs/alphacube/bin/python scripts/m
 3. **archive 内部按 rank 相关去重**:是,0.99;同代同族只让最好的繁殖(精确复制也算同族)。
 4. 用户要求:磁盘恢复后**直接起跑 gpu10**,确认第 1 代正常后汇报。
 
-依据与细节见 `docs/design.md` §7。**要验证的**:(a) 新适应度每条新候选多一次整面板排序,本地
-1942×5220 约 0.5 s,服务器上未实测 —— 起跑前后看每代耗时;(b) 族索引每族 1.5 MB,内存随 archive
-增长(gpu9 10 代 367 条,族数应更少);(c) 块结算多了平滑,每块估计多 1~2 分钟。
+依据与细节见 `docs/design.md` §7。**服务器实测(纯内存基准,07:40)**:新适应度每条新候选一次整面板
+排序,1942×5220 在默认 104 个 torch 线程下 1.75 s/条,线程数按容器配额(`cpu.max` = 25 核)取 24 时
+0.43 s/条 —— 所以打分时临时把 torch 线程设为配额(`gp.cpu_quota` / `torch_threads`),完后恢复;
+族索引 64 候选 × 800 族一次 0.21 s。**还要验证的**:(a) 起跑后看每代耗时;(b) 族索引每族 1.5 MB,
+内存随族数增长;(c) 块结算多了平滑,每块估计多 1~2 分钟。
+**顺带发现、未动**:整个任务的 torch 都是 104 线程跑在 25 核配额上(超订 4 倍);引擎 CPU 侧如果有
+torch 并行运算也在被节流。要不要全局设成配额,需要新旧 A/B(且 CPU 归约结果会随线程数变最后几位)。
 
 ### 技术遗留
 

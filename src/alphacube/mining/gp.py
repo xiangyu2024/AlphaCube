@@ -26,6 +26,7 @@ import math
 import os
 import random
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -51,6 +52,34 @@ FITNESS_KINDS = ("ic", "rank_ic")
 # The book every report trades -- top/bottom decile, equal weight, gross 1
 # (backtest_metrics' default) -- and so the one whose turnover the fitness charges.
 BOOK_TOP_FRAC = 0.1
+
+
+def cpu_quota(path: str = "/sys/fs/cgroup/cpu.max") -> Optional[int]:
+    """CPUs this process may actually use: the cgroup v2 quota when one is set,
+    else None. torch sizes its CPU pool from the host -- 104 threads on the
+    208-core server -- while the container is granted 25 CPUs, and oversubscribed
+    the fitness sort ran 4x slower (measured there: 1.75 s a panel at 104
+    threads, 0.43 s at 24)."""
+    try:
+        quota, period = open(path).read().split()[:2]
+        if quota == "max":
+            return None
+        return max(1, min(os.cpu_count() or 1, int(quota) // int(period)))
+    except (OSError, ValueError):
+        return None
+
+
+@contextmanager
+def torch_threads(n: Optional[int]):
+    """Run the block with ``n`` torch CPU threads, then restore the pool size."""
+    prev = torch.get_num_threads()
+    if n and n != prev:
+        torch.set_num_threads(n)
+    try:
+        yield
+    finally:
+        if torch.get_num_threads() != prev:
+            torch.set_num_threads(prev)
 
 
 @dataclass
@@ -218,6 +247,7 @@ class GPMiner:
         self.turnover_penalty = float(turnover_penalty)
         self._rich = fitness_kind != "ic" or self.turnover_penalty > 0
         self._scores: Dict[str, Dict[str, float]] = {}     # key -> ic, rank_ic, turnover, fit
+        self._score_threads = cpu_quota()
         if self._rich:
             self._target_t64 = torch.from_numpy(np.ascontiguousarray(self.target))
             self._target_ranks_t = torch_rank_rows(self.target)
@@ -320,8 +350,9 @@ class GPMiner:
         fit = np.full(len(population), -np.inf)
         live = [i for i, p in enumerate(panels) if p is not None]
         if live and self._rich:
-            for i in live:
-                fit[i] = self._score(population[i].key(), panels[i])["fit"]
+            with torch_threads(self._score_threads):
+                for i in live:
+                    fit[i] = self._score(population[i].key(), panels[i])["fit"]
         elif live:
             tensors = [torch.from_numpy(panels[i]).float() for i in live]
             ics = batched_ic(tensors, self._target_t).numpy().astype(float)
