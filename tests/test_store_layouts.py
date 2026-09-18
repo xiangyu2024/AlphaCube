@@ -129,3 +129,69 @@ def test_boundary_files_never_land_on_the_system_temp_dir(view, tmp_path, monkey
     res = CubeEngine(view, chunk_symbols=3, chunk_days=7).evaluate([expr], tolerant=True)
     assert res.plan.boundaries, "expected this tree to materialise a boundary"
     assert seen and all(d == tmp_path / "wd" for d in seen), seen
+
+
+def _segmented_truth(layouts):
+    """What the segmented store holds at every (symbol, day): the monolithic cube
+    for the nine base symbols; NEW.1 only on segment B's days, NaN / OUTSIDE_LIFECYCLE
+    before it lists."""
+    mono, comp, cubes, status = layouts
+    cube = {}
+    for name in ("Close", "Volume"):
+        t = np.full((10, 50, mono.n_minutes), np.nan, dtype=np.float32)
+        t[:9] = mono.field(name)
+        t[9, 42:] = np.asarray(cubes[name][:1, 42:] * 1.01, dtype=np.float32)[0]
+        cube[name] = t
+    st = np.zeros((10, 50), dtype=np.int8)
+    st[:9] = mono.day_status()
+    st[9, 42:] = 1
+    return cube, st
+
+
+def test_segmented_reads_match_truth_for_every_index_form(layouts):
+    """Random slices, unsorted and repeated index arrays, day ranges inside one
+    source or across all three. (The dict-based reader returned NaN for the first
+    copy of a repeated row: it mapped each symbol to its LAST output position.)"""
+    mono, comp, cubes, status = layouts
+    seg = SegmentedCubeStore(comp)
+    cube, st = _segmented_truth(layouts)
+    rng = np.random.default_rng(0)
+    for _ in range(300):
+        d0 = int(rng.integers(0, 50))
+        d1 = int(rng.integers(d0 + 1, 51))
+        if rng.random() < 0.5:
+            a = int(rng.integers(0, 10))
+            rows = slice(a, int(rng.integers(a + 1, 11)))
+        else:
+            rows = rng.integers(0, 10, size=int(rng.integers(1, 13)))
+        for name in ("Close", "Volume"):
+            got = seg.read_cube(name, rows, d0, d1)
+            assert got.dtype == np.float32 and np.array_equal(got, cube[name][rows, d0:d1], equal_nan=True)
+        assert np.array_equal(seg.read_status(rows, d0, d1), st[rows, d0:d1])
+
+
+def test_segmented_contiguous_reads_are_stripe_copies(layouts, monkeypatch):
+    """A contiguous request must reach each source memmap as basic slices. The
+    previous reader indexed all three axes with np.ix_ -- the minute axis too --
+    which gathers element by element: 21-28x slower than a slice on the production
+    store's chunk shapes (58 ms vs 2.1-2.7 ms for 15 symbols x 1942 days)."""
+    mono, comp, cubes, status = layouts
+    seg = SegmentedCubeStore(comp)
+    keys = []
+
+    class Spy:
+        def __init__(self, arr):
+            self.arr = arr
+
+        def __getitem__(self, key):
+            keys.append(key)
+            return self.arr[key]
+
+    for src in seg._sources:
+        field = src.store.field
+        monkeypatch.setattr(src.store, "field", lambda name, _f=field: Spy(_f(name)))
+    seg.read_cube("Close", slice(0, 9), 25, 47)          # base + both segments
+    seg.read_cube("Close", slice(2, 6), 0, 30)           # base only (the production case)
+    seg.read_cube("Close", slice(0, 10), 40, 50)         # NEW.1 is absent from segment A
+    assert len(keys) == 6
+    assert all(isinstance(k, slice) for key in keys for k in key), keys
