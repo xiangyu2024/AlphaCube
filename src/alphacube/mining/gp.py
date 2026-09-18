@@ -348,27 +348,19 @@ class GPMiner:
         return report
 
     def _commit(self) -> MiningReport:
-        top_k = self.top_k if self.top_k is not None else 2 * self.pool.capacity
-        ranked = sorted(self._archive.values(), key=lambda t: t[1], reverse=True)[: max(0, int(top_k))]
-        reasons: Dict[str, int] = {}
-        examples: Dict[str, str] = {}
-        added: List[Expression] = []
+        # top_k None: twice the pool's capacity, or the whole archive when the pool
+        # has none. 0 also means the whole archive (it used to commit nothing).
+        top_k = self.top_k
+        if top_k is None:
+            top_k = 2 * self.pool.capacity if self.pool.capacity else 0
+        ranked = sorted(self._archive.values(), key=lambda t: t[1], reverse=True)
+        if top_k:
+            ranked = ranked[: int(top_k)]
         exprs = [e for e, _ in ranked]
         panels = self._panels(exprs) if exprs else []
-        for e, p in zip(exprs, panels):
-            if p is None:
-                key = "panel unavailable"
-            else:
-                try:
-                    self.pool.try_add(e, p.astype(np.float64))
-                    added.append(e)
-                    continue
-                except Exception as exc:  # noqa: BLE001
-                    key = f"{type(exc).__name__}: {str(exc)[:60]}"
-            reasons[key] = reasons.get(key, 0) + 1
-            examples.setdefault(key, repr(e)[:100])
-        return MiningReport(generations=0, evaluated=0, archive_size=0, added=added,
-                            commit_reasons=reasons, commit_examples=examples)
+        adm = self.pool.admit(zip(exprs, panels))
+        return MiningReport(generations=0, evaluated=0, archive_size=0, added=adm.added,
+                            commit_reasons=adm.reasons, commit_examples=adm.examples)
 
     def archive(self) -> List[Tuple[Expression, float]]:
         return sorted(self._archive.values(), key=lambda t: t[1], reverse=True)

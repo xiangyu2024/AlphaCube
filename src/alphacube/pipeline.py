@@ -211,21 +211,14 @@ def run_mining(
         paid; the cumulative view reaches further back and may re-evaluate."""
         from .combine.post_combine import compare, leaderboard
 
-        exprs = [e for e, _ in entries[:block_combine_top]]
+        # block_combine_top 0: every archived expression, not only the leaders
+        exprs = [e for e, _ in (entries[:block_combine_top] if block_combine_top else entries)]
         if not exprs or not miner_ref:
             return None
         panels = miner_ref[0]._panels(exprs)
         sub = build_pool(pool, pool_capacity, target, realized, dedup, min_coverage, meanstd_lr,
                          meanstd_steps, dynamic_window, min_scored_days=min_scored_days)
-        kept = 0
-        for e, p in zip(exprs, panels):
-            if p is None:
-                continue
-            try:
-                sub.try_add(e, p.astype(np.float64))
-                kept += 1
-            except Exception:                                    # noqa: BLE001 - gate rejections are expected
-                continue
+        sub.admit(zip(exprs, panels))                            # gate rejections are expected
         if sub.size == 0:
             say(f"  [{label}] 池为空,跳过")
             return None

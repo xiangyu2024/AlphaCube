@@ -122,6 +122,27 @@ def test_cli_mine_accepts_every_run_mining_knob():
         assert hasattr(args, name), f"cmd_mine reads a.{name}, which the parser never defines"
 
 
+def test_no_cap_keeps_the_whole_archive(tmp_path):
+    """--pool-capacity 0 --block-combine-top 0: nothing is capped anywhere. Every
+    block report scores its whole archive and the final commit offers every
+    archived expression, so the pool ends with more members than any capped
+    setting would allow for this archive."""
+    from alphacube.cli import build_parser
+    args = build_parser().parse_args(["mine", "--store", "x", "--pool-capacity", "0", "--block-combine-top", "0"])
+    assert args.pool_capacity == 0 and args.block_combine_top == 0
+
+    st = write_synthetic_store(tmp_path / "cube", n_symbols=20, n_days=90, n_minutes=24, seed=8, plant_beta=1.0)
+    logs = []
+    r = run_mining(st, start=st.dates[5], label="close", miner="gp", budget=36, pool_capacity=0,
+                   block_combine_top=0, rolling_block=2, dedup=0.95,
+                   gp_params=dict(population_size=12, max_depth=3), combine_methods=("equal",),
+                   log=logs.append)
+    import re
+    block = [re.search(r"候选 (\d+) -> 进池 (\d+)", s) for s in logs if "仅本块" in s]
+    assert block and block[0], logs
+    assert r.pool_size > 4, r.pool_size          # a capped run of this size keeps 4 (test_run_mining_pipeline)
+
+
 def test_run_mining_pipeline(tmp_path):
     st = write_synthetic_store(tmp_path / "cube", n_symbols=20, n_days=90, n_minutes=24, seed=8, plant_beta=1.0)
     logs = []

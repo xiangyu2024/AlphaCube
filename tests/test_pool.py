@@ -124,3 +124,82 @@ def test_pool_ic_from_the_cache_is_the_combined_ic(data):
         assert pool.pool_ic() == PoolBase.pool_ic(pool), f"after candidate {i}"
         checked += 1
     assert checked > pool.capacity
+
+
+def test_dedup_index_is_sampled_abs_corr(data):
+    """The vectorised dedup must be the pairwise one: same sampled days, same
+    pairwise-finite cells, same NaN cases -- one member with no variance, one with
+    no finite cells at all."""
+    from alphacube.metrics import sampled_abs_corr
+    from alphacube.mining.pool import _DedupIndex
+
+    rng, target, panels = data
+    zs = [zscore_rows(p) for p in panels[:10]]
+    flat = np.ones_like(zs[0])                             # z-scores of a constant: no variance
+    empty = np.full_like(zs[0], np.nan)
+    members = zs[:7] + [flat, empty]
+    for sample in (7, 250):                                # fewer sampled days than D, and all of them
+        index = _DedupIndex(target.shape, sample)
+        for z in members:
+            index.add(z)
+        for x in zs[7:] + [zs[0]]:
+            got = index.abs_corr(x)
+            ref = np.array([sampled_abs_corr(x, m, sample) for m in members])
+            assert np.array_equal(np.isnan(got), np.isnan(ref)), (got, ref)
+            np.testing.assert_allclose(got[~np.isnan(ref)], ref[~np.isnan(ref)], rtol=1e-10, atol=1e-12)
+
+
+def test_no_cap_keeps_everything_that_passes(data):
+    """capacity 0 / None: nothing is pruned -- the pool holds every candidate that
+    passes the gates and dedup, where a capped pool keeps only its capacity."""
+    rng, target, panels = data
+    items = [(parse(f"add(day_mean(Close), {i})"), p) for i, p in enumerate(panels)]
+    capped, free = MsePool(6, target, dedup_threshold=0.9), MsePool(0, target, dedup_threshold=0.9)
+    assert free.capacity is None and MsePool(None, target).capacity is None
+    with pytest.raises(ValueError):
+        MsePool(-1, target)
+    capped.admit(items)
+    adm = free.admit(items)
+    dups = adm.reasons.get(next((k for k in adm.reasons if k.startswith("DuplicateFactorError")), ""), 0)
+    assert capped.size == 6 and free.size == len(items) - sum(adm.reasons.values()) > 6
+    assert dups > 0 and len(adm.added) == free.size
+
+
+def test_admit_without_a_cap_is_try_add_one_by_one(data):
+    """The batch path only skips the per-insertion refits: members, order, weights,
+    rejection reasons and pool IC all match offering the same candidates one at a
+    time -- including a pool that already has members, and a missing panel."""
+    rng, target, panels = data
+    items = [(parse(f"add(day_mean(Close), {i})"), p) for i, p in enumerate(panels)]
+    items.insert(3, (parse("day_max(High)"), None))
+    batch, single = MsePool(0, target, dedup_threshold=0.9), MsePool(0, target, dedup_threshold=0.9)
+    for pool in (batch, single):                           # same head start for both
+        pool.try_add(*items[0])
+    adm = batch.admit(items[1:])
+    reasons = {}
+    for e, p in items[1:]:
+        if p is None:
+            reasons["panel unavailable"] = reasons.get("panel unavailable", 0) + 1
+            continue
+        try:
+            single.try_add(e, p)
+        except Exception as exc:  # noqa: BLE001
+            k = f"{type(exc).__name__}: {str(exc)[:60]}"
+            reasons[k] = reasons.get(k, 0) + 1
+    assert [repr(e) for e in batch.exprs()] == [repr(e) for e in single.exprs()]
+    assert adm.reasons == reasons
+    np.testing.assert_allclose(batch.weights, single.weights, rtol=1e-9, atol=1e-12)
+    assert batch.pool_ic() == pytest.approx(single.pool_ic(), rel=1e-9)
+
+
+def test_admit_with_a_cap_is_try_add(data):
+    rng, target, panels = data
+    items = [(parse(f"add(day_mean(Close), {i})"), p) for i, p in enumerate(panels)]
+    a, b = MsePool(5, target, dedup_threshold=0.9), MsePool(5, target, dedup_threshold=0.9)
+    a.admit(items)
+    for e, p in items:
+        try:
+            b.try_add(e, p)
+        except DuplicateFactorError:
+            pass
+    assert [repr(e) for e in a.exprs()] == [repr(e) for e in b.exprs()]

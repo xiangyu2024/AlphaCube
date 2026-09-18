@@ -118,7 +118,8 @@ def cmd_mine(a) -> int:
         meanstd_steps=a.meanstd_steps, dynamic_window=a.dynamic_window, seed_library=a.seed_library,
         presqueeze=(dict(n_iterations=a.presqueeze) if a.presqueeze else None), gp_params=gp,
         allow_boolean_ops=a.allow_boolean_ops, allow_resource_risk=a.allow_resource_risk,
-        checkpoint_every=a.checkpoint_every, rolling_block=a.rolling_block, ban_top_n=a.ban_top_n, engine_progress_every=a.progress_every,
+        checkpoint_every=a.checkpoint_every, rolling_block=a.rolling_block, ban_top_n=a.ban_top_n,
+        block_combine_top=a.block_combine_top, engine_progress_every=a.progress_every,
         skip_kernels=tuple(x for x in a.skip_kernels.split(",") if x),
         workdir=a.workdir,
         max_expr_len=a.max_expr_len, combine_methods=tuple(x for x in a.combine.split(",") if x),
@@ -183,7 +184,8 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--min-depth", type=int, default=2)
     m.add_argument("--max-depth", type=int, default=4)
     m.add_argument("--max-expr-len", type=int, default=20, help="RL token budget per expression")
-    m.add_argument("--pool-capacity", type=int, default=10)
+    m.add_argument("--pool-capacity", type=int, default=10,
+                   help="members the pool keeps; beyond it the weakest |weight| is pruned. 0 = no cap: every candidate that passes the gates (finite IC, coverage, scored days, dedup) stays, and the final commit offers the whole archive")
     m.add_argument("--progress-every", type=float, default=0.0,
                    help="seconds between inside-a-generation progress lines (0 = off). A generation is one "
                         "engine call, so without this the log is silent for its whole duration -- 58 minutes "
@@ -210,7 +212,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "every field the tree touches -- 9.1 GB each on the production cube -- so on a big "
                         "machine this is the cheapest speed knob there is. One panel is n_days x n_symbols x 4 "
                         "bytes (40 MB at 1942 x 5219), so 512 is ~21 GB and 2048 is ~83 GB")
-    m.add_argument("--top-k", type=int, default=None)
+    m.add_argument("--top-k", type=int, default=None,
+                   help="archive leaders offered to the pool at the end (default: 2 x pool capacity; the whole archive when the pool has no cap; 0 = the whole archive)")
+    m.add_argument("--block-combine-top", type=int, default=120,
+                   help="archive leaders each rolling-block report scores (0 = every archived expression)")
     m.add_argument("--dedup", type=float, default=0.99)
     m.add_argument("--min-coverage", type=float, default=0.5,
                    help="share of the label's finite cells on which the factor must be finite")

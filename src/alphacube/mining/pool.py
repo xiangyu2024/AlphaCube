@@ -18,8 +18,8 @@ member, finite pool IC after the (possibly pruned) refit.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Type
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Type
 
 import numpy as np
 import torch
@@ -41,13 +41,14 @@ class Member:
 
 
 class PoolBase(ABC):
-    def __init__(self, capacity: int, target: np.ndarray, dedup_threshold: Optional[float] = 0.99,
+    def __init__(self, capacity: Optional[int], target: np.ndarray, dedup_threshold: Optional[float] = 0.99,
                  dedup_sample_days: int = 250, min_coverage: float = 0.5,
                  min_scored_days: float = 0.5,
                  realized_returns: Optional[np.ndarray] = None) -> None:
-        if capacity < 1:
-            raise ValueError("capacity must be >= 1")
-        self.capacity = int(capacity)
+        # None or 0: no cap -- every candidate that passes the gates stays.
+        if capacity is not None and capacity < 0:
+            raise ValueError("capacity must be >= 0 (0 or None = unlimited)")
+        self.capacity: Optional[int] = int(capacity) if capacity else None
         self.target = np.asarray(target, dtype=np.float64)
         self.dedup_threshold = dedup_threshold
         self.dedup_sample_days = int(dedup_sample_days)
@@ -112,9 +113,9 @@ class PoolBase(ABC):
         self.weights = self._fit(self.z_columns(), self.target) if self.members else np.zeros(0)
         return self.weights
 
-    def try_add(self, expr: Expression, panel: np.ndarray) -> float:
-        """Add, refit, prune the weakest if over capacity, refit; return the pool IC.
-        Any failure restores the pool exactly and re-raises."""
+    def _screen(self, panel: np.ndarray) -> Tuple[np.ndarray, float]:
+        """The gates a candidate passes on its own: finite IC, coverage, scored days.
+        Returns (z-scored panel, IC); raises ValueError naming the gate."""
         z = zscore_rows(panel)
         ic_series = cs_pearson(panel, self.target)
         ic = nanmean_quiet(ic_series)
@@ -129,6 +130,12 @@ class PoolBase(ABC):
         if scored < self.min_scored_days:
             raise ValueError(f"scored on {scored:.2f} of usable days, below min_scored_days "
                              f"{self.min_scored_days} (finite everywhere but no cross-sectional spread)")
+        return z, ic
+
+    def try_add(self, expr: Expression, panel: np.ndarray) -> float:
+        """Add, refit, prune the weakest if over capacity, refit; return the pool IC.
+        Any failure restores the pool exactly and re-raises."""
+        z, ic = self._screen(panel)
         saved_members, saved_weights = list(self.members), self.weights
         try:
             if self.dedup_threshold is not None:
@@ -138,7 +145,7 @@ class PoolBase(ABC):
                         raise DuplicateFactorError(f"|corr| = {c:.4f} with member #{i} {m.expr!r}")
             self.members.append(Member(expr, z, ic))
             self.refit()
-            if self.size > self.capacity:
+            if self.capacity is not None and self.size > self.capacity:
                 weakest = int(np.argmin(np.abs(self.weights)))
                 del self.members[weakest]
                 self.refit()
@@ -149,6 +156,135 @@ class PoolBase(ABC):
         except Exception:
             self.members, self.weights = saved_members, saved_weights
             raise
+
+    def admit(self, candidates: Iterable[Tuple[Expression, Optional[np.ndarray]]]) -> "Admission":
+        """Offer candidates in order: which joined, and why the rest did not.
+
+        With a capacity this is ``try_add`` one at a time -- which member gets pruned
+        depends on the weights after every insertion. Without one nothing is ever
+        pruned, so a candidate only has to pass the gates and dedup, and the weights
+        are fitted once at the end. Refitting after every insertion costs O(k) inner
+        products over ~8M cells plus an O(k) combination for the pool IC, and dedup
+        O(k) correlations, so with a few hundred members per-insertion refits were
+        most of a block's scoring time. Dedup here runs against every member at once
+        (``_DedupIndex``); same threshold, same first offending member."""
+        out = Admission()
+        items = list(candidates)
+        if self.capacity is not None:
+            for expr, panel in items:
+                if panel is None:
+                    out.reject("panel unavailable", expr)
+                    continue
+                try:
+                    self.try_add(expr, np.asarray(panel, dtype=np.float64))
+                    out.added.append(expr)
+                except Exception as exc:  # noqa: BLE001 - every gate raises; callers want the tally
+                    out.reject(f"{type(exc).__name__}: {str(exc)[:60]}", expr)
+            return out
+        saved_members, saved_weights = list(self.members), self.weights
+        index = None
+        if self.dedup_threshold is not None:
+            index = _DedupIndex(self.target.shape, self.dedup_sample_days)
+            for m in self.members:
+                index.add(m.z)
+        for expr, panel in items:
+            if panel is None:
+                out.reject("panel unavailable", expr)
+                continue
+            try:
+                z, ic = self._screen(np.asarray(panel, dtype=np.float64))
+                if index is not None and index.k:
+                    c = index.abs_corr(z)
+                    hit = np.flatnonzero(c > self.dedup_threshold)
+                    if hit.size:
+                        i = int(hit[0])
+                        raise DuplicateFactorError(f"|corr| = {c[i]:.4f} with member #{i} {self.members[i].expr!r}")
+            except Exception as exc:  # noqa: BLE001
+                out.reject(f"{type(exc).__name__}: {str(exc)[:60]}", expr)
+                continue
+            self.members.append(Member(expr, z, ic))
+            if index is not None:
+                index.add(z)
+            out.added.append(expr)
+        if len(self.members) > len(saved_members):
+            self.refit()
+            if not np.isfinite(self.pool_ic()):
+                # Never seen, but the per-insertion path would have refused whichever
+                # candidate did this: redo it that way rather than keep a broken pool.
+                self.members, self.weights = saved_members, saved_weights
+                slow = Admission()
+                for expr, panel in items:
+                    if panel is None:
+                        slow.reject("panel unavailable", expr)
+                        continue
+                    try:
+                        self.try_add(expr, np.asarray(panel, dtype=np.float64))
+                        slow.added.append(expr)
+                    except Exception as exc:  # noqa: BLE001
+                        slow.reject(f"{type(exc).__name__}: {str(exc)[:60]}", expr)
+                return slow
+        return out
+
+
+@dataclass
+class Admission:
+    """What ``PoolBase.admit`` did: members added, rejections by reason, one example each."""
+    added: List[Expression] = field(default_factory=list)
+    reasons: Dict[str, int] = field(default_factory=dict)
+    examples: Dict[str, str] = field(default_factory=dict)
+
+    def reject(self, reason: str, expr: Expression) -> None:
+        self.reasons[reason] = self.reasons.get(reason, 0) + 1
+        self.examples.setdefault(reason, repr(expr)[:100])
+
+
+class _DedupIndex:
+    """``sampled_abs_corr`` of one candidate against every member at once.
+
+    Members are kept as their sampled rows (the days ``sampled_abs_corr`` takes),
+    NaN-zeroed, with finite indicators and squares, so the pairwise-finite sums a
+    correlation needs are six matrix-vector products instead of k calls that each
+    copy and mask 1.3M cells (~25 ms apiece on the production cube). The one-pass
+    formula can differ from ``np.corrcoef`` in the last bits, so a decision can only
+    change when |corr| sits within ~1e-12 of the threshold."""
+
+    def __init__(self, shape: Tuple[int, int], sample_days: int) -> None:
+        D, S = shape
+        self.idx = np.linspace(0, D - 1, num=min(int(sample_days), D)).astype(int)
+        self.width = len(self.idx) * S
+        self.k = 0
+        self._x0 = np.empty((0, self.width))
+        self._ind = np.empty((0, self.width))
+        self._x2 = np.empty((0, self.width))
+
+    def _rows(self, z: np.ndarray):
+        x = np.asarray(z, dtype=np.float64)[self.idx].reshape(-1)
+        fin = np.isfinite(x)
+        x0 = np.where(fin, x, 0.0)
+        return x0, fin.astype(np.float64), x0 * x0
+
+    def add(self, z: np.ndarray) -> None:
+        if self.k == self._x0.shape[0]:
+            grow = max(16, self.k // 2)
+            self._x0, self._ind, self._x2 = (np.concatenate([a, np.empty((grow, self.width))])
+                                            for a in (self._x0, self._ind, self._x2))
+        self._x0[self.k], self._ind[self.k], self._x2[self.k] = self._rows(z)
+        self.k += 1
+
+    def abs_corr(self, z: np.ndarray) -> np.ndarray:
+        """|corr| against members 0..k-1, NaN where ``sampled_abs_corr`` gives NaN
+        (fewer than two shared finite cells, or no variance on one side)."""
+        x0, ix, x2 = self._rows(z)
+        Y0, IY, Y2 = self._x0[:self.k], self._ind[:self.k], self._x2[:self.k]
+        n = IY @ ix
+        sx, sxx = IY @ x0, IY @ x2
+        sy, syy = Y0 @ ix, Y2 @ ix
+        sxy = Y0 @ x0
+        with np.errstate(invalid="ignore", divide="ignore"):
+            vx = sxx - sx * sx / n
+            vy = syy - sy * sy / n
+            c = np.abs((sxy - sx * sy / n) / np.sqrt(vx * vy))
+        return np.where((n >= 2) & (vx > 0) & (vy > 0), c, np.nan)
 
 
 def _lstsq_weights(z: List[np.ndarray], target: np.ndarray) -> np.ndarray:
@@ -209,14 +345,27 @@ class _GramCache:
         for p in [p for p in self._dot if p[0] not in live or p[1] not in live]:
             del self._dot[p]
         entries = [self._entry(m) for m in members]
+        keys = [[(ids[a], ids[c]) if ids[a] <= ids[c] else (ids[c], ids[a]) for c in range(k)] for a in range(k)]
+        missing = sum(keys[a][c] not in self._dot for a in range(k) for c in range(a, k))
+        if missing > 2 * k:
+            # Cold cache (a pool filled in one go by admit()): one blocked matrix
+            # product instead of k^2/2 separate inner products over ~8M cells --
+            # at k = 300 that is ~45k calls, minutes, against seconds for BLAS.
+            full = np.zeros((k, k))
+            step = max(1, (1 << 25) // k)                  # ~256 MB of stacked rows per block
+            for lo in range(0, self.n_ok, step):
+                V = np.stack([e[1][lo:lo + step] for e in entries])
+                full += V @ V.T
+            for a in range(k):
+                for c in range(a, k):
+                    self._dot[keys[a][c]] = float(full[a, c])
         G, b = np.empty((k, k)), np.empty(k)
         for a in range(k):
             b[a] = entries[a][2]
             for c in range(a, k):
-                key = (ids[a], ids[c]) if ids[a] <= ids[c] else (ids[c], ids[a])
-                g = self._dot.get(key)
+                g = self._dot.get(keys[a][c])
                 if g is None:
-                    g = self._dot[key] = float(entries[a][1] @ entries[c][1])
+                    g = self._dot[keys[a][c]] = float(entries[a][1] @ entries[c][1])
                 G[a, c] = G[c, a] = g
         w, *_ = np.linalg.lstsq(G, b, rcond=None)
         return w if np.isfinite(w).all() else np.full(k, 1.0 / k)
@@ -327,4 +476,4 @@ class DynamicRollingPool(PoolBase):
 LinearPool = MsePool     # name used by the first cut of this project
 
 __all__ = ["PoolBase", "MsePool", "MeanStdPool", "DynamicRollingPool", "LinearPool",
-           "DuplicateFactorError", "Member"]
+           "DuplicateFactorError", "Member", "Admission"]
