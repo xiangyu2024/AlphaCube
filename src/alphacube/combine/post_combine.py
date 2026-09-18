@@ -101,9 +101,14 @@ def _weights_for(
         return scores / total if total > 1e-12 else np.full(n, 1.0 / n)
 
     if method == "lstsq":
-        design = np.stack([c[days] for c in columns], axis=-1).reshape(-1, n)
+        # A missing value is a neutral 0, as in the pool's own fit and in the
+        # combination below. Requiring every member finite in a row -- the rule
+        # the pool dropped for exactly this reason -- leaves no rows at all once
+        # the pool is large: 145 members on gpu5's first block, and every
+        # weight method fell back to 1/n.
+        design = np.nan_to_num(np.stack([c[days] for c in columns], axis=-1).reshape(-1, n), nan=0.0)
         y = target[days].reshape(-1)
-        mask = np.all(np.isfinite(design), axis=1) & np.isfinite(y)
+        mask = np.isfinite(y)
         if mask.sum() < max(n, 10):
             return np.full(n, 1.0 / n, dtype=np.float64)
         weights, *_ = np.linalg.lstsq(design[mask], y[mask], rcond=None)
@@ -212,9 +217,17 @@ def combine(
         weights = None
     else:
         weights = _weights_for(method, columns, target, train_days)
+        # A member's missing value counts as neutral 0 (the pool's convention); a
+        # cell is missing only when every member is. Summing NaNs instead made the
+        # whole combination NaN wherever ANY member was: 3.5% of cells with 30
+        # members, and every cell with the 145 of gpu5's first block.
         combined = np.zeros_like(target, dtype=np.float64)
+        seen = np.zeros(target.shape, dtype=bool)
         for column, weight in zip(columns, weights):
-            combined = combined + weight * column
+            finite = np.isfinite(column)
+            combined += weight * np.where(finite, column, 0.0)
+            seen |= finite
+        combined[~seen] = np.nan
 
     ic_series = cross_sectional_pearson(combined[test_days], target[test_days])
     metrics = dict(backtest_metrics(ic_series, combined[test_days], real_returns[test_days],

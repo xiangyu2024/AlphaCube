@@ -197,3 +197,30 @@ def test_model_combinations_are_reproducible(planted):
         a, _ = compare(cols, future, future, methods=(method,), train_frac=0.7, seed=0)
         b, _ = compare(cols, future, future, methods=(method,), train_frac=0.7, seed=0)
         assert np.array_equal(a[0].combined, b[0].combined, equal_nan=True), method
+
+
+def test_missing_members_are_neutral_not_contagious():
+    """With many members nearly every cell has one missing, and the weighted sum
+    used to be NaN there: all four weight methods came back NaN on gpu5's first
+    block (145 members). A missing member counts as 0 -- the pool's own rule --
+    and a cell is missing only when every member is. lstsq also stops needing a
+    row where every member is present, which with many members is no row at all,
+    and silently meant 1/n."""
+    rng = np.random.default_rng(1)
+    T2, N2, K2 = 300, 50, 12
+    future = rng.normal(0, 0.02, (T2, N2))
+    cols = []
+    for k in range(K2):
+        c = (future if k == 0 else 0.0) + rng.normal(0, 0.05, (T2, N2))
+        c[rng.random((T2, N2)) < 0.5] = np.nan         # 0.5**12: ~3 train rows with every member present
+        cols.append(c)
+    all_missing = np.all([~np.isfinite(c) for c in cols], axis=0)
+    results, _ = compare(cols, future, future, methods=("equal", "ic", "icir", "lstsq"), train_frac=0.7)
+    test = slice(int(T2 * 0.7), T2)
+    for r in results:
+        assert np.isfinite(r.metrics["sharpe"]) and np.isfinite(r.metrics["ic_mean"]), r.method
+        assert np.array_equal(np.isnan(r.combined), all_missing), r.method
+        assert r.metrics["coverage"] == pytest.approx(1 - all_missing[test].mean())
+    lstsq = next(r for r in results if r.method == "lstsq")
+    assert not np.allclose(lstsq.weights, 1.0 / K2), "fell back to equal weights"
+    assert abs(lstsq.weights[0]) > 3 * np.abs(lstsq.weights[1:]).max(), lstsq.weights   # found the planted one
