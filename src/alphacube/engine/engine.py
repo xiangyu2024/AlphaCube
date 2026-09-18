@@ -231,24 +231,33 @@ class CubeEngine:
         mode = rnd.mode
         S, D, M = self.view.n_symbols, self.view.n_days, self.view.n_minutes
         tradable = self._tradable[lo:hi, :] if mode == MODE_S else self._tradable[:, lo:hi]
+        # Every operand -- computed in this round, read from the store, or handed
+        # off by an earlier round -- is materialised once per chunk and freed after
+        # its last use here. Leaves used to be re-read at every use: a chunk of the
+        # gpu4 population made 89-104 store reads of 8 distinct fields. Sharing one
+        # tensor is safe because no kernel writes into its operands (locked by
+        # tests/test_engine.py::test_kernels_never_write_into_operands), which CSE
+        # already relied on for computed nodes.
         values: Dict[str, torch.Tensor] = {}
-        in_round = {n.key for n in rnd.nodes}
         remaining_uses: Dict[str, int] = {}
         for n in rnd.nodes:
             for c in n.children:
-                if not c.is_leaf and c.key in in_round:
-                    remaining_uses[c.key] = remaining_uses.get(c.key, 0) + 1
+                remaining_uses[c.key] = remaining_uses.get(c.key, 0) + 1
 
         def operand(c: Node) -> torch.Tensor:
+            v = values.get(c.key)
+            if v is not None:
+                return v
             if c.is_leaf:
-                return self._load_leaf_cube(c.expr, mode, lo, hi, tradable)
-            if c.key in values:
-                return values[c.key]
-            if c.key in panels:                       # degenerate hand-off from another round
-                return self._panel_slice(c.key, panels, mode, lo, hi)
-            if c.key in bounds:                       # full-width boundary from another round
-                return self._bound_slice(c.key, bounds, mode, lo, hi)
-            raise RuntimeError(f"operand {c.key} unavailable in round {rnd}")
+                v = self._load_leaf_cube(c.expr, mode, lo, hi, tradable)
+            elif c.key in panels:                     # degenerate hand-off from another round
+                v = self._panel_slice(c.key, panels, mode, lo, hi)
+            elif c.key in bounds:                     # full-width boundary from another round
+                v = self._bound_slice(c.key, bounds, mode, lo, hi)
+            else:
+                raise RuntimeError(f"operand {c.key} unavailable in round {rnd}")
+            values[c.key] = v
+            return v
 
         for n in rnd.nodes:
             if n.failed or any(c.failed for c in n.children):
@@ -297,10 +306,9 @@ class CubeEngine:
                 else:
                     b[:, lo:hi] = arr
             for c in n.children:
-                if c.key in remaining_uses:
-                    remaining_uses[c.key] -= 1
-                    if remaining_uses[c.key] == 0 and not c.is_root:
-                        values.pop(c.key, None)
+                remaining_uses[c.key] -= 1
+                if remaining_uses[c.key] == 0 and not c.is_root:
+                    values.pop(c.key, None)
         for b in bounds.values():
             b.flush()
 

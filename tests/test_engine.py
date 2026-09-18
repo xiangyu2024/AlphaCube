@@ -205,3 +205,77 @@ def test_sliding_masked_family_is_chunk_invariant(view):
     b = CubeEngine(view).evaluate(exprs, tolerant=True)
     for e, x, y in zip(exprs, a.panels, b.panels):
         assert x is None or np.array_equal(x, y, equal_nan=True), e
+
+
+def test_each_operand_is_read_once_per_chunk(view, monkeypatch):
+    """A chunk used to re-read a field from the store at EVERY use: one chunk of
+    the gpu4 population made 89-104 store reads of 8 distinct fields, and the
+    leaf read was the engine's largest cost on the GPU. Now each distinct operand
+    is read once per chunk -- and every value equals evaluating that expression
+    on its own, where nothing is shared across trees."""
+    from collections import Counter
+    exprs = [parse(s) for s in ("day_mean(Close)", "day_std(Close)", "day_max(add(Close, Volume))",
+                                "day_min(mul(Close, Close))", "day_last(in_rank(Volume))")]
+    reads = Counter()
+    read_s = view.read_s
+
+    def counted(name, lo, hi):
+        reads[(name, lo)] += 1
+        return read_s(name, lo, hi)
+
+    monkeypatch.setattr(view, "read_s", counted)
+    res = CubeEngine(view, chunk_symbols=3).evaluate(exprs)
+    assert [r.mode for r in res.plan.rounds] == [MODE_S]
+    n_chunks = -(-view.n_symbols // 3)
+    assert sorted(reads) == sorted((f, lo) for f in ("Close", "Volume") for lo in range(0, view.n_symbols, 3))
+    assert set(reads.values()) == {1}, "the old engine read Close 5x and Volume 2x per chunk"
+    assert sum(reads.values()) == 2 * n_chunks
+    for e, p in zip(exprs, res.panels):
+        alone = CubeEngine(view, chunk_symbols=3).evaluate([e]).panels[0]
+        assert np.array_equal(p, alone, equal_nan=True), e
+
+
+def test_kernels_never_write_into_operands(registry, tmp_path_factory, monkeypatch):
+    """The engine hands ONE tensor to every consumer of an operand in a chunk --
+    computed nodes through CSE, store reads since leaves are read once per chunk
+    -- so a kernel that wrote into an input would corrupt every later consumer.
+    Probe every registered operator (not only the searchable ones): snapshot each
+    tensor operand bit-for-bit before the call and compare after it."""
+    from alphacube.engine import engine as E
+    from alphacube.expression import Feature, make_node
+    from alphacube.synthetic import write_synthetic_store
+
+    def bits(t):
+        if t.is_floating_point():
+            return t.contiguous().view(torch.int32 if t.dtype == torch.float32 else torch.int64).clone()
+        return t.clone()
+
+    dirty = []
+
+    def guard(fn):
+        def wrap(expr, vals, *rest):
+            flat = [t for v in vals for t in (v if isinstance(v, list) else [v]) if isinstance(t, torch.Tensor)]
+            before = [bits(t) for t in flat]
+            out = fn(expr, vals, *rest)
+            if any(not torch.equal(bits(t), b) for t, b in zip(flat, before)):
+                dirty.append(expr.spec.name)
+            return out
+        return wrap
+
+    monkeypatch.setattr(E, "apply_cube", guard(E.apply_cube))
+    monkeypatch.setattr(E, "apply_panel", guard(E.apply_panel))
+    st = write_synthetic_store(tmp_path_factory.mktemp("purity"), n_symbols=5, n_days=40, n_minutes=241,
+                               seed=2, suspended_frac=0.05)
+    full, full2 = Feature("Close"), Feature("Volume")
+    daily, daily2 = (make_node(registry.get("day_last"), (f,)) for f in (full, full2))
+    exprs = []
+    for spec in registry.list_all():
+        n = 1 if spec.category in ("unary", "rolling") else 2
+        args = (daily, daily2)[:n] if spec.needs_daily else (daily,) if spec.restores_m else (full, full2)[:n]
+        w = 241 if spec.restores_m else (spec.windows[1] if len(spec.windows) > 1 else
+                                         spec.windows[0] if spec.windows else None)
+        e = make_node(spec, args, w)
+        exprs.append(e if e.shape.degenerate else make_node(registry.get("day_last"), (e,)))
+    res = E.CubeEngine(st.view(), chunk_symbols=2, chunk_days=11).evaluate(exprs, tolerant=True)
+    assert len(exprs) == len(registry) and not res.errors
+    assert not dirty, f"kernels that wrote into an operand: {sorted(set(dirty))}"
