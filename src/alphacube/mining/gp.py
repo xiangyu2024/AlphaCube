@@ -323,11 +323,19 @@ class GPMiner:
                 population = self.generator.generate_population(self.population_size)
                 fit = self.fitness(population)
                 self._archive_update(population, fit)
+                # The rebuilt population is a real, evaluated generation: report it as
+                # one. This line used to print placeholders -- "gen_best +nan ... valid 0"
+                # -- which on gpu5 read as a whole block's first population failing,
+                # while those same trees had just added 48 entries to the archive.
+                finite = fit[np.isfinite(fit)]
+                if finite.size:
+                    best = max(best, float(finite.max()))
                 if on_generation is not None:
-                    on_generation(g + 1, n_gen, {"best": best, "gen_best": float("nan"),
-                                                 "gen_mean": float("nan"),
+                    on_generation(g + 1, n_gen, {"best": best,
+                                                 "gen_best": float(finite.max()) if finite.size else float("nan"),
+                                                 "gen_mean": float(finite.mean()) if finite.size else float("nan"),
                                                  "archive": len(self._archive),
-                                                 "valid": 0, "rolled": len(banned)})
+                                                 "valid": int(finite.size), "rolled": len(banned)})
         if self.rolling_block and self.on_block is not None and len(self._archive) > len(self._block_seen):
             self._roll(population, fit, n_gen)          # the final, unrolled block still gets scored
         report = self._commit()

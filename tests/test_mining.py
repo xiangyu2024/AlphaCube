@@ -405,7 +405,13 @@ def test_rolling_restart_bans_what_the_block_leaned_on(registry, view):
     target = Label("close", 1).compute(view)
     m = GPMiner(registry, view, target, MsePool(5, target), population_size=12, max_depth=4,
                 rolling_block=3, ban_top_n=2, seed=3)
-    m.mine(12 * 9)
+    lines = []
+    m.mine(12 * 9, on_generation=lambda g, n, info: lines.append(info))
+
+    # the rebuilt population after a roll is evaluated like any generation, and its
+    # line says how it did -- it used to print "valid 0" and NaN placeholders
+    rolled = [x for x in lines if "rolled" in x]
+    assert rolled and all(x["valid"] > 0 and np.isfinite(x["gen_best"]) for x in rolled), rolled
 
     assert len(m.blocks) >= 2, "nine generations in blocks of three must roll at least twice"
     for b in m.blocks:
