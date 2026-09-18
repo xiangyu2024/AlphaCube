@@ -5,27 +5,35 @@
 
 ---
 
-## 0. 现在的状态(2026-09-18 11:35)
+## 0. 现在的状态(2026-09-18 23:30)
 
 **一个全市场挖掘任务正在跑**,别动它,除非你有理由停。
 
 ```
-run-id   gpu6              screen 会话 gpu6(任务)+ gpu6rep(每 15 分钟快照 -> gpu6_report.log)
-pid      259534            11:34 启动(scripts/gpu6.sh = gpu5.sh 换 run-id,且 --pool-capacity 0 --block-combine-top 0)
+run-id   gpu7              screen 会话 gpu7(任务)+ gpu7rep(每 5 分钟快照 -> gpu7_report.log,带 anon 内存)
+pid      306834            23:20 启动(scripts/gpu7.sh)
 配置     20 代 = 4 块 x 5 代,全市场 5220 只 x 20180102~20251231,seed 0
-代码     commit 1082bd0:读取修复 + 下面全部修复 + 不设上限
+         池子上限 30、块结算前 120 条、最终入池前 60 条(用户:设上限,选不会爆的版本)
+         开局即 --ban 6 个结构 = gpu5 前两块封掉的:log(Amt)、nt_ts_argmax(High)|w3、cross_decay_linear(Amt)|w3、
+         day_ar1_coefficient(High)、day_ar1_coefficient(Close)、day_durbin_watson(Close)
+代码     commit 8f5ca07 启动;组合层 NaN 修复(7e50681)在第 1 块之前同步 —— post_combine 是懒导入,会用上新版
 ```
 
-**用户要求:不设数量上限,生成多少留多少**(去重 0.95 与质量闸门照旧)。`--pool-capacity 0` 池子不剪枝,
-`--block-combine-top 0` 块结算用整个 archive,最终入池也取整个 archive。批量入池 `PoolBase.admit()`:
-不设上限时只过闸门和去重、最后统一拟合一次,去重对全体成员一次矩阵运算。生产规模实测每条候选 1.8 秒。
+**内存:容器上限 90 GiB(`/sys/fs/cgroup/memory.max`),不是 `free` 显示的 754 GB。** `ps` 的 RSS 含 mmap 数据文件页
+(可回收,gpu7 启动 5 分钟 RSS 71.9 GB 而 anon 只有 19.8 GB),判断要看 `memory.stat` 的 `anon`。
+**gpu6(不设上限)在第 1 块结算中途静默死亡**(~12:40,无 traceback、无 core、cgroup oom_kill=0):
+池子 145 条 + 组合层全尺寸堆叠,叠在 GP 自己的面板缓存上撑爆内存。单独进程重放同一结算能跑完
+(`_bench/replay_block1.py`),所以是叠加的问题。上限 30 时结算内存有界,与 archive 大小无关。
 
-**gpu5 已停**(用户批准,11:34,SIGINT,第 10 代落地后、第 2 块结算中途):它和 gpu6 的 GP 搜索完全相同,
-所以 gpu6 第 1~10 代的 archive 应当与 `mining_runs/gpu5/checkpoints/` 逐字节相同。
-**gpu4 已停**(09:26):gpu5 第 1~4 代与之逐行相同(83/129/160/195 行,0 行不同),每代耗时
-gpu4 75.1 / 22.3 / 24.7 / 15.5 分 → gpu5 11.4 / 8.4 / 12.5 / 5.2 分,合计 137.6 → 37.5 分(3.7 倍)。
+gpu6 重放出的第 1 块(不设上限,145 条,**扣 15bp**):ridge 夏普 5.37 → −0.13,gbdt 4.12 → −2.55,
+lightgbm 3.74 → −2.83,xgboost 3.97 → −3.27(日换手 50~71%);equal/ic/icir/lstsq 全 NaN —— 组合层把
+NaN 当传染(任一成员缺值整格 NaN),已修为缺值按 0(commit 7e50681)。
 
-**gpu5 的第 1 块结算(46 分钟)暴露了三个问题,均已修复,gpu6 起生效:**
+**gpu4 / gpu5 / gpu6 已停**:gpu5 跑到第 10 代(`mining_runs/gpu5/checkpoints/archive_gen001..010.csv`);
+gpu4、gpu5、gpu6 前几代逐行相同。每代耗时 gpu4 75.1 / 22.3 / 24.7 / 15.5 分 → gpu5 11.4 / 8.4 / 12.5 / 5.2 分。
+gpu5 第 10 代头部扣费回测见 `_bench/top_gpu5_gen010.json`(`_bench/eval_top.py`)。
+
+**gpu5 的第 1 块结算(46 分钟)暴露了三个问题,均已修复:**
 1. `MsePool` 每试加一条候选就在 ~800 万行上从头解最小二乘(k=31 时 22 秒,池满时每条解两次)
    → 改为增量 Gram 矩阵,单次插入 55.5 s → 5.1 s,成员与池 IC 不变(commit 52eba66)。
 2. 融合回测**不扣成本**:`compare()` 不接成本参数,块报告和最终组合表只有无成本夏普,
@@ -36,7 +44,7 @@ gpu4 75.1 / 22.3 / 24.7 / 15.5 分 → gpu5 11.4 / 8.4 / 12.5 / 5.2 分,合计 1
 
 gpu5 第 1 块报告(**无成本口径,样本外 = 后 30% 交易日,池子上限 30**):lightgbm ICIR 0.55 / 夏普 4.59 / 日换手 62%;
 gbdt 0.54 / 4.34 / 61%;xgboost 0.54 / 3.89 / 67%;lstsq 0.42 / 4.44 / 54%;ridge 0.40 / 4.28 / 45%;
-icir / ic / equal 约 0.27 / 3.4~3.6 / 18~19%。gpu6 的块报告会带扣 15bp 与限换手两套。
+icir / ic / equal 约 0.27 / 3.4~3.6 / 18~19%。gpu7 的块报告带扣 15bp 与限换手两套。
 
 第 3 代头部 10 条已按 pipeline 口径补算扣成本回测(`_bench/eval_top.py`,结果 `_bench/top_gen003.json`):
 几乎全是**成交额水平**(低成交额 → 次日高收益,小盘/流动性溢价),能扛住 15bp 的只有低换手的平滑版
@@ -90,13 +98,13 @@ ssh -o BatchMode=yes -o ControlPath=none -p 29982 root@connect.westd.seetacloud.
 
 ```bash
 ssh -o BatchMode=yes -o ControlPath=none -p 29982 root@connect.westd.seetacloud.com \
-  'cd /root/autodl-tmp/AlphaCube && for f in "" _report; do cp scripts/gpu6$f.sh scripts/gpu7$f.sh;
-   sed -i s/gpu6/gpu7/g scripts/gpu7$f.sh; done &&
-   screen -dmS gpu7 bash -c "./scripts/gpu7.sh > gpu7_run.log 2>&1" &&
-   screen -dmS gpu7rep bash -c "./scripts/gpu7_report.sh"'
+  'cd /root/autodl-tmp/AlphaCube && for f in "" _report; do cp scripts/gpu7$f.sh scripts/gpu8$f.sh;
+   sed -i s/gpu7/gpu8/g scripts/gpu8$f.sh; done &&
+   screen -dmS gpu8 bash -c "./scripts/gpu8.sh > gpu8_run.log 2>&1" &&
+   screen -dmS gpu8rep bash -c "./scripts/gpu8_report.sh"'
 ```
 
-`scripts/gpu6.sh` 是当前配置的样板(只在服务器上,不在 git 里),改参数复用。**脚本里写死了
+`scripts/gpu7.sh` 是当前配置的样板(只在服务器上,不在 git 里),改参数复用。**脚本里写死了
 `--run-id`**:直接拿旧脚本起新任务会写进旧的 `mining_runs/<id>`,所以先复制再改名(上面那条命令就是)。
 **长任务一律用 `screen`** —— 它与 ssh 连接无关,断网、关机、退出 IDE 都不影响。`nohup` 不够可靠,试过。
 停任务用 `kill -INT <pid>`:KeyboardInterrupt 会走引擎的 `finally`,落盘临时目录会被清掉
@@ -137,8 +145,8 @@ ssh -o BatchMode=yes -o ControlPath=none -p 29982 root@connect.westd.seetacloud.
 ```bash
 S='ssh -o BatchMode=yes -o ControlPath=none -p 29982 root@connect.westd.seetacloud.com'
 
-$S 'cd /root/autodl-tmp/AlphaCube && tail -20 gpu6_run.log'            # 进度
-$S 'cd /root/autodl-tmp/AlphaCube && ls mining_runs/gpu6/checkpoints'  # 每代产物
+$S 'cd /root/autodl-tmp/AlphaCube && tail -20 gpu7_run.log'            # 进度
+$S 'cd /root/autodl-tmp/AlphaCube && ls mining_runs/gpu7/checkpoints'  # 每代产物
 $S 'ps -eo pid,etime,pcpu,rss,args | grep "[c]li mine"'                # 活没活着
 $S 'nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv'   # GPU
 $S 'df -h / /root/autodl-tmp'                                          # 磁盘(系统盘必看)
