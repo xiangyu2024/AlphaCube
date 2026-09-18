@@ -5,26 +5,33 @@
 
 ---
 
-## 0. 现在的状态(2026-09-19 00:40)
+## 0. 现在的状态(2026-09-19 03:50)
 
 **一个全市场挖掘任务正在跑**,别动它,除非你有理由停。
 
 ```
-run-id   gpu8              screen 会话 gpu8(任务)+ gpu8rep(每 5 分钟快照 -> gpu8_report.log,带 anon 内存)
-pid      313998            00:34 启动(scripts/gpu8.sh)
+run-id   gpu9              screen 会话 gpu9(任务)+ gpu9rep(每 5 分钟快照 -> gpu9_report.log,带 anon 内存)
+pid      332647            03:44 启动(scripts/gpu9.sh)
 配置     20 代 = 4 块 x 5 代,全市场 5220 只 x 20180102~20251231,seed 0
          池子上限 30、块结算前 120 条、最终入池前 60 条
-         开局 --ban 9 个结构:gpu5 两块的 6 个 + gpu7 第 1 块的 nt_ts_kurt(Vwap)|w30、pow_1_5(Amt)、day_max(Amt)
-         --ban-rank-corr 0.95:和被封结构的因子样本 |rank 相关| >= 0.95 的候选一律拒绝(用户定的口径)
-         样本 = gpu5 第 10 代 + gpu7 第 7 代 archive 中含这 9 个键的 206 条(--ban-archive),启动时先求值
-代码     commit 29e2559
+         开局 --ban 12 个结构:gpu5 两块的 6 个 + gpu7 第 1 块 3 个 + gpu8 第 1 块 3 个
+         (day_ar1_coefficient(Volume)、day_ar1_coefficient(Ret)、in_cov(Ret,Close)|w30)
+         --ban-rank-corr 0.95,样本 = gpu5 第 10 代 + gpu7 第 7 代 + gpu8 第 8 代 archive 中含这 12 个键的 295 条
+代码     commit a30d06f(逐元素 Python 循环的算子退出搜索)
 ```
+
+**gpu8 已停**(用户批准,03:43):第 9 代卡死 —— 一棵树用了 `in_mask_nearby_ones`(为 1/NaN 掩码写的,
+对每个有限格点 Python 循环 + 两次 `.item()`),每块 7 分钟,89 分钟只跑 2%,ETA 77 小时。现在由注册表构建时的
+探针判定(数算子执行的 Python 行数随输入是否增长,确定性、与机器无关;ND 面豁免),命中者退出搜索。
+gpu8 第 1 块结果:头部因子扣 15bp 全负(DW(Low) −1.98、ar1(Volume) 族 −4.19、日内反转 day_mean(Ret) −5.17);
+融合回测扣费后 ic/icir/equal 约 +0.1~+0.3,限换手 30% 时约 1.1~1.25。第 2 块(第 6~8 代)是 DW 族换价格序列回归:
+`day_durbin_watson(inv(Vwap))` |IC| 0.0333 为所有 run 最高,但这一族日换手 ~45%,扣费为负。
 
 **为什么有 rank 封禁**:gpu7 第 1 块证明按一层结构封禁能被单调改写绕过 —— `log(Amt)` 封了,
 GP 写成 `log(pow_1_5(Amt))`、`pow_05(pow_05(day_max(Amt)))`,日截面排名与 `day_max(log(Amt))` 逐位相同。
 rank 相关对任何单调改写(含反号)恰为 1.0。生成日志每代多 `similar`(本代被拒数)与 `exemplars`(样本数)。
 
-**gpu7 已停**(用户批准,00:33,第 7 代后):第 1 块报告 —— 头部 10 条只是 2 个因子:日内 Vwap 峰度
+**gpu7 已停**(00:33,第 7 代后):第 1 块报告 —— 头部 10 条只是 2 个因子:日内 Vwap 峰度
 (`nt_ts_kurt(Vwap, 30)` 族,IC 0.031~0.032,日换手 81~89%,扣费夏普 −9.5~−18.6)与换写法回来的 `day_max(Amt)`;
 融合回测扣 15bp 后只有 equal 为正(+0.24),限换手 30% 时 equal/ic/icir/lstsq/ridge 约 1.0~1.25,树模型为负。
 
@@ -107,13 +114,13 @@ ssh -o BatchMode=yes -o ControlPath=none -p 29982 root@connect.westd.seetacloud.
 
 ```bash
 ssh -o BatchMode=yes -o ControlPath=none -p 29982 root@connect.westd.seetacloud.com \
-  'cd /root/autodl-tmp/AlphaCube && for f in "" _report; do cp scripts/gpu8$f.sh scripts/gpu9$f.sh;
-   sed -i s/gpu8/gpu9/g scripts/gpu9$f.sh; done &&
-   screen -dmS gpu9 bash -c "./scripts/gpu9.sh > gpu9_run.log 2>&1" &&
-   screen -dmS gpu9rep bash -c "./scripts/gpu9_report.sh"'
+  'cd /root/autodl-tmp/AlphaCube && for f in "" _report; do cp scripts/gpu9$f.sh scripts/gpu10$f.sh;
+   sed -i s/gpu9/gpu10/g scripts/gpu10$f.sh; done &&
+   screen -dmS gpu10 bash -c "./scripts/gpu10.sh > gpu10_run.log 2>&1" &&
+   screen -dmS gpu10rep bash -c "./scripts/gpu10_report.sh"'
 ```
 
-`scripts/gpu8.sh` 是当前配置的样板(只在服务器上,不在 git 里),改参数复用。**脚本里写死了
+`scripts/gpu9.sh` 是当前配置的样板(只在服务器上,不在 git 里),改参数复用。**脚本里写死了
 `--run-id`**:直接拿旧脚本起新任务会写进旧的 `mining_runs/<id>`,所以先复制再改名(上面那条命令就是)。
 **长任务一律用 `screen`** —— 它与 ssh 连接无关,断网、关机、退出 IDE 都不影响。`nohup` 不够可靠,试过。
 停任务用 `kill -INT <pid>`:KeyboardInterrupt 会走引擎的 `finally`,落盘临时目录会被清掉
@@ -154,8 +161,8 @@ ssh -o BatchMode=yes -o ControlPath=none -p 29982 root@connect.westd.seetacloud.
 ```bash
 S='ssh -o BatchMode=yes -o ControlPath=none -p 29982 root@connect.westd.seetacloud.com'
 
-$S 'cd /root/autodl-tmp/AlphaCube && tail -20 gpu8_run.log'            # 进度
-$S 'cd /root/autodl-tmp/AlphaCube && ls mining_runs/gpu8/checkpoints'  # 每代产物
+$S 'cd /root/autodl-tmp/AlphaCube && tail -20 gpu9_run.log'            # 进度
+$S 'cd /root/autodl-tmp/AlphaCube && ls mining_runs/gpu9/checkpoints'  # 每代产物
 $S 'ps -eo pid,etime,pcpu,rss,args | grep "[c]li mine"'                # 活没活着
 $S 'nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv'   # GPU
 $S 'df -h / /root/autodl-tmp'                                          # 磁盘(系统盘必看)
