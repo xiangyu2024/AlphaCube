@@ -39,7 +39,11 @@ def cs_pearson(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 def rank_rows(x: np.ndarray) -> np.ndarray:
-    return pd.DataFrame(np.asarray(x, dtype=np.float64)).rank(axis=1).to_numpy()
+    """Per-row average ranks (ties averaged) of the finite cells, NaN elsewhere.
+    pandas ranks inf as a value -- the largest one -- so an inf cell used to get
+    rank n here while every IC and every book in this module skips it."""
+    x = np.asarray(x, dtype=np.float64)
+    return pd.DataFrame(np.where(np.isfinite(x), x, np.nan)).rank(axis=1).to_numpy()
 
 
 def zscore_rows(x: np.ndarray) -> np.ndarray:
@@ -126,6 +130,91 @@ def batched_ic(tensors: Sequence[torch.Tensor], target: torch.Tensor) -> torch.T
     return out
 
 
+def torch_rank_rows(x) -> torch.Tensor:
+    """``rank_rows`` in torch (float64): per-row average ranks of the finite cells."""
+    return _avg_ranks_t(torch.as_tensor(np.asarray(x)))[0]
+
+
+def _avg_ranks_t(x: torch.Tensor):
+    """Average ranks (1-based, ties averaged) of each row's finite cells, NaN
+    elsewhere, plus what the decile book reuses: the stable ascending order with
+    the non-finite cells last, and the per-row finite count."""
+    fin = torch.isfinite(x)
+    s, order = torch.sort(torch.where(fin, x, torch.full_like(x, float("inf"))), dim=1, stable=True)
+    lo = torch.searchsorted(s, s, right=False)          # a tie block spans sorted positions lo..hi-1
+    hi = torch.searchsorted(s, s, right=True)
+    avg = (lo + hi + 1).to(torch.float64) / 2.0
+    ranks = torch.empty(x.shape, dtype=torch.float64).scatter_(1, order, avg)
+    ranks[~fin] = float("nan")
+    return ranks, order, fin.sum(dim=1)
+
+
+def _cs_corr_days_t(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``cs_pearson`` in torch: one correlation per day over the pairwise-finite
+    cells, NaN below ``MIN_PAIRS`` or without variance on either side."""
+    valid = torch.isfinite(a) & torch.isfinite(b)
+    n = valid.sum(dim=1)
+    zero = torch.zeros((), dtype=a.dtype)
+    nf = n.clamp(min=1).to(a.dtype)
+    am = torch.where(valid, a, zero).sum(1) / nf
+    bm = torch.where(valid, b, zero).sum(1) / nf
+    ac = torch.where(valid, a - am.unsqueeze(1), zero)
+    bc = torch.where(valid, b - bm.unsqueeze(1), zero)
+    cov, va, vb = (ac * bc).sum(1), (ac * ac).sum(1), (bc * bc).sum(1)
+    ok = (n >= MIN_PAIRS) & (va > 0) & (vb > 0)
+    out = torch.full((a.shape[0],), float("nan"), dtype=a.dtype)
+    out[ok] = cov[ok] / torch.sqrt(va[ok] * vb[ok])
+    return out
+
+
+def _book_turnover_t(order: torch.Tensor, n: torch.Tensor, top_frac: float) -> float:
+    """Mean daily turnover of ``long_short_weights`` built from a stable sort order,
+    as ``portfolio_returns`` counts it (0.5 * sum|w_t - w_t-1|, from an empty book)."""
+    D, S = order.shape
+    k = torch.clamp(torch.floor(n.to(torch.float64) * top_frac), min=1).to(torch.int64)
+    pos = torch.arange(S).unsqueeze(0)
+    ok = (n >= 2).unsqueeze(1)
+    long_ = ok & (pos >= (n - k).unsqueeze(1)) & (pos < n.unsqueeze(1))
+    short = ok & (pos < k.unsqueeze(1))
+    kk = k.to(torch.float64).unsqueeze(1)
+    ws = torch.where(long_, 0.5 / kk, torch.where(short, -0.5 / kk, torch.zeros((), dtype=torch.float64)))
+    w = torch.zeros((D, S), dtype=torch.float64).scatter_(1, order, ws)
+    prev = torch.cat([torch.zeros((1, S), dtype=torch.float64), w[:-1]])
+    return float((0.5 * (w - prev).abs().sum(1)).mean())
+
+
+def rank_ic_turnover(panel, target_ranks: torch.Tensor, top_frac: float = 0.1):
+    """GP fitness ingredients from one sort of the panel: the daily rank-IC series
+    (``cs_pearson(rank_rows(panel), rank_rows(target))`` -- ``ic_summary``'s
+    ``rank_ic`` -- as a numpy array) and the mean daily turnover of the
+    top/bottom ``top_frac`` book (``backtest_metrics``' ``turnover``; it does not
+    depend on the factor's sign). ``target_ranks`` is ``torch_rank_rows(target)``."""
+    ranks, order, n = _avg_ranks_t(torch.as_tensor(np.asarray(panel)))
+    return _cs_corr_days_t(ranks, target_ranks).numpy(), _book_turnover_t(order, n, top_frac)
+
+
+def ema_rows(panel: np.ndarray, halflife: float) -> np.ndarray:
+    """Causal per-stock EMA along days: ``s_t = a * x_t + (1 - a) * s_t-1`` with
+    ``a = 1 - 0.5 ** (1 / halflife)``. A missing day leaves the state as it was and
+    is missing in the output (nothing to trade that day); a stock's first finite
+    value starts its state. ``halflife <= 0`` returns the panel unchanged."""
+    x = np.asarray(panel, dtype=np.float64)
+    if halflife <= 0:
+        return x
+    a = 1.0 - 0.5 ** (1.0 / float(halflife))
+    out = np.full_like(x, np.nan)
+    state = np.full(x.shape[1], np.nan)
+    for t in range(x.shape[0]):
+        row = x[t]
+        fin = np.isfinite(row)
+        fresh = fin & ~np.isfinite(state)
+        state = np.where(fresh, row, state)
+        upd = fin & ~fresh
+        state[upd] = a * row[upd] + (1.0 - a) * state[upd]
+        out[t, fin] = state[fin]
+    return out
+
+
 def sampled_abs_corr(a: np.ndarray, b: np.ndarray, sample_days: int = 250) -> float:
     D = a.shape[0]
     idx = np.linspace(0, D - 1, num=min(sample_days, D)).astype(int)
@@ -175,20 +264,27 @@ def long_short_weights(alpha: np.ndarray, top_frac: float) -> np.ndarray:
     """(D, S) alpha -> (D, S) target weights: equal-weight long the top ``top_frac``,
     short the bottom, gross exposure 1 (so +0.5 long / -0.5 short) and net 0.
     Days with too few names are all-zero rather than NaN, so a gap in the alpha
-    means "hold nothing", not "hold the previous book forever"."""
+    means "hold nothing", not "hold the previous book forever".
+
+    Ties at a boundary go by symbol order (a stable sort). numpy's default sort
+    is not stable, and which of the tied names it put in the book depended on
+    the rest of the row: nudging one mid-ranked name changed the book in 12 of
+    200 tied rows, i.e. turnover charged for trades nobody would make. With
+    turnover now part of the GP fitness (``rank_ic_turnover`` builds the same
+    book in torch) that noise would also have been selected against."""
+    alpha = np.asarray(alpha, dtype=np.float64)
     D, S = alpha.shape
+    fin = np.isfinite(alpha)
+    n = fin.sum(axis=1)
+    order = np.argsort(np.where(fin, alpha, np.inf), axis=1, kind="stable")     # non-finite last
+    k = np.maximum(1, np.floor(n * top_frac).astype(np.int64))
+    pos = np.arange(S)[None, :]
+    ok = (n >= 2)[:, None]
+    long_ = ok & (pos >= (n - k)[:, None]) & (pos < n[:, None])
+    short = ok & (pos < k[:, None])
+    w_sorted = np.where(long_, 0.5 / k[:, None], np.where(short, -0.5 / k[:, None], 0.0))
     w = np.zeros((D, S), dtype=np.float64)
-    for t in range(D):
-        a = alpha[t]
-        m = np.isfinite(a)
-        n = int(m.sum())
-        if n < 2:
-            continue
-        idx = np.flatnonzero(m)
-        k = max(1, int(np.floor(n * top_frac)))
-        order = idx[np.argsort(a[idx])]
-        w[t, order[-k:]] = 0.5 / k
-        w[t, order[:k]] = -0.5 / k
+    np.put_along_axis(w, order, w_sorted, axis=1)
     return w
 
 
@@ -317,4 +413,4 @@ def backtest_metrics(ic_series: np.ndarray, alpha_values: Optional[np.ndarray] =
 __all__ = ["MIN_PAIRS", "long_short_weights", "apply_turnover_cap", "portfolio_returns",
            "cs_pearson", "cross_sectional_pearson", "rank_rows", "zscore_rows", "nanmean_quiet",
            "ic_summary", "quantile_longshort", "batched_ic", "sampled_abs_corr", "daily_returns_from_close",
-           "combine_panels", "backtest_metrics"]
+           "combine_panels", "backtest_metrics", "torch_rank_rows", "rank_ic_turnover", "ema_rows"]

@@ -224,3 +224,31 @@ def test_missing_members_are_neutral_not_contagious():
     lstsq = next(r for r in results if r.method == "lstsq")
     assert not np.allclose(lstsq.weights, 1.0 / K2), "fell back to equal weights"
     assert abs(lstsq.weights[0]) > 3 * np.abs(lstsq.weights[1:]).max(), lstsq.weights   # found the planted one
+
+
+def test_smoothing_is_chosen_on_training_days_and_cuts_turnover():
+    """Trading an EMA of the combination (smooth_halflives): a persistent signal
+    buried in daily noise churns a daily-rebalanced decile book; its EMA keeps the
+    signal, drops most of the noise and most of the turnover. The half-life is
+    picked on the training days only -- rewriting the test days' returns does not
+    move it -- and "no smoothing" is always a candidate."""
+    from alphacube.metrics import zscore_rows
+
+    rng = np.random.default_rng(0)
+    D, S = 400, 200
+    slow = zscore_rows(np.cumsum(rng.normal(size=(D, S)) * 0.2, axis=0) + rng.normal(size=(1, S)) * 3)
+    target = 0.002 * slow + 0.02 * rng.normal(size=(D, S))
+    col = slow + 2.0 * rng.normal(size=(D, S))
+    kw = dict(methods=("equal",), train_frac=0.6, cost_per_side=0.0015, smooth_halflives=(1, 2, 5, 10))
+    (r,), _ = compare([col], target, target, **kw)
+    m = r.metrics
+    assert m["halflife"] > 0 and m["turnover_smooth"] < 0.5 * m["turnover"], m
+    assert m["sharpe_smooth"] > m["sharpe_net"] + 1.0, m
+
+    flipped = target.copy()
+    flipped[int(D * 0.6):] *= -1.0                     # the test days only
+    (r2,), _ = compare([col], target, flipped, **kw)
+    assert r2.metrics["halflife"] == m["halflife"], "the half-life must come from the training days"
+
+    (r3,), _ = compare([col], target, target, methods=("equal",), train_frac=0.6, cost_per_side=0.0015)
+    assert "halflife" not in r3.metrics and r3.metrics["sharpe_net"] == m["sharpe_net"]

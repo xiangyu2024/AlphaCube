@@ -109,7 +109,8 @@ def cmd_mine(a) -> int:
 
     gp = dict(population_size=a.population, max_depth=a.max_depth, min_depth=a.min_depth, top_k=a.top_k,
               panel_cache_items=a.panel_cache, banned_substructures=tuple(a.ban),
-              ban_rank_corr=a.ban_rank_corr)
+              ban_rank_corr=a.ban_rank_corr, fitness_kind=a.fitness, turnover_penalty=a.turnover_penalty,
+              archive_dedup=a.archive_dedup)
     if a.ban_archive:
         from .pipeline import ban_exemplars_from
         if not a.ban_rank_corr or not a.ban:
@@ -131,6 +132,7 @@ def cmd_mine(a) -> int:
         workdir=a.workdir,
         max_expr_len=a.max_expr_len, combine_methods=tuple(x for x in a.combine.split(",") if x),
         combine_train_frac=a.combine_train_frac, out_root=a.out, run_id=a.run_id,
+        smooth_halflives=tuple(float(x) for x in a.smooth_halflives.split(",") if x),
     )
     return 0 if res.pool_size else 1
 
@@ -270,6 +272,19 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--combine", default="equal,ic,icir,lstsq,ridge,gbdt",
                    help="comma list of combination methods for the out-of-sample leaderboard ('' to skip)")
     m.add_argument("--combine-train-frac", type=float, default=0.7)
+    m.add_argument("--smooth-halflives", default="",
+                   help="comma-separated EMA half-lives (days) to try on every combination: the one with the "
+                        "best after-cost Sharpe on the TRAINING days is traded on the test days "
+                        "(halflife / sharpe_smooth / turnover_smooth); 0 = no smoothing is always a candidate. "
+                        "Empty = off")
+    m.add_argument("--fitness", default="ic", choices=("ic", "rank_ic"),
+                   help="GP fitness base: |mean daily Pearson IC| (ic) or |mean daily rank IC| (rank_ic)")
+    m.add_argument("--turnover-penalty", type=float, default=0.0,
+                   help="GP fitness = |IC or rank IC| - this x daily turnover of the top/bottom decile book "
+                        "(0 = off). 0.14 is 15 bp a side in rank-IC units on the gpu4-gpu8 leaders")
+    m.add_argument("--archive-dedup", type=float, default=0.0,
+                   help="treat GP trees whose daily ranks correlate >= this as one factor family: the archive "
+                        "keeps each family's best, and within a generation only that one breeds (0 = off)")
     m.set_defaults(fn=cmd_mine)
     return ap
 

@@ -46,7 +46,13 @@ if __name__ == "__main__":
                        # 一张面板 = n_days x n_symbols x 4 字节(全市场 1942x5219 约 40 MB)。
                        # 缓存未命中要把这棵树碰到的每个字段重读一遍(每个 9.1 GB),
                        # 所以内存大的机器上这是最便宜的提速手段。512 约 21 GB。
-                       panel_cache_items=512),
+                       panel_cache_items=512,
+                       # 适应度:"ic" = |日均 Pearson IC|;"rank_ic" = |日均 rank IC|(十分位书按排名下单,
+                       # 少数极端值撑起的 Pearson IC 不算数)。turnover_penalty 再减去 λ x 十分位多空书日换手,
+                       # 0.14 = 15bp 单边折成 rank IC 单位(gpu4~gpu8 头部因子标定);0 = 不扣
+                       fitness_kind="rank_ic", turnover_penalty=0.14,
+                       # 日排名相关 >= 0.99 的树算同一个因子:archive 只留最好的一条,同一代里只让它繁殖。0 = 关闭
+                       archive_dedup=0.99),
         rl_params=dict(),            # 例:dict(episodes_per_update=8) / dict(tail_alpha=0.9)
         max_expr_len=20,             # RL 每条表达式的 token 上限
         allow_resource_risk=False,   # 是否允许 NT 面的配对核(nt_ts_pearson / nt_ts_spearman)与 in_multireg。
@@ -75,6 +81,8 @@ if __name__ == "__main__":
         # ---------------- 组合 ----------------
         combine_methods=("equal", "ic", "icir", "lstsq", "ridge", "gbdt"),
         combine_train_frac=0.7,
+        smooth_halflives=(1, 2, 3, 5, 10, 20),   # 组合后按逐股 EMA 平滑再交易:半衰期只在训练段按扣成本夏普选,
+                                                  # 0(不平滑)永远是候选之一。() = 关闭
         # ---------------- 输出 ----------------
         workdir=PROJECT_ROOT / "tmp",   # 落盘中间量:一个边界文件就是整块 (S, D, M) float32
                                        # (5219x1942x241 = 9.8 GB),绝不能落在小的系统盘上

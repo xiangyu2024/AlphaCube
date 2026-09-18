@@ -181,3 +181,104 @@ def test_costs_are_charged_on_both_sides_of_every_trade():
     # no cost and no cap -> the old shape, so existing callers read the same keys
     plain = backtest_metrics(np.full(D, 0.02), alpha, fwd)
     assert "sharpe" in plain and "sharpe_net" not in plain and "sharpe_capped" not in plain
+
+
+def test_rank_rows_does_not_rank_inf():
+    """Every IC and every book in metrics skips inf ("inf is not a value"), but
+    pandas ranks it as the largest value, so rank_rows gave an inf cell rank n and
+    the rank IC of such a panel counted a cell its Pearson IC and its book left
+    out."""
+    r = rank_rows(np.array([[1.0, np.inf, 2.0, np.nan, -np.inf, 0.5]]))
+    assert np.array_equal(np.isnan(r[0]), [False, True, False, True, True, False]), r
+    assert list(r[0, [5, 0, 2]]) == [1.0, 2.0, 3.0]
+
+
+def test_decile_book_breaks_ties_by_symbol_order():
+    """numpy's default argsort is not stable, and which tied names it put in the
+    book depended on the rest of the row: nudging ONE mid-ranked name (it stays
+    mid-ranked) changed the top/bottom book in 12 of these 200 tied rows -- turnover
+    charged for trades nobody would make, and with turnover in the GP fitness,
+    noise that would be selected against."""
+    from alphacube.metrics import long_short_weights, portfolio_returns
+
+    rng = np.random.default_rng(1)
+    churned = 0
+    for _ in range(200):
+        x = np.round(rng.normal(size=3000), 1)          # ~60 distinct values: big tie blocks at the cut
+        y = x.copy()
+        y[int(np.argmin(np.abs(x)))] += 0.01
+        _, _, turn = portfolio_returns(long_short_weights(np.stack([x, y]), 0.1), np.zeros((2, 3000)))
+        churned += turn[1] > 0
+    assert churned == 0, f"{churned} of 200 books changed although no name crossed a boundary"
+    w = long_short_weights(np.ones((1, 40)), 0.1)       # all tied: the order is the symbol order
+    assert list(np.flatnonzero(w[0] > 0)) == [36, 37, 38, 39] and list(np.flatnonzero(w[0] < 0)) == [0, 1, 2, 3]
+
+
+def test_vectorised_book_is_the_per_day_book():
+    """long_short_weights builds every day at once now; it must be the per-day
+    construction it replaced (with the stable sort) on ragged rows: NaN, inf,
+    ties, rows below the two names a book needs."""
+    from alphacube.metrics import long_short_weights
+
+    rng = np.random.default_rng(3)
+    a = np.round(rng.normal(size=(40, 57)), 1)
+    a[rng.random(a.shape) < 0.2] = np.nan
+    a[rng.random(a.shape) < 0.02] = np.inf
+    a[5] = np.nan
+    a[6, 1:] = np.nan
+    a[7, 2:] = np.nan
+    ref = np.zeros_like(a)
+    for t in range(a.shape[0]):
+        m = np.isfinite(a[t])
+        n = int(m.sum())
+        if n < 2:
+            continue
+        idx = np.flatnonzero(m)
+        k = max(1, int(np.floor(n * 0.1)))
+        order = idx[np.argsort(a[t, idx], kind="stable")]
+        ref[t, order[-k:]] = 0.5 / k
+        ref[t, order[:k]] = -0.5 / k
+    assert np.array_equal(long_short_weights(a, 0.1), ref)
+
+
+def test_rank_ic_and_turnover_are_the_numbers_the_reports_print():
+    """The GP fitness gets rank IC and turnover from one torch sort; they must be
+    ic_summary's rank_ic series and backtest_metrics' turnover -- otherwise the
+    search optimises one thing and the checkpoint reports another. Ragged rows,
+    inf, ties, float32 input as the engine returns it."""
+    from alphacube.metrics import backtest_metrics, rank_ic_turnover, torch_rank_rows
+
+    rng = np.random.default_rng(4)
+    D, S = 70, 230
+    target = rng.normal(size=(D, S))
+    target[rng.random((D, S)) < 0.1] = np.nan
+    panel = np.round(target + rng.normal(size=(D, S)), 1).astype(np.float32)
+    panel[rng.random((D, S)) < 0.15] = np.nan
+    panel[rng.random((D, S)) < 0.01] = np.inf
+    panel[3] = np.nan                                   # a day without factor values
+    panel[4, 3:] = np.nan                               # a day below MIN_PAIRS
+    ric, to = rank_ic_turnover(panel, torch_rank_rows(target), 0.1)
+    ref = cs_pearson(rank_rows(panel), rank_rows(target))
+    assert np.array_equal(np.isnan(ric), np.isnan(ref)) and np.isnan(ref[[3, 4]]).all()
+    assert np.allclose(ric[np.isfinite(ref)], ref[np.isfinite(ref)], rtol=0, atol=1e-12)
+    bt = backtest_metrics(cs_pearson(panel, target), panel.astype(np.float64), target)
+    assert abs(to - bt["turnover"]) < 1e-12, (to, bt["turnover"])
+    _, to_flipped = rank_ic_turnover(-panel, torch_rank_rows(target), 0.1)
+    assert abs(to_flipped - to) < 0.05, "a sign flip trades the same names (ties aside)"
+
+
+def test_ema_rows_is_causal_with_the_stated_half_life():
+    from alphacube.metrics import ema_rows
+
+    x = np.zeros((30, 3))
+    x[10:] = 1.0                                        # a step on day 10
+    x[12, 1] = np.nan                                   # a missing day
+    x[:5, 2] = np.nan                                   # a late listing
+    s = ema_rows(x, 4)
+    assert np.isclose(s[13, 0], 0.5), "4 days after the step, half of it has come through"
+    assert np.isnan(s[12, 1]) and np.isclose(s[13, 1], s[12, 0]), "a gap holds the state, it does not update"
+    assert np.isnan(s[:5, 2]).all() and s[5, 2] == 0.0, "the first value starts the state"
+    y = x.copy()
+    y[20:] = -5.0
+    assert np.array_equal(ema_rows(y, 4)[:20], s[:20], equal_nan=True), "the future does not move the past"
+    assert np.array_equal(ema_rows(x, 0), x, equal_nan=True)

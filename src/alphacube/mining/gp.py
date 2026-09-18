@@ -1,8 +1,10 @@
 """Genetic-programming miner over the three-axis vocabulary.
 
 Per generation the whole population is evaluated as ONE engine call (CSE
-across trees, one pass over the cube per chunk phase), scored by |IC|
-against the label, then bred: elitism, tournament selection, type-safe
+across trees, one pass over the cube per chunk phase), scored against the label
+-- |IC| by default, or |rank IC| (or |IC|) minus a charge for the turnover of the
+decile book, see ``fitness_kind`` / ``turnover_penalty`` -- then bred: elitism,
+tournament selection, type-safe
 subtree crossover, subtree/window/constant mutation. Panels of surviving
 trees are cached by structural key so elites and unchanged parents cost
 nothing next generation. At the end the archive's top-k is offered to the
@@ -35,14 +37,20 @@ import torch
 from ..catalog import Registry
 from ..engine.engine import CubeEngine
 from ..expression import Expression, is_valid_root
-from ..metrics import MIN_PAIRS, batched_ic, cs_pearson
+from ..metrics import (MIN_PAIRS, _cs_corr_days_t, batched_ic, cs_pearson, nanmean_quiet, rank_ic_turnover,
+                       torch_rank_rows)
 from ..store import CubeView
 from .clustering import cluster_population, cull_clusters
 from .generator import TypedTreeGenerator, one_layer_keys
-from .rankban import RankSimilarityBan
+from .rankban import CompactRankIndex, RankSimilarityBan
 from .pool import LinearPool
 
 ProgressFn = Callable[[int, int, dict], None]
+
+FITNESS_KINDS = ("ic", "rank_ic")
+# The book every report trades -- top/bottom decile, equal weight, gross 1
+# (backtest_metrics' default) -- and so the one whose turnover the fitness charges.
+BOOK_TOP_FRAC = 0.1
 
 
 @dataclass
@@ -55,6 +63,7 @@ class MiningReport:
     commit_examples: Dict[str, str] = field(default_factory=dict)
     best_fitness: float = float("-inf")
     similar_refused: int = 0
+    dup_demoted: int = 0
     seconds: float = 0.0
     engine_seconds: float = 0.0
 
@@ -93,6 +102,8 @@ class GPMiner:
                  allow_resource_risk: bool = False, skip_kernels: "frozenset[str]" = frozenset(),
                  rolling_block: int = 0, ban_top_n: int = 0, banned_substructures: Sequence[str] = (),
                  ban_rank_corr: float = 0.0, ban_exemplars: Sequence[Expression] = (),
+                 fitness_kind: str = "ic", turnover_penalty: float = 0.0, archive_dedup: float = 0.0,
+                 cost_per_side: float = 0.0,
                  on_block: Optional[Callable[[dict], None]] = None,
                  on_engine_progress: Optional[Callable[[dict], None]] = None,
                  checkpoint_dir: Optional[os.PathLike] = None,
@@ -186,6 +197,49 @@ class GPMiner:
         self._target_finite = np.isfinite(self.target)
         self._target_cells = max(int(self._target_finite.sum()), 1)
         self._usable_days = max(int((self._target_finite.sum(axis=1) >= MIN_PAIRS).sum()), 1)
+        # What the fitness is made of. "ic" without a turnover penalty is the original
+        # |mean daily Pearson IC| path, untouched. Otherwise each new panel is sorted
+        # once per day (metrics.rank_ic_turnover) for its daily rank IC and for the
+        # turnover of the decile book the reports trade, and the fitness is
+        #     |IC or rank IC| - turnover_penalty * turnover.
+        # Why: on the 51 archive leaders with after-cost backtests (gpu4-gpu8, 15 bp a
+        # side), |IC| ranked them against net Sharpe at Spearman 0.02 and turnover at
+        # -0.85; |rank IC| - 0.14 x turnover at 0.96. 0.14 is the cost in rank-IC
+        # units: gross annual return was ~5.5 x |rank IC| there, and 15 bp a side on a
+        # daily turnover T costs 2 x 0.0015 x 252 x T = 0.756 T a year.
+        # Rank IC because the book trades ranks: gpu9's block-2 leaders were
+        # pow_2(kurtosis) factors with IC +0.028 and rank IC -0.015 -- a Pearson IC
+        # carried by a few extreme values, and a decile book that lost 2.4 Sharpe.
+        if fitness_kind not in FITNESS_KINDS:
+            raise ValueError(f"fitness_kind must be one of {FITNESS_KINDS}, not {fitness_kind!r}")
+        if turnover_penalty < 0:
+            raise ValueError("turnover_penalty must be >= 0")
+        self.fitness_kind = fitness_kind
+        self.turnover_penalty = float(turnover_penalty)
+        self._rich = fitness_kind != "ic" or self.turnover_penalty > 0
+        self._scores: Dict[str, Dict[str, float]] = {}     # key -> ic, rank_ic, turnover, fit
+        if self._rich:
+            self._target_t64 = torch.from_numpy(np.ascontiguousarray(self.target))
+            self._target_ranks_t = torch_rank_rows(self.target)
+        # Only for the checkpoint's after-cost column; the fitness charges costs
+        # through turnover_penalty.
+        self.cost_per_side = float(cost_per_side)
+        # Archive dedup (0 = off): factors whose daily ranks correlate >= archive_dedup
+        # are one family. The archive keeps a family's best (fitness, then the smaller
+        # tree), and within a generation only a family's best keeps its fitness -- the
+        # rest do not breed. gpu9's first block had its top 12 archive places taken by
+        # rewrites of day_max(Ret); under a rank fitness a monotone rewrite scores
+        # EXACTLY what the original does, so they would not even be ordered.
+        if archive_dedup < 0 or archive_dedup > 1:
+            raise ValueError("archive_dedup must be in [0, 1]")
+        self.archive_dedup = float(archive_dedup)
+        self._families = CompactRankIndex(self.target.shape) if self.archive_dedup > 0 else None
+        self._slot_of: Dict[str, int] = {}          # archived key -> its row in _families
+        self._absorbed: Dict[str, set] = {}         # archived key -> lesser family members seen
+        self._member_layers: Dict[str, set] = {}    # archived key -> one_layer_keys of those members
+        self._slot_key: List[str] = []              # row in _families -> archived key
+        self._gen_dup = 0
+        self.dup_demoted = 0
         self._panel_cache: "OrderedDict[str, np.ndarray]" = OrderedDict()
         self._panel_cache_items = int(panel_cache_items)
         self._archive: Dict[str, Tuple[Expression, float]] = {}
@@ -238,11 +292,37 @@ class GPMiner:
                 self._panel_cache.popitem(last=False)
         return out
 
+    def _score(self, key: str, panel: np.ndarray) -> Dict[str, float]:
+        """Fitness and what it is made of, for one panel -- cached by structural key:
+        a panel is a pure function of its key, and the sort behind rank IC and
+        turnover costs ~0.5 s on the production cube. Same gates as the IC path
+        (and the pool): finite score, coverage, and the scored-days share taken from
+        the Pearson IC series exactly as LinearPool takes it."""
+        s = self._scores.get(key)
+        if s is not None:
+            return s
+        ric_days, turnover = rank_ic_turnover(panel, self._target_ranks_t, BOOK_TOP_FRAC)
+        x = torch.from_numpy(np.ascontiguousarray(panel)).to(torch.float64)
+        ic_days = _cs_corr_days_t(x, self._target_t64).numpy()
+        ic, ric = nanmean_quiet(ic_days), nanmean_quiet(ric_days)
+        base = ric if self.fitness_kind == "rank_ic" else ic
+        cov = float((np.isfinite(panel) & self._target_finite).sum() / self._target_cells)
+        scored = np.isfinite(ic_days).sum() / self._usable_days
+        fit = -np.inf
+        if (np.isfinite(base) and cov >= self.min_coverage
+                and (self.min_scored_days <= 0 or scored >= self.min_scored_days)):
+            fit = (base if self.fitness_signed else abs(base)) - self.turnover_penalty * turnover
+        s = self._scores[key] = {"ic": ic, "rank_ic": ric, "turnover": float(turnover), "fit": float(fit)}
+        return s
+
     def fitness(self, population: Sequence[Expression]) -> np.ndarray:
         panels = self._panels(population)
         fit = np.full(len(population), -np.inf)
         live = [i for i, p in enumerate(panels) if p is not None]
-        if live:
+        if live and self._rich:
+            for i in live:
+                fit[i] = self._score(population[i].key(), panels[i])["fit"]
+        elif live:
             tensors = [torch.from_numpy(panels[i]).float() for i in live]
             ics = batched_ic(tensors, self._target_t).numpy().astype(float)
             for i, ic in zip(live, ics):
@@ -300,10 +380,15 @@ class GPMiner:
         if banned:
             self.generator.ban(banned)
         # Every archived factor that leans on a newly banned structure becomes a
-        # rank exemplar, so rewriting it some other way does not bring it back.
+        # rank exemplar, so rewriting it some other way does not bring it back. With
+        # families, "leans on" covers the family's members too: a family whose
+        # representative is day_max(log(Amt)) and which also met
+        # pow_05(pow_05(day_max(Amt))) is the family of day_max(Amt).
         exemplars = 0
         if banned and self._rank_ban is not None:
-            exemplars = self._add_exemplars([e for e, _ in cumulative if one_layer_keys(e) & set(banned)])
+            hit = set(banned)
+            exemplars = self._add_exemplars([e for e, _ in cumulative
+                                             if (one_layer_keys(e) | self._member_layers.get(e.key(), set())) & hit])
 
         info = {"index": len(self.blocks) + 1, "generation": generation, "banned": banned,
                 "counts": counts.most_common(10),
@@ -317,7 +402,12 @@ class GPMiner:
             self.on_block(info)
         return banned
 
-    def _archive_update(self, population, fit) -> None:
+    def _archive_update(self, population, fit) -> np.ndarray:
+        """Archive this generation's scored trees and return the fitness selection
+        should use -- the same array unless archive_dedup is on, when every family
+        member but the family's best in this generation is demoted to -inf."""
+        if self._families is not None:
+            return self._archive_update_families(population, fit)
         for e, f in zip(population, fit):
             if not np.isfinite(f):
                 continue
@@ -325,6 +415,92 @@ class GPMiner:
             prev = self._archive.get(k)
             if prev is None or f > prev[1]:
                 self._archive[k] = (e, float(f))
+        return fit
+
+    def _family_rows(self, expr: Expression, key: str) -> np.ndarray:
+        slot = self._slot_of.get(key)
+        if slot is not None:
+            return self._families._y[:, slot]
+        p = self._panel_cache.get(key)
+        if p is None:                              # evicted -- not expected right after fitness()
+            p = self._panels([expr])[0]
+        return self._families.rows(p)
+
+    def _archive_update_families(self, population, fit) -> np.ndarray:
+        """``_archive_update`` with factor families (see ``archive_dedup``).
+
+        1. Within the generation, best first (fitness, then the smaller tree), each
+           tree either starts a family or joins the first kept tree it ranks like;
+           joiners drop to -inf so a family breeds through one member.
+        2. Each kept tree meets the archive: a tree that ranks like an archived
+           family replaces its representative if it is better, and is only counted
+           as a member otherwise; a tree like none starts a new archived family.
+        A kept tree that loses to an archived family keeps its fitness: it is the
+        best its family has in this population, and the representative is not here
+        to breed in its place."""
+        fit = np.array(fit, dtype=float, copy=True)
+        live = [i for i in range(len(population)) if np.isfinite(fit[i])]
+        if not live:
+            return fit
+        size = {i: len(population[i].nodes()) for i in live}
+        live.sort(key=lambda i: (-fit[i], size[i], i))
+        keys = [population[i].key() for i in live]
+        rows = np.stack([self._family_rows(population[i], k) for i, k in zip(live, keys)], axis=1)
+        thr = self.archive_dedup
+        c_gen = CompactRankIndex.pairwise(rows)
+        kept: List[int] = []                        # positions in `live`
+        leader: Dict[int, int] = {}                 # demoted position -> the kept one it joined
+        for p in range(len(live)):
+            near = [q for q in kept if c_gen[p, q] >= thr]
+            if near:
+                leader[p] = max(near, key=lambda q: c_gen[p, q])
+                fit[live[p]] = -np.inf
+                self._gen_dup += 1
+                self.dup_demoted += 1
+            else:
+                kept.append(p)
+        c_arch = (self._families.corr(rows[:, kept]) if len(self._families)
+                  else np.full((len(kept), 0), np.nan))
+        taken: set = set()                          # rows replaced this generation (now hold a kept tree)
+        family: Dict[int, str] = {}                 # kept position -> archived key of its family
+        for j, p in enumerate(kept):
+            i, k = live[p], keys[p]
+            if k in self._slot_of:                  # it IS a family's representative
+                family[p] = k
+                continue
+            c = c_arch[j].copy()
+            # a replaced row now holds a tree kept in this same generation, and kept
+            # trees do not rank alike by construction
+            c[list(taken)] = np.nan
+            slot = int(np.nanargmax(c)) if np.isfinite(c).any() else -1
+            if slot >= 0 and c[slot] >= thr:
+                rep = self._slot_key[slot]
+                rep_e, rep_f = self._archive[rep]
+                if fit[i] > rep_f or (fit[i] == rep_f and size[i] < len(rep_e.nodes())):
+                    del self._archive[rep], self._slot_of[rep]
+                    self._absorbed[k] = (self._absorbed.pop(rep, set()) | {rep}) - {k}
+                    self._member_layers[k] = self._member_layers.pop(rep, set()) | one_layer_keys(rep_e)
+                    self._archive[k] = (population[i], float(fit[i]))
+                    self._slot_of[k], self._slot_key[slot] = slot, k
+                    self._families.set(slot, rows[:, p])
+                    taken.add(slot)
+                    family[p] = k
+                else:
+                    self._absorbed[rep].add(k)
+                    self._member_layers[rep] |= one_layer_keys(population[i])
+                    family[p] = rep
+            else:
+                self._slot_of[k] = self._families.add(rows[:, p])
+                self._slot_key.append(k)
+                self._archive[k] = (population[i], float(fit[i]))
+                self._absorbed[k] = set()
+                self._member_layers[k] = set()
+                family[p] = k
+        for p, q in leader.items():
+            if keys[p] != family[q]:
+                self._absorbed[family[q]].add(keys[p])
+                self._member_layers[family[q]] |= one_layer_keys(population[live[p]])
+        return fit
 
     # -- evolution -------------------------------------------------------------------
     def _select(self, population, fit, clusters) -> Expression:
@@ -378,15 +554,19 @@ class GPMiner:
         if self._pending_exemplars:
             self.initial_exemplars = self._add_exemplars(self._pending_exemplars)
             self._pending_exemplars = []
+        # raw: every scored tree; fit: what selection sees (with archive_dedup on, a
+        # family's lesser members are -inf there). The block's ban counts use raw, as
+        # they did before families existed -- they measure where the population's
+        # mass went, rewrites included, which is exactly what a ban is for.
         population = self.generator.generate_population(self.population_size)
-        fit = self.fitness(population)
-        self._archive_update(population, fit)
+        raw = self.fitness(population)
+        fit = self._archive_update(population, raw)
         best = float(np.max(fit)) if np.isfinite(fit).any() else float("-inf")
         for g in range(n_gen):
             population = self._next_generation(population, fit)
-            self._gen_similar = 0
-            fit = self.fitness(population)
-            self._archive_update(population, fit)
+            self._gen_similar = self._gen_dup = 0
+            raw = self.fitness(population)
+            fit = self._archive_update(population, raw)
             finite = fit[np.isfinite(fit)]
             if finite.size:
                 best = max(best, float(finite.max()))
@@ -398,11 +578,11 @@ class GPMiner:
             if self.checkpoint_every and self.checkpoint_dir and (g + 1) % self.checkpoint_every == 0:
                 self.write_checkpoint(g + 1)
             if self.rolling_block and (g + 1) % self.rolling_block == 0 and g + 1 < n_gen:
-                banned = self._roll(population, fit, g + 1)
+                banned = self._roll(population, raw, g + 1)
                 population = self.generator.generate_population(self.population_size)
-                self._gen_similar = 0
-                fit = self.fitness(population)
-                self._archive_update(population, fit)
+                self._gen_similar = self._gen_dup = 0
+                raw = self.fitness(population)
+                fit = self._archive_update(population, raw)
                 # The rebuilt population is a real, evaluated generation: report it as
                 # one. This line used to print placeholders -- "gen_best +nan ... valid 0"
                 # -- which on gpu5 read as a whole block's first population failing,
@@ -418,22 +598,28 @@ class GPMiner:
                                                  "valid": int(finite.size), "rolled": len(banned),
                                                  **self._similar_info()})
         if self.rolling_block and self.on_block is not None and len(self._archive) > len(self._block_seen):
-            self._roll(population, fit, n_gen)          # the final, unrolled block still gets scored
+            self._roll(population, raw, n_gen)          # the final, unrolled block still gets scored
         report = self._commit()
         report.generations = n_gen
         report.evaluated = self.evaluated
         report.archive_size = len(self._archive)
         report.best_fitness = best
         report.similar_refused = self.similar_refused
+        report.dup_demoted = self.dup_demoted
         report.seconds = time.perf_counter() - t0
         report.engine_seconds = self.engine_seconds
         return report
 
     def _similar_info(self) -> Dict[str, int]:
-        """Rank-ban counters for the generation line (empty when the ban is off)."""
-        if self._rank_ban is None:
-            return {}
-        return {"similar": self._gen_similar, "exemplars": len(self._rank_ban)}
+        """Rank-ban and family counters for the generation line (each only when on):
+        ``similar`` refused by the rank ban, ``dup`` demoted as a lesser member of a
+        family in the same generation."""
+        out: Dict[str, int] = {}
+        if self._rank_ban is not None:
+            out.update(similar=self._gen_similar, exemplars=len(self._rank_ban))
+        if self._families is not None:
+            out["dup"] = self._gen_dup
+        return out
 
     def _commit(self) -> MiningReport:
         # top_k None: twice the pool's capacity, or the whole archive when the pool
@@ -457,11 +643,19 @@ class GPMiner:
         """Ranked archive -> ``archive_gen<N>.csv``, written atomically so a kill
         during the write cannot leave a half file.
 
-        The top ``metrics_top_n`` rows also carry IC and return-based metrics when
-        their panel is still in the cache -- free, because the panel is already in
-        memory, and it is what makes a checkpoint readable mid-run rather than a
-        list of expressions with one number each. Deeper rows, and any row whose
-        panel has been evicted, carry fitness only; members.csv at the end is where
+        Every row carries what its fitness was made of when the fitness is not
+        plain |IC| -- ``score_ic`` (Pearson) / ``score_rank_ic``, signed, and
+        ``score_turnover`` of the decile book -- and, with archive_dedup on,
+        ``dups``: how many other trees of its family (daily ranks alike to the
+        threshold) the run has met. The top ``metrics_top_n`` rows also carry IC and
+        return-based metrics when their panel is still in the cache -- free, because
+        the panel is already in memory, and it is what makes a checkpoint readable
+        mid-run rather than a list of expressions with one number each. Of those,
+        ``sharpe`` / ``annualized_return`` / ``max_drawdown`` are no-cost and for
+        the factor AS WRITTEN (IC -0.024 with sharpe -3.3 is a strong factor, traded
+        the other way); ``sharpe_net`` is after ``cost_per_side`` and traded in its
+        IC's direction -- the number to read. Deeper rows, and any row whose panel
+        has been evicted, carry no metrics; members.csv at the end is where
         everything gets measured properly."""
         if self.checkpoint_dir is None:
             return None
@@ -470,19 +664,30 @@ class GPMiner:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         path = self.checkpoint_dir / f"archive_gen{generation:03d}.csv"
         tmp = path.with_suffix(".csv.tmp")
+        scores = ["score_ic", "score_rank_ic", "score_turnover", "dups"]
         cols = ["ic_mean", "icir", "rank_ic", "coverage", "n_days",
-                "annualized_return", "sharpe", "max_drawdown"]
+                "annualized_return", "sharpe", "max_drawdown", "turnover", "sharpe_net"]
         with tmp.open("w", encoding="utf-8") as fh:
-            fh.write("rank,fitness," + ",".join(cols) + ",expression\n")
+            fh.write("rank,fitness," + ",".join(scores + cols) + ",expression\n")
             for i, (expr, fit) in enumerate(self.archive()):
-                vals = {}
+                k = expr.key()
+                sc = self._scores.get(k, {})
+                vals = {f"score_{n}": sc[n] for n in ("ic", "rank_ic", "turnover") if n in sc}
+                if self._families is not None:
+                    vals["dups"] = len(self._absorbed.get(k, ()))
                 if i < metrics_top_n:
-                    p = self._panel_cache.get(expr.key())
+                    p = self._panel_cache.get(k)
                     if p is not None:
                         pan = np.asarray(p, dtype=np.float64)
+                        ics = cs_pearson(pan, self.target)
                         vals.update(ic_summary(pan, self.target))
-                        vals.update(backtest_metrics(cs_pearson(pan, self.target), pan, self.target))
-                cells = ",".join("" if c not in vals else f"{vals[c]:.6f}" for c in cols)
+                        vals.update(backtest_metrics(ics, pan, self.target))
+                        if self.cost_per_side > 0 and np.isfinite(vals.get("ic_mean", np.nan)):
+                            sign = -1.0 if vals["ic_mean"] < 0 else 1.0
+                            vals["sharpe_net"] = backtest_metrics(sign * ics, sign * pan, self.target,
+                                                                  cost_per_side=self.cost_per_side)["sharpe_net"]
+                cells = ",".join("" if c not in vals else (str(vals[c]) if c == "dups" else f"{vals[c]:.6f}")
+                                 for c in scores + cols)
                 text = repr(expr).replace('"', '""')
                 fh.write(f'{i},{fit:.6f},{cells},"{text}"\n')
         os.replace(tmp, path)

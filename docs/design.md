@@ -172,6 +172,35 @@ QCM 回放池预热)、`GPMiner`(需求驱动的类型化生成器,面均衡抽�
 覆盖率闸的 |IC| 适应度,结构聚类 + 簇剔除 + 簇内锦标赛,面板缓存跨代复用)。
 各自与论文的简化处保留原项目的说明。
 
+**GP 适应度与因子族(gpu10 起,2026-09-19 用户决定)**:
+
+- **适应度** = `|rank IC| − λ × 日换手`(`--fitness rank_ic --turnover-penalty 0.14`)。rank IC =
+  `ic_summary` 的 `rank_ic`(各自在有限格点上取平均秩,再逐日 Pearson);日换手 = 报告里那本
+  十分位多空书(`long_short_weights`,top/bottom 10%,等权,总敞口 1)的 `0.5 Σ|w_t − w_{t−1}|`
+  日均,与 `backtest_metrics` 的 `turnover` 逐位相同(测试锁定),与因子符号无关。两者由
+  `metrics.rank_ic_turnover` 对面板做一次逐行稳定排序得到,按结构键缓存。
+  依据(51 条做过扣成本回测的 gpu4~gpu8 头部因子,样本内):|IC| 与扣 15bp 夏普的秩相关 0.02,
+  日换手 −0.85,`|rank IC| − 0.14 × 换手` 0.96。λ = 0.14 就是成本折成 rank IC 单位:那批因子的
+  无成本年化收益约 5.5 × |rank IC|,单边 15bp、日换手 T 的年成本是 2 × 0.0015 × 252 × T = 0.756 T。
+  用 rank IC 是因为书按排名下单:gpu9 第 2 块头名是 `pow_2(峰度)` 类,IC +0.028、rank IC −0.015,
+  靠少数极端值撑起 Pearson IC,十分位书夏普 −2.4。闸不变(IC 有限、覆盖率、有 IC 的天数占比,
+  后者仍按 Pearson 日 IC 数,与池一致)。`--fitness ic` 且不扣换手时走原来的路径,逐位不变。
+- **十分位书的并列按股票顺序**(稳定排序)。原来 `np.argsort` 不稳定,并列股票谁进书取决于整行
+  其他值:只挪一只中间股票,200 个有并列的行里 12 个书变了 —— 凭空的换手,现在还会被适应度惩罚。
+  `rank_rows` 同时不再给 inf 排名(pandas 把 inf 当最大值;IC 和书都跳过 inf)。
+- **因子族**(`--archive-dedup 0.99`):日排名相关 ≥ 0.99 的树算同一个因子。同一代里按(适应度,
+  树更小)排序,每族只有最好的一棵保留适应度去繁殖,其余降为 −inf(精确复制也算同族);再与
+  archive 比:像某个已存族就只在更好时取代其代表,否则只记为族成员;都不像就开新族。于是
+  archive、块结算和最终入池拿到的前 N 条是 N 个不同因子。rank 适应度下单调改写的分数**完全相同**,
+  不去重就会并列占满 archive(gpu9 第 1 块前 12 名全是 `day_max(Ret)` 的改写)。索引
+  (`rankban.CompactRankIndex`)每族一行:250 天 × 512 只的标准化排名,float32,约 1.5 MB;
+  0.99 附近的抽样误差约 5e-5。
+- **组合后平滑**(`--smooth-halflives 1,2,3,5,10,20`):每种组合方法的合成信号再按逐股 EMA
+  (`metrics.ema_rows`,因果;缺失日保持状态、输出缺失)交易一遍,半衰期只在训练段按扣成本
+  夏普选(0 = 不平滑永远是候选),测试段报 `halflife` / `sharpe_smooth` / `turnover_smooth`。
+- checkpoint 每行多出 `score_ic`、`score_rank_ic`、`score_turnover`、`dups`(族成员数);前 10 行
+  多出 `turnover` 与 `sharpe_net`(扣 `cost_per_side`、按 IC 方向交易 —— 该看的数)。
+
 **池**(`mining/pool.py`):`MsePool`(z-score 后 OLS,缺失 z 视为中性 0)、`MeanStdPool`
 (Adam 最大化 ICIR)、`DynamicRollingPool`(滚动窗口内拟合);同一套闸:IC 有限、覆盖率、
 |corr| 去重、事务性;`test_ensemble` 用 label 的可执行收益作 P&L 腿。

@@ -1,4 +1,4 @@
-# AlphaCube 交接(2026-09-19 06:20 北京时间)
+# AlphaCube 交接(2026-09-19 07:20 北京时间)
 
 你正在接手 AlphaCube。这份文件自足 —— 读完就能接着干,不需要任何对话历史。
 设计细节在 `docs/design.md`(中文,权威);这份讲**现状、地址、怎么跑、踩过什么坑、还欠什么**。
@@ -8,22 +8,24 @@
 
 ## 0. 先读这里
 
-**现在没有任务在跑,服务器数据盘卡死(§4;06:18 复查仍是 `write-pending`、校验仍停在 79.9%、gpu9 仍是 D 状态)。在它恢复之前,不要往 `/root/autodl-tmp` 写任何东西**
+**现在没有任务在跑,服务器数据盘卡死(§4;07:20 复查仍是 `write-pending`、校验仍停在 79.9%、gpu9 仍是 D 状态)。在它恢复之前,不要往 `/root/autodl-tmp` 写任何东西**
 —— 包括 rsync、scp、启动任务;写入会挂在内核里,连你的命令一起卡住。读是正常的。
+**容器里 `/sys` 是只读挂载**:停校验(`echo idle > sync_action`)在容器里做不到,连用户也不行,只能 AutoDL 在宿主机上处理。
 
-接手后按顺序做:
+**gpu10 的代码已就绪、用户已批准"恢复后直接起跑"**(§11 三个决定已由用户拍板并实现,见 §11)。接手后按顺序做:
 
 1. **看数据盘恢复没有**(只读):
    ```bash
    ssh -o BatchMode=yes -o ControlPath=none -p 29982 root@connect.westd.seetacloud.com 'cat /sys/block/md0/md/array_state; cat /proc/mdstat'
    ```
    `write-pending` = 还卡着;`clean` / `active` = 恢复了。修复是系统层的事(§4),由用户或 AutoDL 处理,**你不能动**。
-2. **恢复后收尾 gpu9**:它已被用户要求停止,SIGINT 已发出、在等写入返回才生效。确认
-   `ps -p 332647` 已退出、`ls /root/autodl-tmp/AlphaCube/tmp/` 为空、`screen -ls` 里没有 `gpu9`。
-   若进程还在,再 `kill -INT 332647`。
-3. **同步仓库到服务器**(§5.2)。服务器上的 `docs/` 和新脚本 `scripts/gp_full_market.sh`、
-   `scripts/gp_report_loop.sh`、`scripts/eval_checkpoint_costs.py`、`scripts/merge_archives.py` 都还没过去。
-4. **下一次运行前先问用户 §11 的三个决定**,再用 `scripts/gp_full_market.sh gpu10` 起跑(§5.3)。
+2. **恢复后收尾 gpu9**:用户要求直接杀掉;SIGINT 和 SIGKILL 都已发出(`/proc/332647/status` 的
+   `ShdPnd 0x102`),写入一返回就会死。**因为是 SIGKILL,引擎的临时目录不会自动删**:确认
+   `ps -p 332647` 已退出、GPU 显存已释放(它占着 28.9 GB)后,手动删 `tmp/alphacube_bvh5ou93/`(3 个边界文件约 29 GB),
+   `screen -ls` 里的 `gpu9` 会随之消失。
+3. **同步仓库到服务器**(§5.2)。服务器上还是 gpu9 的代码:`docs/`、新脚本和本次的适应度 / 族 / 平滑改动都还没过去。
+4. **直接起跑 gpu10**:`scripts/gp_full_market.sh gpu10`(§5.3,已含新参数),确认第 1 代正常后向用户汇报。
+   可选:同时用 `scripts/combine_archive.py` 给 gpu9 第 10 代 archive 补一次带平滑的组合(§5.7),先看平滑在真实数据上的效果。
 
 **挖出来的东西都在**:服务器 `mining_runs/*/checkpoints/` 完好;本地有全量备份(§2);全部表达式
 去重汇总在 `~/Desktop/AlphaCube/mining_runs/全部因子表达式.csv`(1922 条)。
@@ -108,7 +110,7 @@ GP / 四个 RL miner / 因子池 / 组合 / 回测全跑在它上面。当前阶
 cd ~/Desktop/AlphaCube && PYTHONPATH=src ~/.venvs/alphacube/bin/python -m pytest tests -q
 ```
 
-当前 **341 passed, 8 skipped, 1 xfailed**(约 2 分钟)。改完必跑。
+当前 **353 passed, 8 skipped, 1 xfailed**(约 2 分钟)。改完必跑。
 
 ### 5.2 同步到服务器
 
@@ -137,6 +139,10 @@ ssh -o BatchMode=yes -o ControlPath=none -p 29982 root@connect.westd.seetacloud.
 - 它的配置:20 代 = 4 块 × 5 代;池子上限 30(块结算取前 120 条、最终入池取前 60 条 —— 内存有界);
   单边 15bp、限 30% 日换手;**开局封禁 18 个结构**(§7)+ **rank 相关封禁 0.95**,样本取自
   gpu5 第 10 代、gpu7 第 7 代、gpu8 第 8 代、gpu9 第 10 代的 archive。
+  gpu10 起另加:**适应度 `|rank IC| − 0.14 × 日换手`**、**因子族去重 0.99**、**组合后 EMA 平滑**
+  (半衰期 1,2,3,5,10,20 在训练段选)—— 见 §11 与 `docs/design.md` §7。
+  gpu10 的日志行多一个 `dup`(本代被判为同族而降级的个体数);`valid` 是降级后的数,会比以前低;
+  `best / gen_best / gen_mean` 现在是新适应度(可为负),不再是 |IC|。
 - **每次重启都该把上一次运行块结束时新封的结构加进 `--ban`,并把它最新的 archive 加进 `--ban-archive`**
   (日志里 `封禁 3 个一层结构,累计生效 N 个: ...` 那一行就是键),这是用户定下的做法。
   键写错会在启动时报错(`check_ban_key`),不会静默不生效。
@@ -154,10 +160,12 @@ $S 'cd /root/autodl-tmp/AlphaCube && sed -n "/块结束/,\$p" gpu10_run.log | gr
 $S 'cat /sys/block/md0/md/array_state; df -h / /root/autodl-tmp'
 ```
 
-- 每代那一行:`best / gen_best / gen_mean`(|IC|)、`archive`、`valid`、`similar`(本代被 rank 封禁拒的数)、
-  `exemplars`(rank 样本数)。滚块那一行带 `rolled N`。
+- 每代那一行:`best / gen_best / gen_mean`(适应度;gpu9 及以前是 |IC|,gpu10 起是 |rank IC| − 0.14×换手)、
+  `archive`(gpu10 起 = 因子族数)、`valid`、`similar`(本代被 rank 封禁拒的数)、`exemplars`(rank 样本数)、
+  `dup`(gpu10 起,本代同族降级数)。滚块那一行带 `rolled N`。
 - 块结算表:`[第i块 仅本块]` 与 `[第i块 累计1~i]`,列 `sharpe`(无成本)、`sharpe_net`(扣 15bp)、
-  `sharpe_capped`(限换手 30%)、`turnover`。**看 `sharpe_net`。**
+  `sharpe_capped`(限换手 30%)、`turnover`,gpu10 起加 `halflife`(训练段选出的 EMA 半衰期)、
+  `sharpe_smooth`(平滑后扣 15bp)、`turnover_smooth`。**看 `sharpe_net` 和 `sharpe_smooth`。**
 - **卡住怎么判断**:代内进度行超过几分钟不更新 → 看 `ps -o stat= -p <pid>`、`cat /proc/<pid>/wchan`、
   `top -H`。R + 单核满 + GPU 闲 = Python 循环(见 §10 的逐元素算子);D + `md_write_start` = 磁盘(§4)。
   `py-spy` 用不了(容器禁 ptrace)。
@@ -193,6 +201,16 @@ cd /root/autodl-tmp/AlphaCube && PYTHONPATH=src PYTORCH_CUDA_ALLOC_CONF=expandab
 输出翻转到可交易方向后的无成本 / 扣 15bp / 限换手夏普、换手、逐年盈亏;先核对无成本数字与 checkpoint 一致。
 算完把 JSON 拷回本地 `mining_runs/evals/`,汇总表就会带上它。
 
+给一个 archive 补一次和块结算同口径的池 + 组合(含扣成本、限换手、组合后 EMA 平滑):
+
+```bash
+cd /root/autodl-tmp/AlphaCube && PYTHONPATH=src PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  /root/miniconda3/envs/quant/bin/python scripts/combine_archive.py \
+  mining_runs/gpu9/checkpoints/archive_gen010.csv --top 120 --gpu-fraction 0.045 --out _bench/gpu9_gen010_combine
+```
+
+旁边有任务在跑时同样用 0.045 或 0;内存约 8~10 GB(120 个面板 + 30 个 z 面板),先看 anon 有没有余量。
+
 ### 5.8 汇总全部表达式
 
 ```bash
@@ -217,6 +235,10 @@ cd ~/Desktop/AlphaCube && PYTHONPATH=src ~/.venvs/alphacube/bin/python scripts/m
 | `--ban KEY`(可重复) | 开局即封禁的一层结构,键如 `O:log(F:Amt)`、`O:nt_ts_argmax(F:High)\|w3`、`O:in_cov(F:Ret,F:Close)\|w30` |
 | `--ban-rank-corr R` | 候选与任一被封家族样本的日截面排名相关 \|ρ\| ≥ R 就拒(0 = 关)。单调改写与反号恰为 1.0 |
 | `--ban-archive CSV`(可重复) | 旧 run 的 checkpoint;其中含 `--ban` 键的表达式作为开局样本(需配 `--ban-rank-corr`) |
+| `--fitness {ic,rank_ic}` | GP 适应度的底:\|日均 Pearson IC\| 或 \|日均 rank IC\|(默认 ic) |
+| `--turnover-penalty λ` | 适应度再减 λ × 十分位多空书日换手(0 = 不扣;0.14 = 15bp 折成 rank IC 单位) |
+| `--archive-dedup R` | 日排名相关 ≥ R 的树算同一因子族:archive 留最好的,同代只让它繁殖(0 = 关) |
+| `--smooth-halflives 1,2,...` | 每个组合再按逐股 EMA 交易一遍,半衰期只在训练段按扣成本夏普选(空 = 关) |
 
 ---
 
@@ -289,13 +311,17 @@ cd ~/Desktop/AlphaCube && PYTHONPATH=src ~/.venvs/alphacube/bin/python scripts/m
 | 8f5ca07 | `--ban`:开局封禁结构,键有校验 | |
 | 29e2559 | rank 相关封禁 `--ban-rank-corr` / `--ban-archive`(`mining/rankban.py`) | 单调改写(含反号)恰为 1.0,全部拦住 |
 | a30d06f | 注册表构建时探针:数算子执行的 Python 行数随输入是否增长,逐元素循环的算子退出搜索(ND 面豁免) | 抓到 `in_mask_nearby_ones`(gpu8 卡死元凶) |
-| (本提交) | 新增 `scripts/gp_full_market.sh`、`gp_report_loop.sh`、`eval_checkpoint_costs.py`、`merge_archives.py`;重写本文件 | |
+| 53f6273 | 新增 `scripts/gp_full_market.sh`、`gp_report_loop.sh`、`eval_checkpoint_costs.py`、`merge_archives.py`;重写本文件 | |
+| (本提交) | §11 三个决定落地:`--fitness rank_ic --turnover-penalty 0.14`、`--archive-dedup 0.99`(`rankban.CompactRankIndex`)、`--smooth-halflives`(`post_combine.smoothed_metrics`、`metrics.ema_rows`);十分位书改稳定排序并向量化;`rank_rows` 不再给 inf 排名;checkpoint 新列;`merge_archives.py` / `combine_archive.py` 跟上 | 新适应度与报告的 rank IC、换手逐位一致(测试锁定);块末 rank 封禁按族成员判定;353 passed |
 
 ---
 
 ## 9. 读结果时的陷阱(都踩过)
 
-- **checkpoint 里的 `sharpe` / `annualized_return` 是无成本的**;扣成本要用 §5.7 补算,或看块结算表的 `sharpe_net`。
+- **checkpoint 里的 `sharpe` / `annualized_return` 是无成本的**(且按表达式原方向);扣成本要用 §5.7 补算,
+  或看块结算表的 `sharpe_net`。gpu10 起 checkpoint 前 10 行有 `sharpe_net`(扣 15bp、按 IC 方向交易)和 `turnover`,
+  每行都有 `score_ic` / `score_rank_ic` / `score_turnover`(适应度的原料)和 `dups`(族成员数);
+  `fitness` 列不再是 |IC| —— `merge_archives.py` 已按新列处理。
 - **符号**:GP 用 `|IC|` 做适应度,方向由组合层事后对齐。`IC = −0.024、夏普 = −3.3` 是一条**强**因子
   (翻转后 +3.3)。可疑的是 |IC| 高而 |夏普| 接近 0。
 - **IC 与 rank IC 符号相反** = 少数极端值撑起的 IC(`pow_2(day_kurt(...))` 就是),不能当真。
@@ -333,14 +359,17 @@ cd ~/Desktop/AlphaCube && PYTHONPATH=src ~/.venvs/alphacube/bin/python scripts/m
 
 ## 11. 还没解决的
 
-### 待用户决定(都提过,用户说先继续跑,未动)
+### 已由用户决定并实现(2026-09-19 07:00,gpu10 起生效)
 
-1. **换手纳入选择**:GP 适应度扣换手惩罚 / 池子只收低换手因子 / 组合后的信号平滑再交易。这是扣费后
-   能否稳定赚钱的关键。
-2. **适应度改用 rank IC**:防 `pow_2(峰度)` 这种尾部撑起的 Pearson IC(gpu9 第 2 块头名 IC +0.028、
-   rank IC −0.015、夏普 −2.4)。
-3. **archive 内部按 rank 相关去重**(例如 ≥ 0.99 视为同一因子):防每块头名被几十种单调改写占满
-   archive 和选择压力(gpu9 第 1 块前 12 名全是 `day_max(Ret)`)。
+1. **换手纳入选择**:用户选了"适应度扣换手" + "组合后平滑再交易"(没选"入池设换手门槛")。
+   适应度 = `|rank IC| − 0.14 × 日换手`;组合层每种方法再试 EMA 平滑,半衰期只在训练段选。
+2. **适应度改用 rank IC**:是。
+3. **archive 内部按 rank 相关去重**:是,0.99;同代同族只让最好的繁殖(精确复制也算同族)。
+4. 用户要求:磁盘恢复后**直接起跑 gpu10**,确认第 1 代正常后汇报。
+
+依据与细节见 `docs/design.md` §7。**要验证的**:(a) 新适应度每条新候选多一次整面板排序,本地
+1942×5220 约 0.5 s,服务器上未实测 —— 起跑前后看每代耗时;(b) 族索引每族 1.5 MB,内存随 archive
+增长(gpu9 10 代 367 条,族数应更少);(c) 块结算多了平滑,每块估计多 1~2 分钟。
 
 ### 技术遗留
 

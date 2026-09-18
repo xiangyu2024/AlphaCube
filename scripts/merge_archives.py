@@ -8,7 +8,9 @@ Reads, under the runs directory (default ./mining_runs):
   evals/*.json                           after-cost backtests from eval_checkpoint_costs.py
 
 Writes one row per distinct expression (by structural key): best |IC| over runs,
-signed IC / rank IC where a checkpoint carried them, which runs found it, its
+signed IC / rank IC where a checkpoint carried them (every row of a gpu10+
+checkpoint does: score_ic / score_rank_ic / score_turnover, with the fitness
+|rank IC| - 0.14 x turnover and the family size), which runs found it, its
 core (depth-1) structures, whether one of them is banned now (BANNED below),
 which of its operators the current search no longer breeds (exploit-era
 operators: trivial booleans, binary pow, per-element-loop kernels...), and the
@@ -63,7 +65,8 @@ entries = {}
 
 def entry(k, e, text):
     return entries.setdefault(k, {"expr": text, "e": e, "ic": 0.0, "runs": set(), "ic_test": None,
-                                  "signed_ic": None, "rank_ic": None})
+                                  "signed_ic": None, "rank_ic": None, "fit": None, "turnover": None,
+                                  "dups": None, "net": None})
 
 
 for run_dir in sorted(p for p in runs_dir.iterdir() if p.is_dir()):
@@ -72,13 +75,27 @@ for run_dir in sorted(p for p in runs_dir.iterdir() if p.is_dir()):
         for r in csv.DictReader(open(ckpts[-1], encoding="utf-8")):
             k, e = key_of(r["expression"])
             d = entry(k, e, r["expression"])
-            fit = float(r["fitness"])
-            if fit > d["ic"]:
-                d["ic"], d["expr"] = fit, r["expression"]
+            # gpu10+ checkpoints: the fitness is |rank IC| - penalty x turnover, and
+            # every row carries its IC as score_ic; before that the fitness WAS |IC|
+            scored = bool(r.get("score_ic"))
+            ic = abs(float(r["score_ic"])) if scored else float(r["fitness"])
+            if ic > d["ic"]:
+                d["ic"], d["expr"] = ic, r["expression"]
             d["runs"].add(run_dir.name)
-            if r.get("ic_mean"):
+            if scored:
+                d["signed_ic"] = float(r["score_ic"])
+                if r.get("score_rank_ic"):
+                    d["rank_ic"] = float(r["score_rank_ic"])
+                if r.get("score_turnover"):
+                    d["turnover"] = float(r["score_turnover"])
+                d["fit"] = max(float(r["fitness"]), d["fit"] if d["fit"] is not None else float("-inf"))
+            elif r.get("ic_mean"):
                 d["signed_ic"] = float(r["ic_mean"])
                 d["rank_ic"] = float(r["rank_ic"]) if r.get("rank_ic") else None
+            if r.get("dups"):
+                d["dups"] = max(int(r["dups"]), d["dups"] or 0)
+            if r.get("sharpe_net"):                     # after cost, traded in its IC's direction
+                d["net"] = float(r["sharpe_net"])
     elif (run_dir / "members.csv").exists():
         for r in csv.DictReader(open(run_dir / "members.csv", encoding="utf-8")):
             k, e = key_of(r["expression"])
@@ -106,12 +123,16 @@ for k, d in entries.items():
         "|IC|(无checkpoint的早期run)": "" if d["ic_test"] is None else round(d["ic_test"], 6),
         "出自哪些run": ",".join(sorted(d["runs"])),
         "核心结构(一层子树)": "; ".join(c[2:] if c.startswith("O:") else c for c in core),
+        "适应度(|rankIC|-0.14x换手)": "" if d["fit"] is None else round(d["fit"], 6),
+        "同族改写数": "" if d["dups"] is None else d["dups"],
         "现已封禁(结构)": "是" if set(core) & BANNED else "",
         "含已移出搜索的算子(漏洞写法)": "; ".join(gone),
         "夏普无成本(已翻转)": "" if n is None else round(n["sharpe"], 3),
-        "夏普扣15bp": "" if n is None else round(n["sharpe_net"], 3),
+        "夏普扣15bp": (round(n["sharpe_net"], 3) if n is not None
+                       else "" if d["net"] is None else round(d["net"], 3)),
         "夏普限换手30%": "" if n is None else round(n["sharpe_capped"], 3),
-        "日换手": "" if n is None else f"{n['turnover']:.0%}",
+        "日换手": (f"{n['turnover']:.0%}" if n is not None
+                 else "" if d["turnover"] is None else f"{d['turnover']:.0%}"),
         "年化扣15bp": "" if n is None else f"{n['annualized_return_net']:+.1%}",
         "_ic": d["ic"] or (d["ic_test"] or 0.0),
     })

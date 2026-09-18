@@ -9,6 +9,11 @@
 # Starts with every structure earlier runs banned (18, gpu5..gpu9) plus the rank ban: a candidate
 # whose daily ranks correlate >= 0.95 with a factor of a banned family is refused (exemplars from
 # the four archives below). Costs 15 bp/side, 30% turnover cap in every report.
+# From gpu10 on (user's decisions of 2026-09-19):
+#   fitness = |rank IC| - 0.14 x daily turnover of the decile book (0.14 = 15 bp/side in rank-IC units);
+#   archive families: trees whose daily ranks correlate >= 0.99 are one factor -- the archive keeps
+#     the best, and within a generation only that one breeds;
+#   every combination is also traded through an EMA whose half-life is picked on the training days.
 set -e
 RUN_ID="$1"
 [ -n "$RUN_ID" ] || { echo "usage: $0 <run-id>"; exit 2; }
@@ -23,6 +28,8 @@ exec /root/miniconda3/envs/quant/bin/python -u -m alphacube.cli mine \
   --pool mse --pool-capacity 30 --dedup 0.95 \
   --min-coverage 0.5 --min-scored-days 0.5 \
   --cost-per-side 0.0015 --turnover-cap 0.30 \
+  --fitness rank_ic --turnover-penalty 0.14 --archive-dedup 0.99 \
+  --smooth-halflives 1,2,3,5,10,20 \
   --rolling-block 5 --ban-top-n 3 \
   --ban "O:log(F:Amt)" --ban "O:nt_ts_argmax(F:High)|w3" --ban "O:cross_decay_linear(F:Amt)|w3" \
   --ban "O:day_ar1_coefficient(F:High)" --ban "O:day_ar1_coefficient(F:Close)" --ban "O:day_durbin_watson(F:Close)" \

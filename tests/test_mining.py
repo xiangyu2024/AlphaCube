@@ -503,3 +503,165 @@ def test_ban_exemplars_come_from_an_earlier_archive(tmp_path):
     path.write_text("rank,fitness,expression\n" + "\n".join(f'{i},{f},"{e}"' for i, (f, e) in enumerate(rows)))
     got = ban_exemplars_from([path], ["O:log(F:Amt)"])
     assert [repr(e) for e in got] == [repr(parse("day_max(log(Amt))")), repr(parse("ts_mean(day_max(log(Amt)), 5)"))]
+
+
+def test_rank_ic_turnover_fitness_is_what_the_reports_measure(registry, view):
+    """fitness_kind / turnover_penalty: the fitness must be built from the numbers
+    the checkpoint and the reports print -- ic_summary's rank IC, backtest_metrics'
+    decile-book turnover -- or the search optimises something nobody reads.
+    The IC path's gates (coverage, scored days) hold in this path too."""
+    from alphacube.label import Label
+    from alphacube.metrics import backtest_metrics, cs_pearson, nanmean_quiet, rank_rows
+    from alphacube.mining.pool import MsePool
+
+    target = Label("close", 1).compute(view)
+    exprs = [parse(s) for s in ("day_std(Ret)", "day_max(log(Amt))", "ts_mean(day_mean(Close), 5)",
+                                "sub(0.5, day_max(Amt))")]
+    rich = GPMiner(registry, view, target, MsePool(4, target), seed=0, fitness_kind="rank_ic",
+                   turnover_penalty=0.14)
+    ic_pen = GPMiner(registry, view, target, MsePool(4, target), seed=0, fitness_kind="ic", turnover_penalty=0.3)
+    f_rank, f_ic = rich.fitness(exprs), ic_pen.fitness(exprs)
+    for e, p, fr, fi in zip(exprs, rich._panels(exprs), f_rank, f_ic):
+        pan = np.asarray(p, dtype=np.float64)
+        ric = nanmean_quiet(cs_pearson(rank_rows(pan), rank_rows(target)))
+        ic = nanmean_quiet(cs_pearson(pan, target))
+        to = backtest_metrics(cs_pearson(pan, target), pan, target)["turnover"]
+        assert abs(fr - (abs(ric) - 0.14 * to)) < 1e-9, (e, fr, ric, to)
+        assert abs(fi - (abs(ic) - 0.3 * to)) < 1e-9, (e, fi, ic, to)
+    # a decreasing rewrite trades the same book the other way round: same |rank IC|
+    assert abs(f_rank[1] - f_rank[3]) < 0.02 * abs(f_rank[1]) + 1e-9
+    with pytest.raises(ValueError):
+        GPMiner(registry, view, target, MsePool(4, target), fitness_kind="sharpe")
+
+    # the gates: a panel constant on 9 days in 10 has a finite mean rank IC from the
+    # tenth, and must still score -inf (scored days), like it does in the IC path
+    D, S = target.shape
+    rng = np.random.default_rng(0)
+    real = np.where(np.isfinite(target), rng.normal(size=(D, S)), np.nan)
+    sparse = np.where(np.arange(D)[:, None] % 10 == 0, real, 0.0).astype(np.float32)
+    e = parse("day_max(High)")
+    for m in (rich, GPMiner(registry, view, target, MsePool(4, target), seed=0)):
+        m._panel_cache[e.key()] = sparse
+        assert np.isneginf(m.fitness([e])[0])
+
+
+def test_archive_keeps_one_member_per_rank_family(registry, view):
+    """archive_dedup: gpu9's first block filled its top 12 archive places with
+    rewrites of day_max(Ret), and under a rank fitness every monotone rewrite scores
+    EXACTLY the same. Trees whose daily ranks correlate >= the threshold are one
+    family: the archive keeps its best (fitness, then the smaller tree) and, within
+    a generation, only that one keeps a fitness to breed with. An exact copy is a
+    member too."""
+    from alphacube.label import Label
+    from alphacube.mining.pool import MsePool
+
+    target = Label("close", 1).compute(view)
+    fam = [parse(s) for s in ("pow_05(pow_05(day_max(Amt)))", "day_max(log(Amt))",
+                              "day_max(pow_1_5(log(pow_1_5(Amt))))", "sub(0.5, day_max(Amt))")]
+    other = parse("day_std(Ret)")
+    pop = fam + [other, fam[1]]
+    kw = dict(seed=0, fitness_kind="rank_ic", turnover_penalty=0.14)
+    plain = GPMiner(registry, view, target, MsePool(4, target), **kw)
+    plain._archive_update(pop, plain.fitness(pop))
+    assert len(plain.archive()) == 5
+
+    m = GPMiner(registry, view, target, MsePool(4, target), archive_dedup=0.99, **kw)
+    raw = m.fitness(pop)
+    assert np.isfinite(raw).all()
+    fit = m._archive_update(pop, raw)
+    assert len(m.archive()) == 2 and m._gen_dup == 4 and m.dup_demoted == 4
+    kept_fam = [i for i in (0, 1, 2, 3, 5) if np.isfinite(fit[i])]
+    assert len(kept_fam) == 1 and np.isfinite(fit[4]), fit
+    best = max((0, 1, 2, 3), key=lambda i: (raw[i], -len(pop[i].nodes())))
+    rep = pop[kept_fam[0]]
+    assert rep.key() == pop[best].key() and m._archive[rep.key()][1] == raw[best]
+    assert m._absorbed[rep.key()] == {e.key() for e in fam} - {rep.key()}
+    assert m._absorbed[other.key()] == set()
+    assert m._similar_info() == {"dup": 4}
+
+
+def test_a_better_family_member_takes_over_the_archive_place(registry, view):
+    """Whichever order two members of a family arrive in, the archive ends up
+    holding the better one, counting the other as a member."""
+    from alphacube.label import Label
+    from alphacube.mining.pool import MsePool
+
+    target = Label("close", 1).compute(view)
+    a, b = parse("pow_05(pow_05(day_max(Amt)))"), parse("day_max(log(Amt))")
+    kw = dict(seed=0, fitness_kind="rank_ic", turnover_penalty=0.14, archive_dedup=0.99)
+    ends = []
+    for order in ((a, b), (b, a)):
+        m = GPMiner(registry, view, target, MsePool(4, target), **kw)
+        for e in order:                                   # one per generation
+            fit = m._archive_update([e], m.fitness([e]))
+            assert np.isfinite(fit).all(), "alone in its generation, a member keeps its fitness"
+        (rep, _), = m.archive()
+        ends.append((rep.key(), m._absorbed[rep.key()], len(m._families), sorted(m._slot_of)))
+    assert ends[0] == ends[1], ends
+    assert len(ends[0][1]) == 1 and ends[0][2] == 1
+
+
+def test_mining_with_families_keeps_the_archive_a_set_of_families(registry, view, tmp_path):
+    """A whole run -- rolling blocks, rank ban, families, checkpoints: the archive,
+    the index and the slot map stay one-to-one, no two archived factors rank alike
+    at the threshold, and every checkpoint row carries what its fitness was made of."""
+    import csv
+
+    from alphacube.label import Label
+    from alphacube.metrics import rank_rows, cs_pearson, nanmean_quiet
+    from alphacube.mining.pool import MsePool
+    from alphacube.mining.rankban import CompactRankIndex
+
+    target = Label("close", 1).compute(view)
+    m = GPMiner(registry, view, target, MsePool(5, target), population_size=12, max_depth=4, seed=3,
+                rolling_block=3, ban_top_n=2, ban_rank_corr=0.95, fitness_kind="rank_ic",
+                turnover_penalty=0.14, archive_dedup=0.99, cost_per_side=0.0015,
+                checkpoint_dir=tmp_path / "ck", checkpoint_every=1)
+    lines = []
+    rep = m.mine(12 * 7, on_generation=lambda g, n, info: lines.append(info))
+    assert all("dup" in x and "similar" in x for x in lines)
+    assert rep.dup_demoted == m.dup_demoted > 0
+    assert len(m._archive) == len(m._slot_of) == len(m._families) == len(m._slot_key)
+    assert set(m._slot_key) == set(m._archive)
+    y = m._families._y[:, :len(m._families)]
+    c = CompactRankIndex.pairwise(y)
+    np.fill_diagonal(c, 0.0)
+    assert np.nanmax(c) < 0.99 + 1e-6, "two archived factors rank alike"
+
+    rows = list(csv.DictReader(sorted((tmp_path / "ck").glob("archive_gen*.csv"))[-1].open()))
+    assert len(rows) == len(m.archive())
+    assert all(r["score_rank_ic"] and r["score_turnover"] and r["dups"] != "" for r in rows)
+    for r in rows:
+        assert abs(float(r["fitness"]) - (abs(float(r["score_rank_ic"])) - 0.14 * float(r["score_turnover"]))) < 2e-6
+    top = [r for r in rows if r["sharpe"]]
+    assert top and all(r["sharpe_net"] and r["turnover"] for r in top)
+    for r in top:
+        assert abs(float(r["turnover"]) - float(r["score_turnover"])) < 2e-6
+        assert abs(float(r["rank_ic"]) - float(r["score_rank_ic"])) < 2e-6
+
+
+def test_a_family_is_rank_banned_when_any_member_used_the_banned_structure(registry, view):
+    """With families on, a banned structure can sit in a lesser member only -- the
+    family of day_max(Amt) may well be represented by day_max(log(Amt)). The block
+    end must still make the family a rank exemplar, or the next block breeds it
+    back under its representative's name. The ban counts come from the raw
+    fitness, so the demoted member's structure is counted like before families."""
+    from alphacube.label import Label
+    from alphacube.mining.generator import one_layer_keys
+    from alphacube.mining.pool import MsePool
+
+    target = Label("close", 1).compute(view)
+    m = GPMiner(registry, view, target, MsePool(4, target), seed=0, fitness_kind="rank_ic",
+                turnover_penalty=0.14, archive_dedup=0.99, ban_rank_corr=0.95, rolling_block=5, ban_top_n=1)
+    pair = [parse("day_max(log(Amt))"), parse("pow_05(pow_05(day_max(Amt)))")]
+    raw = m.fitness(pair)
+    fit = m._archive_update(pair, raw)
+    (rep, _), = m.archive()
+    member = next(e for e in pair if e.key() != rep.key())
+    assert np.isneginf(fit[pair.index(member)]) and np.isfinite(raw).all()
+    only_member = one_layer_keys(member) - one_layer_keys(rep)
+    assert only_member
+    order = [member, rep]                                  # the member's structure is counted first
+    banned = m._roll(order, m.fitness(order), 5)
+    assert set(banned) == only_member
+    assert m.blocks[-1]["exemplars_added"] == 1 and m._rank_ban.exemplars == [repr(rep)]

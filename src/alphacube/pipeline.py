@@ -16,6 +16,11 @@ import numpy as np
 MINERS = ("gp", "alphagen", "alphaqcm", "alphaforge", "alphasage", "warmstart")
 POOLS = ("mse", "meanstd", "dynamic")
 LABELS = ("open_vwap15", "close", "volatility", "downside_volatility", "rank", "class", "spike", "crash")
+# Columns of the combination tables (block reports and the final one), when present.
+# *_smooth: the same combination traded through an EMA whose half-life was picked on
+# the training days (post_combine.smoothed_metrics).
+_TABLE_COLUMNS = ("ic_mean", "icir", "rank_ic", "sharpe", "sharpe_net", "sharpe_capped", "turnover",
+                  "halflife", "sharpe_smooth", "turnover_smooth", "coverage", "error")
 
 
 @dataclass
@@ -162,6 +167,7 @@ def run_mining(
     max_expr_len: int = 20,
     combine_methods: Sequence[str] = ("equal", "ic", "icir", "lstsq", "ridge", "gbdt"),
     combine_train_frac: float = 0.7,
+    smooth_halflives: Sequence[float] = (),
     out_root: Optional[Union[str, Path]] = None,
     run_id: Optional[str] = None,
     save_values: bool = True,
@@ -252,10 +258,10 @@ def run_mining(
             return None
         res, signs = compare(sub.z_columns(), target, realized, methods=tuple(combine_methods),
                              train_frac=combine_train_frac, align=True, seed=seed,
-                             cost_per_side=cost_per_side, turnover_cap=turnover_cap)
+                             cost_per_side=cost_per_side, turnover_cap=turnover_cap,
+                             smooth_halflives=smooth_halflives)
         tbl = leaderboard(res)
-        cols = [c for c in ("ic_mean", "icir", "rank_ic", "sharpe", "sharpe_net", "sharpe_capped",
-                            "turnover", "coverage", "error") if c in tbl.columns]
+        cols = [c for c in _TABLE_COLUMNS if c in tbl.columns]
         say(f"  [{label}] 候选 {len(exprs)} -> 进池 {sub.size};样本外:")
         say(tbl[cols].to_string(float_format=lambda v: f"{v:+.4f}"))
         return {"label": label, "candidates": len(exprs), "pool_size": sub.size,
@@ -288,14 +294,14 @@ def run_mining(
                     chunk_symbols=chunk_symbols, chunk_days=chunk_days,
                     allow_boolean_ops=allow_boolean_ops, allow_resource_risk=allow_resource_risk,
                     skip_kernels=frozenset(skip_kernels), rolling_block=rolling_block, ban_top_n=ban_top_n,
-                    on_block=on_block,
+                    on_block=on_block, cost_per_side=cost_per_side,
                     checkpoint_dir=ckpt_dir,
                     on_engine_progress=(engine_progress if engine_progress_every > 0 else None),
                     checkpoint_every=checkpoint_every, workdir=workdir, **gp)
         miner_ref.append(m)
         rep = m.mine(budget, on_generation=lambda g, n, s: progress(g, n, s))
         added, evaluated, engine_s = rep.added, rep.evaluated, rep.engine_seconds
-        summary = f"{rep.generations} generations, archive {rep.archive_size}, best |IC| {rep.best_fitness:+.4f}"
+        summary = f"{rep.generations} generations, archive {rep.archive_size}, best fitness {rep.best_fitness:+.4f}"
         rejected = rep.commit_reasons
         panels_of = m._panels
     else:
@@ -355,10 +361,10 @@ def run_mining(
         # gpu5's first block -- which is exactly the ranking costs overturn.
         results, signs = compare(pool_obj.z_columns(), target, realized, methods=tuple(combine_methods),
                                  train_frac=combine_train_frac, align=True, seed=seed,
-                                 cost_per_side=cost_per_side, turnover_cap=turnover_cap)
+                                 cost_per_side=cost_per_side, turnover_cap=turnover_cap,
+                                 smooth_halflives=smooth_halflives)
         table = leaderboard(results)
-        cols = [c for c in ("ic_mean", "icir", "rank_ic", "sharpe", "sharpe_net", "sharpe_capped",
-                            "turnover", "coverage", "error") if c in table.columns]
+        cols = [c for c in _TABLE_COLUMNS if c in table.columns]
         say(f"combination (out-of-sample after {combine_train_frac:.0%} of days; {int((signs < 0).sum())} flipped):")
         say(table[cols].to_string(float_format=lambda v: f"{v:+.4f}"))
 

@@ -36,6 +36,11 @@
 
 树模型的样本量:全市场 10 年 x 10 因子 = 1.26 亿行,直接喂进去不现实,所以
 拟合前按 `max_fit_rows` 随机下采样(预测仍在全量上做)。
+
+平滑再交易(`smooth_halflives`):每种方法合成出信号后,再试一遍"交易它的逐股 EMA"。
+半衰期只在训练段上按扣成本夏普选(0 = 不平滑,永远在候选里),测试段报这个选择的
+结果:`halflife` / `sharpe_smooth` / `turnover_smooth`。gpu5~gpu9 的组合无成本夏普
+4~5,但日换手 40~70%,15bp 吃掉绝大部分 —— 平滑是在不动因子的前提下压换手。
 """
 
 from __future__ import annotations
@@ -45,7 +50,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from ..metrics import backtest_metrics, cross_sectional_pearson, rank_rows
+from ..metrics import backtest_metrics, cross_sectional_pearson, ema_rows, rank_rows
 
 WEIGHT_METHODS = ("equal", "ic", "icir", "lstsq", "ridge")
 MODEL_METHODS = ("ridge", "gbdt", "lightgbm", "xgboost", "factorgcl")
@@ -202,6 +207,7 @@ def combine(
     factorgcl_kwargs: Optional[Dict] = None,
     cost_per_side: float = 0.0,
     turnover_cap: Optional[float] = None,
+    smooth_halflives: Sequence[float] = (),
 ) -> CombinationResult:
     """按 `method` 组合,指标只在 `test_days`(样本外)上算。
 
@@ -235,7 +241,42 @@ def combine(
     metrics["rank_ic"] = float(np.nanmean(cross_sectional_pearson(
         rank_rows(combined[test_days]), rank_rows(target[test_days]))))
     metrics["coverage"] = float(np.isfinite(combined[test_days]).mean())
+    if smooth_halflives:
+        metrics.update(smoothed_metrics(combined, target, real_returns, train_days, test_days,
+                                        smooth_halflives, cost_per_side))
     return CombinationResult(method, weights, combined, metrics)
+
+
+def smoothed_metrics(
+    combined: np.ndarray,
+    target: np.ndarray,
+    real_returns: np.ndarray,
+    train_days: slice,
+    test_days: slice,
+    halflives: Sequence[float],
+    cost_per_side: float = 0.0,
+) -> Dict[str, float]:
+    """交易合成信号的逐股 EMA(`metrics.ema_rows`,因果,不看未来)而不是信号本身。
+
+    半衰期只用训练段选:每个候选(外加 0 = 不平滑)在训练段上算十分位多空书的
+    夏普 —— 有成本时是扣成本的 —— 取最高的;测试段只报这一个选择。EMA 在整段上
+    递推,所以测试段第一天接着训练段的状态,这不是前视:第 t 天只用到 t 及以前。"""
+    net_key = "sharpe_net" if cost_per_side > 0 else "sharpe"
+    no_ic = np.zeros(0)
+    best_h, best_s = 0.0, -np.inf
+    for h in sorted({0.0, *(float(x) for x in halflives)}):
+        sm = ema_rows(combined, h)
+        s = backtest_metrics(no_ic, sm[train_days], real_returns[train_days],
+                             cost_per_side=cost_per_side).get(net_key, np.nan)
+        if np.isfinite(s) and s > best_s:
+            best_h, best_s = h, float(s)
+    sm = ema_rows(combined, best_h)
+    t = backtest_metrics(cross_sectional_pearson(sm[test_days], target[test_days]), sm[test_days],
+                         real_returns[test_days], cost_per_side=cost_per_side)
+    return {"halflife": best_h, "sharpe_smooth": float(t.get(net_key, np.nan)),
+            "turnover_smooth": float(t.get("turnover", np.nan)),
+            "annualized_return_smooth": float(t.get("annualized_return_net" if cost_per_side > 0
+                                                    else "annualized_return", np.nan))}
 
 
 def compare(
@@ -250,6 +291,7 @@ def compare(
     factorgcl_kwargs: Optional[Dict] = None,
     cost_per_side: float = 0.0,
     turnover_cap: Optional[float] = None,
+    smooth_halflives: Sequence[float] = (),
 ) -> Tuple[List[CombinationResult], np.ndarray]:
     """跑一组组合方法,全部在同一个样本外切分上比较。
 
@@ -272,7 +314,8 @@ def compare(
         try:
             results.append(combine(method, columns, target, real_returns,
                                    train_days, test_days, max_fit_rows, seed,
-                                   factorgcl_kwargs, cost_per_side, turnover_cap))
+                                   factorgcl_kwargs, cost_per_side, turnover_cap,
+                                   smooth_halflives))
         except Exception as exc:  # 缺可选依赖/样本不足,跳过但要说出来
             results.append(CombinationResult(
                 method, None, np.full_like(target, np.nan, dtype=np.float64),
@@ -299,5 +342,5 @@ def leaderboard(results: Sequence[CombinationResult]) -> "object":
 
 __all__ = [
     "CombinationResult", "DEFAULT_METHODS", "MODEL_METHODS", "WEIGHT_METHODS",
-    "align_signs", "combine", "compare", "factor_ic_series", "leaderboard",
+    "align_signs", "combine", "compare", "factor_ic_series", "leaderboard", "smoothed_metrics",
 ]

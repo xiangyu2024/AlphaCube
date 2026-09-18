@@ -231,3 +231,37 @@ def test_two_axis_factor_by_composition(view, raw):
     last = ops.dt_day.day_last(torch.where(m, beta, nan).reshape(S * D, M)).reshape(S, D)
     ref = np.where(trad, last.numpy(), np.nan).T
     assert np.array_equal(ref, res.panels[0], equal_nan=True)
+
+
+def test_cli_mine_takes_the_fitness_and_smoothing_knobs(tmp_path):
+    """--fitness / --turnover-penalty / --archive-dedup / --smooth-halflives reach
+    the miner and the combination tables of a real (synthetic) run."""
+    import re
+
+    from alphacube.cli import build_parser, cmd_mine
+
+    p = build_parser()
+    args = p.parse_args(["mine", "--store", str(tmp_path / "cube"), "--fitness", "rank_ic",
+                         "--turnover-penalty", "0.14", "--archive-dedup", "0.99",
+                         "--smooth-halflives", "1,2,5", "--label", "close", "--budget", "36",
+                         "--population", "12", "--max-depth", "3", "--rolling-block", "2",
+                         "--cost-per-side", "0.0015", "--combine", "equal,ic", "--pool-capacity", "4",
+                         "--checkpoint-every", "1", "--out", str(tmp_path / "runs"), "--run-id", "t"])
+    assert (args.fitness, args.turnover_penalty, args.archive_dedup, args.smooth_halflives) == \
+        ("rank_ic", 0.14, 0.99, "1,2,5")
+    for bad in (["--fitness", "sharpe"],):
+        with pytest.raises(SystemExit):
+            p.parse_args(["mine", "--store", "x", *bad])
+
+    write_synthetic_store(tmp_path / "cube", n_symbols=20, n_days=90, n_minutes=24, seed=8, plant_beta=1.0)
+    import contextlib
+    import io
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        cmd_mine(args)
+    log = out.getvalue()
+    assert re.search(r"\bdup \d+", log), log[-2000:]
+    assert "halflife" in log and "sharpe_smooth" in log, log[-2000:]
+    ck = sorted((tmp_path / "runs" / "t" / "checkpoints").glob("archive_gen*.csv"))
+    head = ck[-1].read_text().splitlines()[0]
+    assert "score_rank_ic" in head and "dups" in head and "sharpe_net" in head
