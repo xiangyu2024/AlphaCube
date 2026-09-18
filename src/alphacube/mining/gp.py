@@ -38,7 +38,8 @@ from ..expression import Expression, is_valid_root
 from ..metrics import MIN_PAIRS, batched_ic, cs_pearson
 from ..store import CubeView
 from .clustering import cluster_population, cull_clusters
-from .generator import TypedTreeGenerator
+from .generator import TypedTreeGenerator, one_layer_keys
+from .rankban import RankSimilarityBan
 from .pool import LinearPool
 
 ProgressFn = Callable[[int, int, dict], None]
@@ -53,6 +54,7 @@ class MiningReport:
     commit_reasons: Dict[str, int] = field(default_factory=dict)
     commit_examples: Dict[str, str] = field(default_factory=dict)
     best_fitness: float = float("-inf")
+    similar_refused: int = 0
     seconds: float = 0.0
     engine_seconds: float = 0.0
 
@@ -90,6 +92,7 @@ class GPMiner:
                  fields: Optional[Sequence[str]] = None, allow_boolean_ops: bool = False,
                  allow_resource_risk: bool = False, skip_kernels: "frozenset[str]" = frozenset(),
                  rolling_block: int = 0, ban_top_n: int = 0, banned_substructures: Sequence[str] = (),
+                 ban_rank_corr: float = 0.0, ban_exemplars: Sequence[Expression] = (),
                  on_block: Optional[Callable[[dict], None]] = None,
                  on_engine_progress: Optional[Callable[[dict], None]] = None,
                  checkpoint_dir: Optional[os.PathLike] = None,
@@ -169,6 +172,16 @@ class GPMiner:
         self.engine = CubeEngine(view, device=device, chunk_symbols=chunk_symbols, chunk_days=chunk_days,
                                  workdir=workdir)
         self.target = np.asarray(target, dtype=np.float64)
+        # Rank-similarity bans (0 = off): panels of banned families; a candidate
+        # whose daily ranks correlate with one to ban_rank_corr is refused, however
+        # it is written. See mining/rankban.py. Exemplars from an earlier run are
+        # evaluated when mining starts; each rolling block adds its own.
+        self._rank_ban = RankSimilarityBan(self.target.shape, ban_rank_corr) if ban_rank_corr else None
+        self._pending_exemplars = list(ban_exemplars) if self._rank_ban is not None else []
+        self._rank_verdict: Dict[str, Tuple[int, bool]] = {}
+        self._gen_similar = 0
+        self.similar_refused = 0
+        self.initial_exemplars = 0
         self._target_t = torch.from_numpy(np.ascontiguousarray(self.target)).float()
         self._target_finite = np.isfinite(self.target)
         self._target_cells = max(int(self._target_finite.sum()), 1)
@@ -243,7 +256,30 @@ class GPMiner:
                     if scored / self._usable_days < self.min_scored_days:
                         continue
                 fit[i] = ic if self.fitness_signed else abs(ic)
+        if self._rank_ban is not None and len(self._rank_ban):
+            for i in live:
+                if not np.isfinite(fit[i]):
+                    continue
+                k = population[i].key()
+                v = self._rank_verdict.get(k)
+                if v is None or v[0] != self._rank_ban.version:
+                    v = self._rank_verdict[k] = (self._rank_ban.version,
+                                                 self._rank_ban.match(panels[i]) is not None)
+                if v[1]:
+                    fit[i] = -np.inf
+                    self._gen_similar += 1
+                    self.similar_refused += 1
         return fit
+
+    def _add_exemplars(self, exprs: Sequence[Expression]) -> int:
+        """Store the panels of ``exprs`` as rank-ban exemplars; how many were new."""
+        if self._rank_ban is None or not exprs:
+            return 0
+        added = 0
+        for e, p in zip(exprs, self._panels(list(exprs))):
+            if p is not None and self._rank_ban.add(e, p):
+                added += 1
+        return added
 
     def _roll(self, population, fit, generation: int) -> List[str]:
         """End of a block: score what it found, ban what it leaned on, start over."""
@@ -263,10 +299,17 @@ class GPMiner:
         banned = [k for k, _ in counts.most_common(self.ban_top_n)] if self.ban_top_n else []
         if banned:
             self.generator.ban(banned)
+        # Every archived factor that leans on a newly banned structure becomes a
+        # rank exemplar, so rewriting it some other way does not bring it back.
+        exemplars = 0
+        if banned and self._rank_ban is not None:
+            exemplars = self._add_exemplars([e for e, _ in cumulative if one_layer_keys(e) & set(banned)])
 
         info = {"index": len(self.blocks) + 1, "generation": generation, "banned": banned,
                 "counts": counts.most_common(10),
                 "banned_total": len(self.generator.banned_substructures),
+                "exemplars_added": exemplars,
+                "exemplars_total": len(self._rank_ban) if self._rank_ban is not None else 0,
                 "block_archive": block, "cumulative_archive": cumulative}
         self.blocks.append({k: v for k, v in info.items()
                             if k not in ("block_archive", "cumulative_archive")})
@@ -332,12 +375,16 @@ class GPMiner:
     def mine(self, budget: int, on_generation: Optional[ProgressFn] = None) -> MiningReport:
         t0 = time.perf_counter()
         n_gen = max(1, math.ceil(budget / self.population_size))
+        if self._pending_exemplars:
+            self.initial_exemplars = self._add_exemplars(self._pending_exemplars)
+            self._pending_exemplars = []
         population = self.generator.generate_population(self.population_size)
         fit = self.fitness(population)
         self._archive_update(population, fit)
         best = float(np.max(fit)) if np.isfinite(fit).any() else float("-inf")
         for g in range(n_gen):
             population = self._next_generation(population, fit)
+            self._gen_similar = 0
             fit = self.fitness(population)
             self._archive_update(population, fit)
             finite = fit[np.isfinite(fit)]
@@ -346,12 +393,14 @@ class GPMiner:
             if on_generation is not None:
                 on_generation(g + 1, n_gen, {"best": best, "gen_best": float(finite.max()) if finite.size else float("nan"),
                                              "gen_mean": float(finite.mean()) if finite.size else float("nan"),
-                                             "archive": len(self._archive), "valid": int(finite.size)})
+                                             "archive": len(self._archive), "valid": int(finite.size),
+                                             **self._similar_info()})
             if self.checkpoint_every and self.checkpoint_dir and (g + 1) % self.checkpoint_every == 0:
                 self.write_checkpoint(g + 1)
             if self.rolling_block and (g + 1) % self.rolling_block == 0 and g + 1 < n_gen:
                 banned = self._roll(population, fit, g + 1)
                 population = self.generator.generate_population(self.population_size)
+                self._gen_similar = 0
                 fit = self.fitness(population)
                 self._archive_update(population, fit)
                 # The rebuilt population is a real, evaluated generation: report it as
@@ -366,7 +415,8 @@ class GPMiner:
                                                  "gen_best": float(finite.max()) if finite.size else float("nan"),
                                                  "gen_mean": float(finite.mean()) if finite.size else float("nan"),
                                                  "archive": len(self._archive),
-                                                 "valid": int(finite.size), "rolled": len(banned)})
+                                                 "valid": int(finite.size), "rolled": len(banned),
+                                                 **self._similar_info()})
         if self.rolling_block and self.on_block is not None and len(self._archive) > len(self._block_seen):
             self._roll(population, fit, n_gen)          # the final, unrolled block still gets scored
         report = self._commit()
@@ -374,9 +424,16 @@ class GPMiner:
         report.evaluated = self.evaluated
         report.archive_size = len(self._archive)
         report.best_fitness = best
+        report.similar_refused = self.similar_refused
         report.seconds = time.perf_counter() - t0
         report.engine_seconds = self.engine_seconds
         return report
+
+    def _similar_info(self) -> Dict[str, int]:
+        """Rank-ban counters for the generation line (empty when the ban is off)."""
+        if self._rank_ban is None:
+            return {}
+        return {"similar": self._gen_similar, "exemplars": len(self._rank_ban)}
 
     def _commit(self) -> MiningReport:
         # top_k None: twice the pool's capacity, or the whole archive when the pool

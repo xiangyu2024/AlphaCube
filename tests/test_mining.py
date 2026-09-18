@@ -448,3 +448,58 @@ def test_structures_can_be_banned_from_the_first_generation(registry, view):
     for bad in ("log(Amt)", "O:no_such_op(F:Amt)", "O:log(F:NoSuchField)", "O:log(O:abs_(F:Amt))"):
         with pytest.raises(ValueError):
             GPMiner(registry, view, target, MsePool(4, target), banned_substructures=[bad])
+
+
+def test_rank_ban_refuses_monotone_rewrites(registry, view):
+    """A structural ban was walked around by rewriting: with log(Amt) banned, gpu7
+    came back with log(pow_1_5(Amt)) and pow_05(pow_05(day_max(Amt))) -- the same
+    daily ranks as day_max(log(Amt)), so the same backtest. Ranked panels score
+    every monotone rewrite (a sign flip included) at exactly 1.0; an unrelated
+    factor passes."""
+    from alphacube.label import Label
+    from alphacube.mining.pool import MsePool
+
+    target = Label("close", 1).compute(view)
+    rewrites = [parse(s) for s in ("pow_05(pow_05(day_max(Amt)))", "day_max(pow_1_5(log(pow_1_5(Amt))))",
+                                   "sub(0.5, day_max(Amt))")]
+    other = parse("day_std(Ret)")
+    plain = GPMiner(registry, view, target, MsePool(4, target), seed=0)
+    banned = GPMiner(registry, view, target, MsePool(4, target), seed=0, ban_rank_corr=0.95,
+                     ban_exemplars=[parse("day_max(log(Amt))")])
+    assert banned._add_exemplars(banned._pending_exemplars) == 1          # what mine() does first
+    f0, f1 = plain.fitness(rewrites + [other]), banned.fitness(rewrites + [other])
+    assert np.isfinite(f0).all(), f0
+    assert np.isneginf(f1[:3]).all() and np.isfinite(f1[3]), f1
+    assert banned.similar_refused == 3
+    # a rewrite of an exemplar is not stored again: they rank identically
+    assert not banned._rank_ban.add(rewrites[0], banned._panels([rewrites[0]])[0])
+
+
+def test_rolling_blocks_turn_banned_families_into_rank_exemplars(registry, view):
+    from alphacube.label import Label
+    from alphacube.mining.generator import one_layer_keys
+    from alphacube.mining.pool import MsePool
+
+    target = Label("close", 1).compute(view)
+    m = GPMiner(registry, view, target, MsePool(5, target), population_size=12, max_depth=4,
+                rolling_block=3, ban_top_n=2, seed=3, ban_rank_corr=0.95)
+    lines = []
+    m.mine(12 * 7, on_generation=lambda g, n, info: lines.append(info))
+    assert m.blocks and m.blocks[0]["exemplars_total"] > 0, m.blocks
+    assert len(m._rank_ban) == m.blocks[-1]["exemplars_total"]
+    assert all("similar" in x and "exemplars" in x for x in lines)
+    # every stored exemplar is an archived factor that used a banned structure
+    banned = m.generator.banned_substructures
+    archived = {repr(e): e for e, _ in m.archive()}
+    assert all(one_layer_keys(archived[r]) & banned for r in m._rank_ban.exemplars)
+
+
+def test_ban_exemplars_come_from_an_earlier_archive(tmp_path):
+    from alphacube.pipeline import ban_exemplars_from
+
+    rows = [(0.03, "day_max(log(Amt))"), (0.02, "ts_mean(day_max(log(Amt)), 5)"), (0.05, "day_std(Ret)"),
+            (0.01, "day_max(log(Amt))"), (0.04, "not_an_operator(Close)")]
+    path = tmp_path / "archive_gen010.csv"
+    path.write_text("rank,fitness,expression\n" + "\n".join(f'{i},{f},"{e}"' for i, (f, e) in enumerate(rows)))
+    got = ban_exemplars_from([path], ["O:log(F:Amt)"])
+    assert [repr(e) for e in got] == [repr(parse("day_max(log(Amt))")), repr(parse("ts_mean(day_max(log(Amt)), 5)"))]

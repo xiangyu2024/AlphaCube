@@ -108,7 +108,14 @@ def cmd_mine(a) -> int:
     from .pipeline import run_mining
 
     gp = dict(population_size=a.population, max_depth=a.max_depth, min_depth=a.min_depth, top_k=a.top_k,
-              panel_cache_items=a.panel_cache, banned_substructures=tuple(a.ban))
+              panel_cache_items=a.panel_cache, banned_substructures=tuple(a.ban),
+              ban_rank_corr=a.ban_rank_corr)
+    if a.ban_archive:
+        from .pipeline import ban_exemplars_from
+        if not a.ban_rank_corr or not a.ban:
+            raise SystemExit("--ban-archive needs --ban-rank-corr and the --ban keys whose factors it should load")
+        gp["ban_exemplars"] = ban_exemplars_from(a.ban_archive, a.ban)
+        print(f"rank-ban exemplars from {len(a.ban_archive)} archive(s): {len(gp['ban_exemplars'])} expressions")
     res = run_mining(
         a.store, start=a.start, end=a.end, max_symbols=a.max_symbols, warmup=a.warmup, label=a.label,
         label_params=_kv(a.label_param), horizon=a.horizon, miner=a.miner, budget=a.budget, seed=a.seed,
@@ -199,6 +206,15 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--ban", action="append", default=[], metavar="KEY",
                    help="depth-1 structure banned from the first generation, as the block reports print "
                         "it, e.g. --ban 'O:log(F:Amt)' --ban 'O:nt_ts_argmax(F:High)|w3'. Repeatable")
+    m.add_argument("--ban-rank-corr", type=float, default=0.0,
+                   help="also refuse any candidate whose daily cross-sectional ranks correlate (absolute, "
+                        "pooled over the sampled days) at least this much with an exemplar of a banned "
+                        "structure -- so a monotone rewrite such as log(pow_1_5(Amt)) for a banned log(Amt) "
+                        "is caught (0 = off). Exemplars: every archived factor containing a structure a "
+                        "rolling block bans, plus --ban-archive")
+    m.add_argument("--ban-archive", action="append", default=[], metavar="CSV",
+                   help="checkpoint CSV of an earlier run; its expressions that contain a --ban key become "
+                        "rank-ban exemplars from the first generation. Repeatable")
     m.add_argument("--rolling-block", type=int, default=0,
                    help="restart the population every N generations (0 = off, one long run). A single run "
                         "converges onto one primitive and spends the rest of its budget re-wrapping it")

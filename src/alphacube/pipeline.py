@@ -74,6 +74,34 @@ def make_label(kind: str, horizon: int, params: Optional[Dict[str, float]] = Non
     return _Lab(f"{kind}(h={horizon}, {p})", compute, lambda v: Label("close", horizon).compute(v))
 
 
+def ban_exemplars_from(paths: Sequence[Union[str, Path]], keys: Sequence[str]) -> List[Any]:
+    """Rank-ban exemplars for structures banned by an earlier run: every expression
+    in those checkpoint CSVs (``archive_genNNN.csv``) that contains one of ``keys``,
+    best fitness first, each once. Rows that no longer parse are skipped."""
+    import csv
+
+    from .mining.generator import one_layer_keys
+    from .parser import parse
+
+    wanted = set(keys)
+    rows = []
+    for path in paths:
+        with open(path, encoding="utf-8") as fh:
+            for r in csv.DictReader(fh):
+                try:
+                    e = parse(r["expression"])
+                except Exception:  # noqa: BLE001 - an old archive may hold a retired operator
+                    continue
+                if one_layer_keys(e) & wanted:
+                    rows.append((float(r.get("fitness") or 0.0), e))
+    seen, out = set(), []
+    for _, e in sorted(rows, key=lambda t: -t[0]):
+        if e.key() not in seen:
+            seen.add(e.key())
+            out.append(e)
+    return out
+
+
 def build_pool(kind: str, capacity: int, target, realized, dedup: Optional[float] = 0.99,
                min_coverage: float = 0.5, meanstd_lr: float = 0.05, meanstd_steps: int = 200,
                dynamic_window: int = 60, min_scored_days: float = 0.5):
@@ -239,6 +267,8 @@ def run_mining(
         say(f"\n=== 第 {i} 块结束(至第 {info['generation']} 代)===")
         say(f"  封禁 {len(info['banned'])} 个一层结构,累计生效 {info['banned_total']} 个: "
             + ", ".join(info["banned"]))
+        if info.get("exemplars_total"):
+            say(f"  按 rank 相关封禁:本块新增样本 {info['exemplars_added']} 个,累计 {info['exemplars_total']} 个")
         if not (block_combine and combine_methods):
             return
         entry = {"index": i, "generation": info["generation"], "banned": list(info["banned"])}
