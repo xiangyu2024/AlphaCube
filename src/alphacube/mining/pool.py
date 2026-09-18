@@ -164,9 +164,96 @@ def _lstsq_weights(z: List[np.ndarray], target: np.ndarray) -> np.ndarray:
     return w if np.isfinite(w).all() else np.full(k, 1.0 / k)
 
 
+class _GramCache:
+    """``XᵀX`` and ``Xᵀy`` of a pool's members against its own target, kept across refits.
+
+    ``_lstsq_weights`` stacks every member into an ``(n_cells, k)`` design and
+    solves it from scratch, and ``try_add`` does that on every insertion -- twice
+    once the pool is full. On the production cube that is ~8M rows: 22 s per solve
+    at k = 31 (measured on the server), so scoring one rolling block (up to 120
+    candidates) spent most of an hour refitting the pool. The normal equations need
+    only the k x k Gram matrix and k inner products with the target: a new member
+    costs one row of k + 1 inner products, a dropped member is a deleted row. Same
+    least-squares solution up to rounding, not bit-identical to the SVD path.
+
+    Keyed by ``id(member)`` (``Member`` is unhashable); each entry holds the member
+    itself, so an id cannot be reused by a new object while it is cached, and stale
+    ids are pruned on every solve."""
+
+    def __init__(self, target: np.ndarray) -> None:
+        self._target = np.asarray(target, dtype=np.float64)
+        y = self._target.reshape(-1)
+        self._ok = np.isfinite(y)
+        self._y = y[self._ok]
+        self.n_ok = int(self._ok.sum())
+        self._vec: Dict[int, tuple] = {}            # id(member) -> (member, masked z, z.y)
+        self._dot: Dict[tuple, float] = {}          # (id_a, id_b), id_a <= id_b -> z_a.z_b
+
+    def _entry(self, m: Member) -> tuple:
+        e = self._vec.get(id(m))
+        if e is None:
+            v = np.nan_to_num(np.asarray(m.z, dtype=np.float64).reshape(-1)[self._ok], nan=0.0)
+            e = self._vec[id(m)] = (m, v, float(v @ self._y))
+        return e
+
+    def weights(self, members: Sequence[Member]) -> np.ndarray:
+        k = len(members)
+        if k == 0:
+            return np.zeros(0)
+        if self.n_ok < 10 * k:
+            return np.full(k, 1.0 / k)
+        ids = [id(m) for m in members]
+        live = set(ids)
+        for i in [i for i in self._vec if i not in live]:
+            del self._vec[i]
+        for p in [p for p in self._dot if p[0] not in live or p[1] not in live]:
+            del self._dot[p]
+        entries = [self._entry(m) for m in members]
+        G, b = np.empty((k, k)), np.empty(k)
+        for a in range(k):
+            b[a] = entries[a][2]
+            for c in range(a, k):
+                key = (ids[a], ids[c]) if ids[a] <= ids[c] else (ids[c], ids[a])
+                g = self._dot.get(key)
+                if g is None:
+                    g = self._dot[key] = float(entries[a][1] @ entries[c][1])
+                G[a, c] = G[c, a] = g
+        w, *_ = np.linalg.lstsq(G, b, rcond=None)
+        return w if np.isfinite(w).all() else np.full(k, 1.0 / k)
+
+    def pool_ic(self, members: Sequence[Member], weights: np.ndarray) -> float:
+        """``PoolBase.pool_ic`` on the cached vectors. The combination only matters
+        where the target is finite (``cs_pearson`` drops the rest), and there the
+        per-cell arithmetic -- ``0 + w1*z1 + w2*z2 + ...`` in member order -- is the
+        one ``combined()`` does, without its three fresh full-size arrays per member
+        (~5 s at k = 30 on the production cube)."""
+        acc, tmp = np.zeros(self.n_ok), np.empty(self.n_ok)
+        for m, w in zip(members, weights):
+            np.multiply(self._entry(m)[1], w, out=tmp)
+            acc += tmp
+        panel = np.full(self._target.shape, np.nan)
+        panel.reshape(-1)[self._ok] = acc
+        return nanmean_quiet(cs_pearson(panel, self._target))
+
+
 class MsePool(PoolBase):
+    _gram: Optional[_GramCache] = None
+
     def _fit(self, z: List[np.ndarray], target: np.ndarray) -> np.ndarray:
+        # Arbitrary columns and target (DynamicRollingPool passes a trailing window):
+        # the direct solve. The pool's own refits go through the Gram cache below.
         return _lstsq_weights(z, target)
+
+    def refit(self) -> np.ndarray:
+        if self._gram is None:
+            self._gram = _GramCache(self.target)
+        self.weights = self._gram.weights(self.members)
+        return self.weights
+
+    def pool_ic(self) -> float:
+        if self._gram is None or not self.members or len(self.weights) != len(self.members):
+            return super().pool_ic()
+        return self._gram.pool_ic(self.members, self.weights)
 
 
 def _torch_daily_ic(x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor):
