@@ -127,6 +127,7 @@ def test_run_mining_pipeline(tmp_path):
     logs = []
     r = run_mining(st, start=st.dates[5], label="close", miner="gp", budget=36, pool_capacity=4,
                    gp_params=dict(population_size=12, max_depth=3), combine_methods=("equal", "ic"),
+                   cost_per_side=0.0015, turnover_cap=0.30, rolling_block=2,
                    out_root=tmp_path / "runs", run_id="p", log=logs.append)
     assert r.pool_size >= 1 and r.run_dir == tmp_path / "runs" / "p" and (r.run_dir / "members.csv").exists()
     assert r.combination is not None and {"equal", "ic"} <= set(r.combination.index)
@@ -154,6 +155,16 @@ def test_run_mining_pipeline(tmp_path):
     assert r.combination is not None
     assert "error" not in r.combination.columns, r.combination.to_string()
     assert r.combination["sharpe"].notna().any()
+
+    # ...and the costs the run was launched with must reach it. They reached
+    # members.csv but not the combinations, so the final table and every block
+    # report showed only the no-cost Sharpe (found on gpu5's first block, where the
+    # model methods turned over 3x the book the simple weightings did).
+    for col in ("sharpe_net", "sharpe_capped", "turnover"):
+        assert col in r.combination.columns, r.combination.to_string()
+    assert r.combination["sharpe_net"].notna().any()
+    block = [s for s in logs if "sharpe_net" in s]
+    assert any("仅本块" in s for s in logs) and len(block) >= 2, "block report and final table both carry it"
 
     # Inside-a-generation progress. A generation is ONE engine call, so without this
     # the log says nothing for its whole duration -- 58 minutes for a cold

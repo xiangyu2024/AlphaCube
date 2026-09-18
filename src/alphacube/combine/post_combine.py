@@ -143,7 +143,14 @@ def _model_prediction(
         rng = np.random.default_rng(seed)
         fit_rows = rng.choice(fit_rows, size=max_fit_rows, replace=False)
 
-    model = ESTIMATOR_REGISTRY[key]()
+    # Seeded: HistGradientBoosting turns on early stopping above 10k rows and draws
+    # its validation split at random, so an unseeded "gbdt" gave a different
+    # combination on every call -- out-of-sample Sharpe 5.0 then 3.0 for the same
+    # inputs and seed on the test fixture, and the same on the production blocks.
+    try:
+        model = ESTIMATOR_REGISTRY[key](random_state=seed)
+    except TypeError:                                  # an estimator without a seed
+        model = ESTIMATOR_REGISTRY[key]()
     model.fit(X_all[fit_rows], y[fit_rows])
     return np.asarray(model.predict(X_all), dtype=np.float64).reshape(T, N)
 
@@ -188,8 +195,14 @@ def combine(
     max_fit_rows: int = 2_000_000,
     seed: int = 0,
     factorgcl_kwargs: Optional[Dict] = None,
+    cost_per_side: float = 0.0,
+    turnover_cap: Optional[float] = None,
 ) -> CombinationResult:
-    """按 `method` 组合,指标只在 `test_days`(样本外)上算。"""
+    """按 `method` 组合,指标只在 `test_days`(样本外)上算。
+
+    `cost_per_side` / `turnover_cap` 原样交给 `backtest_metrics`,多出
+    `*_net`(扣成本)和 `*_capped`(限换手)两套指标。不传就只有无成本那套 ——
+    模型类方法的日换手常是简单加权的 3 倍,只看无成本会把排名看反。"""
     if method == "factorgcl":
         combined = _factorgcl_prediction(columns, target, train_days, seed,
                                          **(factorgcl_kwargs or {}))
@@ -204,7 +217,8 @@ def combine(
             combined = combined + weight * column
 
     ic_series = cross_sectional_pearson(combined[test_days], target[test_days])
-    metrics = dict(backtest_metrics(ic_series, combined[test_days], real_returns[test_days]))
+    metrics = dict(backtest_metrics(ic_series, combined[test_days], real_returns[test_days],
+                                    cost_per_side=cost_per_side, turnover_cap=turnover_cap))
     metrics["rank_ic"] = float(np.nanmean(cross_sectional_pearson(
         rank_rows(combined[test_days]), rank_rows(target[test_days]))))
     metrics["coverage"] = float(np.isfinite(combined[test_days]).mean())
@@ -221,6 +235,8 @@ def compare(
     max_fit_rows: int = 2_000_000,
     seed: int = 0,
     factorgcl_kwargs: Optional[Dict] = None,
+    cost_per_side: float = 0.0,
+    turnover_cap: Optional[float] = None,
 ) -> Tuple[List[CombinationResult], np.ndarray]:
     """跑一组组合方法,全部在同一个样本外切分上比较。
 
@@ -243,7 +259,7 @@ def compare(
         try:
             results.append(combine(method, columns, target, real_returns,
                                    train_days, test_days, max_fit_rows, seed,
-                                   factorgcl_kwargs))
+                                   factorgcl_kwargs, cost_per_side, turnover_cap))
         except Exception as exc:  # 缺可选依赖/样本不足,跳过但要说出来
             results.append(CombinationResult(
                 method, None, np.full_like(target, np.nan, dtype=np.float64),

@@ -159,3 +159,41 @@ def test_build_prior_incidence_is_the_zscore_stack():
     np.testing.assert_allclose(from_helper, from_columns, rtol=0, atol=0, equal_nan=True)
     with pytest.raises(ValueError):
         build_prior_incidence([])
+
+
+def test_costs_reach_every_combination(planted):
+    """`compare` used to call backtest_metrics without costs, so every combination
+    table -- the pipeline's final one and each rolling-block report -- carried only
+    the no-cost Sharpe, whatever --cost-per-side the run was launched with. On
+    gpu5's first block the model methods turned over 45-67% of the book a day
+    against 18-19% for the simple weightings, which is the ranking costs overturn."""
+    from alphacube.metrics import backtest_metrics, cross_sectional_pearson
+
+    cols, future = planted
+    methods = ("equal", "ic", "lstsq", "gbdt")
+    gross, _ = compare(cols, future, future, methods=methods, train_frac=0.7)
+    net, _ = compare(cols, future, future, methods=methods, train_frac=0.7,
+                     cost_per_side=0.0015, turnover_cap=0.30)
+    test = slice(int(T * 0.7), T)
+    for g, r in zip(gross, net):
+        assert "sharpe_net" not in g.metrics                        # no costs asked, none charged
+        assert r.metrics["sharpe"] == g.metrics["sharpe"]           # the no-cost headline is unchanged
+        ref = backtest_metrics(cross_sectional_pearson(r.combined[test], future[test]), r.combined[test],
+                               future[test], cost_per_side=0.0015, turnover_cap=0.30)
+        for k in ("sharpe_net", "annualized_return_net", "sharpe_capped", "turnover_capped"):
+            assert r.metrics[k] == pytest.approx(ref[k], rel=1e-12), (r.method, k)
+        assert r.metrics["sharpe_net"] < r.metrics["sharpe"], r.method
+    table = leaderboard(net)
+    assert {"sharpe_net", "sharpe_capped", "turnover"} <= set(table.columns)
+
+
+def test_model_combinations_are_reproducible(planted):
+    """Same inputs, same seed, two calls: the same combination. "gbdt" is
+    HistGradientBoosting, which enables early stopping above 10k rows and draws the
+    validation split at random; unseeded, the two calls gave out-of-sample Sharpe
+    5.0 and 3.0 on this fixture."""
+    cols, future = planted
+    for method in ("gbdt", "ridge"):
+        a, _ = compare(cols, future, future, methods=(method,), train_frac=0.7, seed=0)
+        b, _ = compare(cols, future, future, methods=(method,), train_frac=0.7, seed=0)
+        assert np.array_equal(a[0].combined, b[0].combined, equal_nan=True), method

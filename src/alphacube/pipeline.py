@@ -230,7 +230,8 @@ def run_mining(
             say(f"  [{label}] 池为空,跳过")
             return None
         res, signs = compare(sub.z_columns(), target, realized, methods=tuple(combine_methods),
-                             train_frac=combine_train_frac, align=True, seed=seed)
+                             train_frac=combine_train_frac, align=True, seed=seed,
+                             cost_per_side=cost_per_side, turnover_cap=turnover_cap)
         tbl = leaderboard(res)
         cols = [c for c in ("ic_mean", "icir", "rank_ic", "sharpe", "sharpe_net", "sharpe_capped",
                             "turnover", "coverage", "error") if c in tbl.columns]
@@ -325,10 +326,16 @@ def run_mining(
     table = None
     if combine_methods:
         from .combine.post_combine import compare, leaderboard
+        # Costs reach the combinations too: without them this table (and every block
+        # report) showed only the no-cost Sharpe while the model methods turned over
+        # ~3x the book the simple weightings did -- 45-67% a day against 18-19% on
+        # gpu5's first block -- which is exactly the ranking costs overturn.
         results, signs = compare(pool_obj.z_columns(), target, realized, methods=tuple(combine_methods),
-                                 train_frac=combine_train_frac, align=True, seed=seed)
+                                 train_frac=combine_train_frac, align=True, seed=seed,
+                                 cost_per_side=cost_per_side, turnover_cap=turnover_cap)
         table = leaderboard(results)
-        cols = [c for c in ("ic_mean", "icir", "rank_ic", "sharpe", "coverage", "error") if c in table.columns]
+        cols = [c for c in ("ic_mean", "icir", "rank_ic", "sharpe", "sharpe_net", "sharpe_capped",
+                            "turnover", "coverage", "error") if c in table.columns]
         say(f"combination (out-of-sample after {combine_train_frac:.0%} of days; {int((signs < 0).sum())} flipped):")
         say(table[cols].to_string(float_format=lambda v: f"{v:+.4f}"))
 
