@@ -424,3 +424,27 @@ def test_rolling_restart_bans_what_the_block_leaned_on(registry, view):
     plain = GPMiner(registry, view, target, MsePool(5, target), population_size=12, max_depth=4, seed=3)
     plain.mine(12 * 9)
     assert plain.blocks == [] and not plain.generator.banned_substructures
+
+
+def test_structures_can_be_banned_from_the_first_generation(registry, view):
+    """--ban carries an earlier run's exhausted structures into a fresh one: they
+    are refused from generation 1, and a key that names nothing is an error rather
+    than a ban that silently bans nothing."""
+    from alphacube.cli import build_parser
+    from alphacube.label import Label
+    from alphacube.mining.generator import one_layer_keys
+    from alphacube.mining.pool import MsePool
+
+    args = build_parser().parse_args(["mine", "--store", "x", "--ban", "O:log(F:Amt)",
+                                      "--ban", "O:day_cov(F:Ret,F:Amt)"])
+    assert args.ban == ["O:log(F:Amt)", "O:day_cov(F:Ret,F:Amt)"]
+
+    target = Label("close", 1).compute(view)
+    keys = ["O:log(F:Amt)", "O:nt_ts_argmax(F:High)|w3", "O:day_ar1_coefficient(F:High)", "O:day_cov(F:Ret,F:Amt)"]
+    m = GPMiner(registry, view, target, MsePool(4, target), population_size=12, max_depth=3, seed=3,
+                banned_substructures=keys)
+    assert set(keys) <= m.generator.banned_substructures
+    assert not any(set(keys) & one_layer_keys(e) for e in m.generator.generate_population(300))
+    for bad in ("log(Amt)", "O:no_such_op(F:Amt)", "O:log(F:NoSuchField)", "O:log(O:abs_(F:Amt))"):
+        with pytest.raises(ValueError):
+            GPMiner(registry, view, target, MsePool(4, target), banned_substructures=[bad])

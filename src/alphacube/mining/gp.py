@@ -18,6 +18,8 @@ engine).
 
 from __future__ import annotations
 
+import re
+
 import math
 import os
 import random
@@ -55,6 +57,28 @@ class MiningReport:
     engine_seconds: float = 0.0
 
 
+_BAN_KEY = re.compile(r"^O:([A-Za-z0-9_]+)\((.*)\)(\|w\d+)?$")
+
+
+def check_ban_key(key: str, registry: Registry, fields: Sequence[str]) -> None:
+    """``key`` must be a depth-1 structure as ``one_layer_keys`` writes it --
+    ``O:<operator>(<leaf>,...)[|w<window>]`` over leaves ``F:<field>`` / ``C:<value>``,
+    e.g. ``O:log(F:Amt)`` or ``O:nt_ts_argmax(F:High)|w3`` -- naming a registered
+    operator and existing fields."""
+    m = _BAN_KEY.match(key)
+    if not m:
+        raise ValueError(f"ban key {key!r} is not a depth-1 structure like 'O:log(F:Amt)'")
+    name, args = m.group(1), m.group(2)
+    if name not in registry:
+        raise ValueError(f"ban key {key!r}: no operator named {name!r}")
+    for a in args.split(","):
+        if a.startswith("F:"):
+            if a[2:] not in fields:
+                raise ValueError(f"ban key {key!r}: no field named {a[2:]!r}")
+        elif not a.startswith("C:"):
+            raise ValueError(f"ban key {key!r}: operand {a!r} is not a leaf (F:<field> or C:<value>)")
+
+
 class GPMiner:
     def __init__(self, registry: Registry, view: CubeView, target: np.ndarray, pool: LinearPool,
                  population_size: int = 24, tournament_size: int = 3, crossover_rate: float = 0.7,
@@ -65,7 +89,7 @@ class GPMiner:
                  device: str = "cpu", chunk_symbols: Optional[int] = None, chunk_days: Optional[int] = None,
                  fields: Optional[Sequence[str]] = None, allow_boolean_ops: bool = False,
                  allow_resource_risk: bool = False, skip_kernels: "frozenset[str]" = frozenset(),
-                 rolling_block: int = 0, ban_top_n: int = 0,
+                 rolling_block: int = 0, ban_top_n: int = 0, banned_substructures: Sequence[str] = (),
                  on_block: Optional[Callable[[dict], None]] = None,
                  on_engine_progress: Optional[Callable[[dict], None]] = None,
                  checkpoint_dir: Optional[os.PathLike] = None,
@@ -135,6 +159,13 @@ class GPMiner:
                                             min_depth=min_depth, max_depth=max_depth,
                                             allow_boolean_ops=allow_boolean_ops,
                                             allow_resource_risk=allow_resource_risk, rng=self._rng)
+        # Structures banned from the first generation on -- e.g. what an earlier run's
+        # rolling blocks already exhausted -- on top of whatever this run bans itself.
+        # A key that names nothing would ban nothing, silently, so each is checked.
+        if banned_substructures:
+            for key in banned_substructures:
+                check_ban_key(key, registry, self.generator.fields)
+            self.generator.ban(banned_substructures)
         self.engine = CubeEngine(view, device=device, chunk_symbols=chunk_symbols, chunk_days=chunk_days,
                                  workdir=workdir)
         self.target = np.asarray(target, dtype=np.float64)

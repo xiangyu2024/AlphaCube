@@ -108,7 +108,7 @@ def cmd_mine(a) -> int:
     from .pipeline import run_mining
 
     gp = dict(population_size=a.population, max_depth=a.max_depth, min_depth=a.min_depth, top_k=a.top_k,
-              panel_cache_items=a.panel_cache)
+              panel_cache_items=a.panel_cache, banned_substructures=tuple(a.ban))
     res = run_mining(
         a.store, start=a.start, end=a.end, max_symbols=a.max_symbols, warmup=a.warmup, label=a.label,
         label_params=_kv(a.label_param), horizon=a.horizon, miner=a.miner, budget=a.budget, seed=a.seed,
@@ -196,6 +196,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "draw where it was, so a run reproduces an earlier one exactly up to the first "
                         "refusal -- use it with --allow-resource-risk to replay a run that was poisoned "
                         "by an expensive operator")
+    m.add_argument("--ban", action="append", default=[], metavar="KEY",
+                   help="depth-1 structure banned from the first generation, as the block reports print "
+                        "it, e.g. --ban 'O:log(F:Amt)' --ban 'O:nt_ts_argmax(F:High)|w3'. Repeatable")
     m.add_argument("--rolling-block", type=int, default=0,
                    help="restart the population every N generations (0 = off, one long run). A single run "
                         "converges onto one primitive and spends the rest of its budget re-wrapping it")
