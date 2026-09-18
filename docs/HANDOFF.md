@@ -1,16 +1,35 @@
-# AlphaCube 交接说明
+# AlphaCube 交接
 
-给接手这个项目的下一个 agent。读完这份就能接着干,不用从头翻对话。
-设计层面的东西在 `docs/design.md`(中文,权威);这份只讲**当前在做什么**和**怎么操作**。
+你正在接手 AlphaCube。这份文件是自足的 —— 读完就能接着干,不需要任何对话历史。
+设计层面的细节在 `docs/design.md`(中文,权威);这份讲**在做什么、怎么操作、踩过什么坑**。
 
 ---
 
-## 1. 一句话
+## 0. 现在的状态(2026-09-18 08:30)
+
+**一个全市场挖掘任务正在跑**,别动它,除非你有理由停。
+
+```
+run-id   gpu4              screen 会话 gpu4(任务)+ gpu4rep(每 15 分钟快照)
+pid      232124            已跑 1h35m,RSS 83.8 GB
+配置     20 代 = 4 块 x 5 代,全市场 5219 只 x 20180102~20251231
+进度     第 1 代 08:09 落地(best +0.0227, valid 64/64),第 2 代进行中
+```
+
+第 5 代(第 1 块边界)会输出**第一份融合回测**,预计 09:15 前后。
+
+**同时有一个 profiling 在跑**(`scripts/_profile_gpu.py` → `profile_gpu.log`),
+CUDA 那半已出结论(见 §9),CPU 对照还没跑完。
+
+---
+
+## 1. 这个项目是什么
 
 三维立方体 `(股票, 交易日, 分钟)` 上的因子挖掘引擎。一个数据对象、一份算子注册表、
 一个引擎,GP / 四个 RL miner / 池 / 组合 / 回测全跑在它上面。
 
-**当前阶段**:在真实全市场数据上跑 GP,反复发现"搜索被钻空子"并堵漏。
+**当前阶段**:在真实全市场数据上跑 GP,反复发现"搜索被钻空子"并堵漏 —— §7 那张表
+里每一条都是 GP 在真实数据上找到并利用过的漏洞。
 
 ---
 
@@ -25,18 +44,21 @@
 | 服务器 python | `/root/miniconda3/envs/quant/bin/python` |
 | 数据 | `/root/autodl-tmp/qmt_daily_data/fast_factor_compute`(5219 只 × 2111 天 × 241 分钟,79 GB) |
 
-**连接务必带 `-o ControlPath=none`** —— 否则会去复用一个早已失效的 ControlMaster 套接字:
+**连接务必带 `-o ControlPath=none`** —— 否则会去复用一个早已失效的 ControlMaster 套接字然后被拒:
 
 ```bash
 ssh -o BatchMode=yes -o ControlPath=none -p 29982 root@connect.westd.seetacloud.com '<cmd>'
 ```
 
+`ps -eo ... -p <pid>` 里的 `-e` 会**覆盖** `-p` 过滤而列出所有进程。查单个进程用 `ps -o pid=,etime= -p <pid>`。
+
 ### 两条硬约束
 
-1. **只能改 `/root/autodl-tmp/AlphaCube`**,服务器上其他一切只读。
+1. **只能改 `/root/autodl-tmp/AlphaCube`**,服务器上其他一切只读。装 pip 包、改系统设置都超出授权。
 2. **系统盘 `/` 只有 30 GB 且已用 86%**(miniconda 22 GB + vscode-server 8.4 GB)。
-   任何中间产物都必须落在数据盘。引擎的 `workdir` 默认已是 `<项目>/tmp`,别再改回系统临时目录 ——
-   一个落盘边界文件是整块 `(S, D, M)` float32 = **9.8 GB**,曾经把系统盘写满、进程被静默杀掉。
+   中间产物必须落在数据盘。引擎 `workdir` 默认已是 `<项目>/tmp`,**别改回系统临时目录** ——
+   一个落盘边界文件是整块 `(S, D, M)` float32 = **9.8 GB**,曾经写满系统盘、进程被静默杀掉、
+   日志里连一行报错都没有。
 
 ---
 
@@ -47,21 +69,36 @@ ssh -o BatchMode=yes -o ControlPath=none -p 29982 root@connect.westd.seetacloud.
   'cd /root/autodl-tmp/AlphaCube && screen -dmS gpu5 bash -c "./scripts/gpu4.sh > gpu5_run.log 2>&1"'
 ```
 
-`scripts/gpu4.sh` 是当前配置的样板,直接改参数复用。**长任务一律用 `screen`**,
-它与 ssh 连接无关,断网不影响。
+`scripts/gpu4.sh` 是当前配置的样板,改参数复用。**长任务一律用 `screen`** —— 它与 ssh 连接无关,
+断网、关机、退出 IDE 都不影响。`nohup` 不够可靠,试过。
 
 ### 当前配置的含义
 
 ```
---budget 1280 --population 64        20 代
---rolling-block 5 --ban-top-n 3      每 5 代推倒重来,封禁该块最常用的 3 个一层结构
---cost-per-side 0.0015               单边 15bp,买卖都收
+--budget 1280 --population 64        20 代(budget / population = 代数)
+--min-depth 2 --max-depth 5
+--rolling-block 5 --ban-top-n 3      每 5 代推倒重来,封禁该块最常用的 3 个一层子结构
+--cost-per-side 0.0015               单边 15bp,买卖都收,整本换一遍 = 2 倍
 --turnover-cap 0.30                  另出一套"日换手率 ≤30%"的曲线
---checkpoint-every 1                 每代把表达式+回测写盘
---progress-every 60                  代内进度(轮次/units/百分比/ETA)
+--min-coverage 0.5 --min-scored-days 0.5
+--checkpoint-every 1                 每代把表达式 + 回测写盘
+--progress-every 60                  代内进度(轮次 / units / 百分比 / ETA)
 --panel-cache 1024                   面板缓存条数(一张 40 MB,1024 ≈ 42 GB)
---min-scored-days 0.5                因子必须在过半可用交易日上真的算得出 IC
+--combine equal,ic,icir,lstsq,ridge,gbdt,lightgbm,xgboost
 ```
+
+服务器上 lightgbm 4.6 / xgboost 3.2 / sklearn 1.8 都有;`factorgcl` 需要 `torch_geometric`,**未装**。
+
+### 滚动块的语义
+
+```
+1~5 代   -> 融合回测(仅本块)         -> 封禁本块最常用的 3 个一层结构 -> 重建初始种群
+6~10 代  -> 融合回测(仅本块 + 累计1~2) -> 再封 3 个(与前面的并集生效)  -> 重建
+11~15 代 -> 融合回测(仅本块 + 累计1~3) -> ...
+```
+
+封禁是**累积并集**,且在**所有接受点**生效(新树、五种变异、交叉),被封结构无法通过繁殖绕回来。
+最后一个不足 5 代的残块也会被评分。
 
 ---
 
@@ -70,10 +107,10 @@ ssh -o BatchMode=yes -o ControlPath=none -p 29982 root@connect.westd.seetacloud.
 ```bash
 S='ssh -o BatchMode=yes -o ControlPath=none -p 29982 root@connect.westd.seetacloud.com'
 
-$S 'cd /root/autodl-tmp/AlphaCube && tail -20 gpu4_run.log'          # 进度
-$S 'cd /root/autodl-tmp/AlphaCube && ls mining_runs/gpu4/checkpoints' # 每代产物
-$S 'ps -eo pid,etime,pcpu,rss,args | grep "[c]li mine"'               # 活没活着
-$S 'nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv'  # GPU
+$S 'cd /root/autodl-tmp/AlphaCube && tail -20 gpu4_run.log'            # 进度
+$S 'cd /root/autodl-tmp/AlphaCube && ls mining_runs/gpu4/checkpoints'  # 每代产物
+$S 'ps -eo pid,etime,pcpu,rss,args | grep "[c]li mine"'                # 活没活着
+$S 'nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv'   # GPU
 $S 'df -h / /root/autodl-tmp'                                          # 磁盘(系统盘必看)
 ```
 
@@ -104,25 +141,25 @@ mining_runs/<run-id>/
 ```
 
 **archive 只在 checkpoint 里。** GP 的 archive 活在内存,`_commit()` 只在预算跑完时执行。
-中途杀掉进程,没有 checkpoint 就什么都拿不到 —— 这是花了一整夜才换来的教训,所以
+中途杀进程、没有 checkpoint 就什么都拿不到 —— 这是花了一整夜换来的教训,所以
 `--checkpoint-every 1` 基本应该一直开着。
 
 ---
 
-## 6. 读结果时的陷阱(都是踩过的)
+## 6. 读结果时的陷阱(都踩过)
 
 **符号**:GP 用 `|IC|` 做适应度,方向由组合层事后对齐。所以 `IC = -0.024, 夏普 = -3.3`
 是一条**强**因子(翻转后夏普 +3.3),不是坏因子。真正可疑的是 **|IC| 高而 |夏普| 接近 0**。
 按 `|夏普|` 排序(`show2.py`)才对应真实强度。
 
 **回撤 -99%**:负 IC 因子被复利八年的算术必然(年化 -44% 复利 7.7 年 = 净值剩 1%),
-不是"某天暴雷"。看翻转后的。
+不是"某天暴雷"。要看翻转后的。
 
 **`coverage` 与 `n_days` 要一起看**:`coverage` 只问格点是否有限,一个恒为 0 的面板
 处处有限、照样通过;`n_days` 问的是**当天有没有截面区分度**。两者背离就是退化因子。
 
-**换手率**:现在每条因子都有 `turnover` / `*_net`(扣成本)/ `*_capped`(限换手)。
-无成本的夏普 4.0 配 89% 日换手,扣 15bp 后是负的。**永远看扣成本那套。**
+**换手率**:每条因子都有 `turnover` / `*_net`(扣成本)/ `*_capped`(限换手)。
+无成本夏普 4.0 配 89% 日换手,扣 15bp 后是负的。**永远看扣成本那套。**
 
 ---
 
@@ -132,13 +169,17 @@ mining_runs/<run-id>/
 
 | 漏洞 | 现象 | 现在怎么防 |
 |---|---|---|
-| **平凡布尔算子** | `pow_05(eq(a,b))` 把恒定指示量洗成合法根,\|IC\| 0.58 | `trivial_boolean` 探针(喂全正/全负/混号/同操作数,任一使输出恒定即判定),22 个默认移出词表 |
-| **float32 下溢** | `pow(0.5, 成交量)`:0.5^1e5 = 0,面板恒零,\|IC\| 0.0741 全靠 329/1893 天 | 二元 `pow` 移出搜索,指数改为烘焙变体 `pow_05/1_5/2/2_5/3` |
-| **部分退化面板** | 有值但每天截面无方差,IC 从少数天来 | `--min-scored-days 0.5` |
-| **NT 面配对核** | `nt_ts_pearson` 逐日 5219² 对 × 1942 天,一代跑 3~10 小时 | 按**面**排除(ND 的 `ts_pearson` 保留,NT 双胞胎排除) |
-| **单结构霸榜** | `day_ar1_coefficient(Volume)` 占 archive 的 49%,外面套不同单调变换 | `--rolling-block` + `--ban-top-n` |
+| **平凡布尔算子** | `pow_05(eq(a,b))` 把恒定指示量洗成合法根,\|IC\| 0.58 而池里 IC 是 NaN | `trivial_boolean` 探针(喂全正/全负/混号/同操作数,任一使输出恒定即判定),22 个默认移出词表 |
+| **float32 下溢** | `pow(0.5, 成交量)`:0.5^1e5 = 0,面板恒零,\|IC\| 0.0741 全靠 329/1893 天,且六代内霸占前 8 名 | 二元 `pow` 移出搜索,指数改为烘焙变体 `pow_05/1_5/2/2_5/3` |
+| **部分退化面板** | 有值但每天截面无方差,IC 从少数天来(全退化的早被"IC 非有限"挡了,漏的是部分退化) | `--min-scored-days 0.5` |
+| **NT 面配对核** | `nt_ts_pearson` 逐日 5219² 对 × 1942 天,一代跑 3~10 小时 | 按**面**排除:ND 的 `ts_pearson` 保留(整面板一次),NT 双胞胎排除(逐日 241 倍) |
+| **单结构霸榜** | `day_ar1_coefficient(Volume)` 占 archive 的 49%,外面套不同单调变换,\|IC\| 全在噪声内 | `--rolling-block` + `--ban-top-n`;另加初始种群去重、变异从 3 种增至 5 种(含唯一能让树变短的 `hoist`) |
 
 > 判据一律用**探针实测**而非手写名单 —— 见 `catalog._probe_constant_capable`。
+
+**还修过一个静默 bug**:`pipeline.py` 里 `realized` 被重新绑定成截断版,而最终 `compare()`
+传的是未截断的列和 target,导致每个组合方法都越界 —— 但异常被 `except` 捕获后**做成表格打印**,
+所以跑完看着"正常结束",实际最重要那张表全是 `error`。现在有测试断言最终表必须有数字。
 
 ---
 
@@ -151,31 +192,69 @@ mining_runs/<run-id>/
 | `Return` 的 39 处 NaN 位置差异 | 与生产日频 store 比对时出现,约 0.8%,疑似复牌日,未细查 |
 | CUDA 逐算子一致性 | `scripts/validate_gpu_parity.py --device cuda` 还没在服务器跑过(本机用 MPS 跑过,238 个算子零缺陷) |
 | `factorgcl` 组合方法 | 需要 `torch_geometric`,服务器未装(装它要动 conda 环境,超出授权) |
+| 引擎提速 | 见 §9,方向已定但未实现 |
 
 ---
 
-## 9. 性能事实(实测,别再重新推测)
+## 9. 性能事实(全部实测,别再重新推测)
 
-- **瓶颈不是分块粒度**。`--chunk-symbols` 从自动(~15 只)放大到 64,速度只变 6%,显存却多 10 GB。
-  GPU 利用率长期 1–9%,时间花在每块内部的 Python 调度和逐股票/逐日循环上。
-- **成本单位是"读了几个字段"**,不是"跑了几棵树"。单字段全量 9.1 GB,
-  所以一代里多塞几棵树反而便宜 —— 这是 population 取 64 的依据。
+### 瓶颈在叶子读取,不在算力也不在调度
+
+`scripts/_profile_gpu.py` 按阶段计时(242 天 × 400 只):
+
+```
+device=cuda   总 4.0s
+  叶子读取+上卡    2.5s  (63.8%)   24 次,单次 106 ms   <-- 主因
+  核函数(立方体)   0.4s  (11.3%)   27 次,单次  17 ms
+  核函数(面板)    0.2s  ( 4.7%)
+  其余(调度/落盘)  0.8s  (20.3%)
+
+device=cpu    总 16.4s
+  核函数(立方体)  12.9s  (79.1%)   单次 479 ms   <-- CPU 上核函数慢 29 倍
+  叶子读取+上卡    2.4s  (14.8%)   单次 101 ms   <-- 与 CUDA 几乎相同
+```
+
+两个佐证:叶子读取在 CPU 和 CUDA 上耗时几乎一样(101 vs 106 ms),说明那段与设备无关、
+GPU 全程干等;而核函数在 GPU 上快 29 倍 —— 正因为算得太快,读取的占比才被顶到 64%。
+
+**提速方向**:预取 / 异步传输(`non_blocking=True` + pinned memory)/ 在算第 N 块时后台读第 N+1 块。
+**不要动**分块粒度和逐股票循环,两者都已被实测排除。
+
+### 其他实测结论
+
+- **分块粒度不是瓶颈**:`--chunk-symbols` 从自动(~15 只)放大到 64,速度只变 6%,显存多吃 10 GB。
+- **成本单位是"读了几个字段"**,不是"跑了几棵树"。单字段全量 9.1 GB,所以一代里多塞几棵树反而便宜 ——
+  这是 population 取 64 的依据。
 - **单代耗时由缓存命中率决定**,与代数无单调关系,实测 8 分钟到 10 小时都出现过。
-  别用少数几代外推总时长(这个错误犯过三次)。
-- 磁盘阵列顺序读 **3.5 GB/s**,任务峰值约 800 MB/s,有余量并行第二个任务(但 GPU 显存只有一张卡的量)。
+  **别用少数几代外推总时长** —— 这个错误犯过三次。
+- 磁盘阵列顺序读 **3.5 GB/s**,任务峰值约 800 MB/s,有余量并行第二个任务(但 GPU 只有一张卡)。
+- CPU 有 208 核,任务长期只用 1 核(100–115%),754 GB 内存通常只用到 30–80 GB。
 
 ---
 
-## 10. 测试
+## 10. 工作约定
 
 ```bash
 cd ~/Desktop/AlphaCube && PYTHONPATH=src ~/.venvs/alphacube/bin/python -m pytest tests -q
 ```
 
-当前 **320 passed, 8 skipped, 1 xfailed**。改完必跑。
+当前 **320 passed, 8 skipped, 1 xfailed**。改完必跑。改完也要 `git push` 并 rsync 到服务器:
+
+```bash
+rsync -a --exclude __pycache__ --exclude .git --exclude .pytest_cache --exclude mining_runs \
+  --exclude tmp --exclude '*.log' --exclude .DS_Store \
+  -e "ssh -o BatchMode=yes -o ControlPath=none -p 29982" \
+  ~/Desktop/AlphaCube/ root@connect.westd.seetacloud.com:/root/autodl-tmp/AlphaCube/
+```
+
+**注意:同步到服务器不影响正在跑的进程** —— Python 启动时已把代码载入内存,改动要下次启动才生效。
 
 几个约定:
+
 - 每个修复都要有**能复现该 bug 的测试**,注释写清楚它当初是怎么发生的
 - 判据尽量**探针实测**,不手写名单
 - CLI 参数有单独的测试(遍历 `cmd_mine` 读的每个 `a.xxx`,断言 parser 定义了它)——
-  因为测试直接调 `run_mining`,不走 CLI,曾漏掉一个参数导致启动即失败
+  因为其他测试直接调 `run_mining` 不走 CLI,曾漏掉一个参数导致启动即失败
+- **所有性能判断以实测为准。** 这个项目里已经猜错过三次(分块粒度、CPU 相对 GPU 的倍率、
+  面板缓存失效),每次都是拿局部或简单负载外推整体
+- 停掉正在跑的长任务前先问用户 —— 那可能是十几个小时的计算
