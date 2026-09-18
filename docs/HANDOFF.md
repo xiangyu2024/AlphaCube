@@ -5,20 +5,32 @@
 
 ---
 
-## 0. 现在的状态(2026-09-19 03:50)
+## 0. 现在的状态(2026-09-19 06:00)
 
-**一个全市场挖掘任务正在跑**,别动它,除非你有理由停。
+**没有任务在跑。数据盘卡死,先别往 `/root/autodl-tmp` 写任何东西(包括 rsync)。**
 
-```
-run-id   gpu9              screen 会话 gpu9(任务)+ gpu9rep(每 5 分钟快照 -> gpu9_report.log,带 anon 内存)
-pid      332647            03:44 启动(scripts/gpu9.sh)
-配置     20 代 = 4 块 x 5 代,全市场 5220 只 x 20180102~20251231,seed 0
-         池子上限 30、块结算前 120 条、最终入池前 60 条
-         开局 --ban 12 个结构:gpu5 两块的 6 个 + gpu7 第 1 块 3 个 + gpu8 第 1 块 3 个
-         (day_ar1_coefficient(Volume)、day_ar1_coefficient(Ret)、in_cov(Ret,Close)|w30)
-         --ban-rank-corr 0.95,样本 = gpu5 第 10 代 + gpu7 第 7 代 + gpu8 第 8 代 archive 中含这 12 个键的 295 条
-代码     commit a30d06f(逐元素 Python 循环的算子退出搜索)
-```
+- 数据盘 `/dev/md0`(3 块 NVMe 的 RAID5,挂在 `/root/autodl-tmp`)在做例行一致性校验,卡在 79.9% 不动
+  (`sync_completed` 不增长),`array_state` 停在 `write-pending` —— **所有写入都挂在内核的 `md_write_start`**,
+  读正常。约 09-19 05:41 开始。恢复与否只读检查:`cat /sys/block/md0/md/array_state`(正常应是 clean/active)、
+  `cat /proc/mdstat`。停校验(`echo idle > /sys/block/md0/md/sync_action`)是系统设置,不在授权内,由用户/AutoDL 决定。
+- **gpu9 已按用户要求停止**:SIGINT 已发出但挂起(进程处于 D 状态,信号要等写入返回才生效);阵列一恢复它就会
+  干净退出并清掉 `tmp/` 里的边界文件。若届时 `ps -p 332647` 还在,再 `kill -INT` 一次。
+- **表达式都在**:服务器 `mining_runs/*/checkpoints/` 未受影响(只读可取);**本地已全量备份**到
+  `~/Desktop/AlphaCube/mining_runs/`(gpu2~gpu9 全部 checkpoint + 运行日志 `logs/`,git 忽略),合并去重表
+  `mining_runs/全部因子表达式.csv`:1922 条,修复后 run(gpu4~gpu9)1314 条,标了出处、核心结构、是否已封(18 个)、
+  是否含已移出搜索的漏洞算子,以及算过扣成本回测的 51 条。
+- 本文件的这次更新**还没同步到服务器**(等阵列恢复);代码自 a30d06f 起两边一致。
+
+**gpu9(12 结构封禁 + rank 封禁)的结果**,池子 30,样本外 = 后 30% 交易日:
+- 第 1 块:头名 `day_max(Ret)`(日内最大分钟收益,彩票效应,|IC| 0.0219)被几十种单调改写占满 archive;
+  融合扣 15bp 全负(equal −0.31 最好),限换手 30% 最好 0.73。
+- **第 2 块:扣费后首次稳定为正** —— ic 加权 +1.50(日换手 32~34%),等权 +1.03~1.05;累计 1~2 块限换手 lstsq 1.68、
+  ic 1.63;树模型仍为负(−1.9~−5.5)。第 2 块头名是 `day_kurt(Ret)` 族,但 **IC 为正而 rank IC 与夏普为负**
+  (`pow_2(峰度)` 放大尾部,少数极端值撑起 Pearson IC)。
+- 结束时封禁累计 18 个结构、rank 样本 225 个。
+
+**待用户决定**(都提过,未动):① 换手纳入选择(适应度扣换手 / 池子只收低换手 / 组合后平滑);
+② 适应度改用 rank IC(防上面那种尾部撑起的 IC);③ archive 内部按 rank 相关去重(防头名被改写占满)。
 
 **gpu8 已停**(用户批准,03:43):第 9 代卡死 —— 一棵树用了 `in_mask_nearby_ones`(为 1/NaN 掩码写的,
 对每个有限格点 Python 循环 + 两次 `.item()`),每块 7 分钟,89 分钟只跑 2%,ETA 77 小时。现在由注册表构建时的
