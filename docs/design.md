@@ -104,6 +104,9 @@ float 往返"一致;需要布尔掩码的核函数(参数名 `mask`/`*_mask`)在
 - NT 两族:与逐日在 `(M, S)` 面上调核**逐 bit 相同**(含跨列混合的 `nt_ts_spearman`)。
 - ND 面:与直接在 `(D, S)` 上调核**逐 bit 相同**。
 - 任意分块大小、任意轮次结构(含 S→D→S 落盘)结果**逐 bit 不变**;150 棵随机文法树上锁定。
+  **这一条只在 CPU 上成立。** CUDA 按张量形状选归约路径,块的行数一变,`day_sum`/`day_mean` 就有
+  ULP 级差异(实测 10~15% 的格点,相对 ~3e-7);对"舍入噪声过阈值"的核函数(`day_durbin_watson`
+  的 `E[x²]-E[x]² < 1e-8`)会翻 NaN。选择类(`day_max`)不受影响。见 HANDOFF §8。
 - 跨设备(CPU/CUDA/MPS)不承诺逐 bit,但承诺三件事(tests/test_device_parity.py,有加速器才跑):
   **没有算子只在加速器上失败**(设备错配、`.numpy()`、漏 `device=` 都表现为此)、
   **有限/NaN 版图不变**、**选择类算子**(`day_last` / `day_first` / `day_max` / `in_expand`,
