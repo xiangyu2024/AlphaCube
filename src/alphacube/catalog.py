@@ -220,6 +220,61 @@ def _probe_constant_capable(fn: Callable, category: str, restores: bool) -> bool
     return False
 
 
+def _probe_per_element_python(fn: Callable, category: str, restores: bool) -> bool:
+    """Does the kernel do Python-level work per element of its input?
+
+    Counted, not timed: the Python lines executed inside ``alphacube.operators``
+    while the kernel runs on a 16 x 48 input, then on 4x the rows and on 4x the
+    columns. A vectorised kernel runs the same lines whatever the size; one that
+    loops in Python runs ~4x more. Deterministic and machine-independent, so the
+    search vocabulary cannot drift with the host's speed.
+
+    Why it matters: a DT kernel sees ~8M stock-day-minute cells per chunk on the
+    production cube. ``in_mask_nearby_ones`` -- written for 1/NaN masks -- loops
+    over every finite cell with two ``.item()`` syncs, so on a float panel one
+    chunk took ~7 minutes instead of ~1 second; one tree using it froze gpu8's
+    generation 9 at 2% after 89 minutes, ETA 77 hours. Such kernels stay
+    callable by name (research, the legacy corpus) but leave the search -- except
+    on the ND face, whose kernels run once per panel (see ``_make_spec``)."""
+    import sys
+
+    def lines(rows: int, cols: int) -> int:
+        g = torch.Generator().manual_seed(5)
+        x = torch.rand((rows, cols), generator=g) + 0.5
+        y = torch.rand((rows, cols), generator=g) + 0.5
+        if restores:
+            x = x[:, :1]
+        n = [0]
+
+        def tracer(frame, event, arg):
+            if "alphacube" in frame.f_code.co_filename and "operators" in frame.f_code.co_filename:
+                if event == "line":
+                    n[0] += 1
+                return tracer
+            return tracer if event == "call" else None
+
+        previous = sys.gettrace()
+        sys.settrace(tracer)
+        try:
+            with torch.no_grad():
+                if category == "unary":
+                    fn(x)
+                elif category == "binary":
+                    fn(x, y)
+                elif category == "rolling":
+                    fn(x, 5)
+                else:
+                    fn(x, y, 5)
+        except Exception:                                    # noqa: BLE001 - counted either way
+            pass
+        finally:
+            sys.settrace(previous)
+        return n[0]
+
+    small = lines(16, 48)
+    return lines(64, 48) > 2 * small + 20 or lines(16, 192) > 2 * small + 20
+
+
 def _probe_distinct_values(fn: Callable, category: str, reduces: bool, restores: bool) -> int:
     """Distinct finite output values on a random normal panel (rows 40, cols 9)."""
     g = torch.Generator().manual_seed(7)
@@ -337,7 +392,12 @@ def _make_spec(name: str, face: str, family: str, category: str, meta: dict,
         lookahead=(kernel_id.split(".")[-1] in LOOKAHEAD_KERNELS),
         boolean_output=(distinct <= 2), coarse_output=(2 < distinct <= 3),
         trivial_boolean=(distinct <= 2 and _probe_constant_capable(fn, category, restores)),
-        resource_risk=(name in SEARCH_FORBIDDEN_KERNELS or name in POSITIONALLY_UNSAFE_KERNELS),
+        # ND kernels run once over the whole (D, S) panel, so a Python loop over its
+        # 5219 stocks costs seconds (ts_spearman, kept on purpose -- see
+        # test_only_the_nt_face_pair_kernels_leave_the_action_set). Every other face
+        # runs per chunk of millions of stock-day-minutes or once per day.
+        resource_risk=(name in SEARCH_FORBIDDEN_KERNELS or name in POSITIONALLY_UNSAFE_KERNELS
+                       or (face != "nd" and _probe_per_element_python(fn, category, restores))),
         windows=WINDOWS.get(face, ()),
     )
 

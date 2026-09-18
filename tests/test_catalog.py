@@ -61,3 +61,32 @@ def test_boolean_outputs_are_non_root(registry):
 
 def test_lookahead_kernels_constant():
     assert LOOKAHEAD_KERNELS == {"ts_shift", "cross_shift", "in_local_mean"}
+
+
+def test_per_element_python_kernels_leave_the_search():
+    """A kernel that loops in Python over its input's elements is fine on a toy
+    panel and fatal on the production cube: in_mask_nearby_ones loops over every
+    finite cell with two .item() syncs, and one tree using it froze gpu8's
+    generation 9 at 2% after 89 minutes (ETA 77 hours). The probe counts Python
+    lines, not seconds, so the verdict is the same on any machine and on every
+    build; the kernels stay callable by name."""
+    import sys
+
+    from alphacube.catalog import build_registry
+
+    marker = lambda *a: None                                # noqa: E731 - someone else's tracer
+    sys.settrace(marker)
+    try:
+        a = build_registry()
+        assert sys.gettrace() is marker, "the probe must hand back the tracer it found"
+    finally:
+        sys.settrace(None)
+    b = build_registry()
+    flagged = lambda r: {s.name for s in r.list_all() if s.resource_risk}   # noqa: E731
+    assert flagged(a) == flagged(b)
+    assert "in_mask_nearby_ones" in flagged(a)
+    # ND kernels run once per panel, so a loop over stocks is affordable there
+    assert not {"in_mean_rolling", "day_mean", "ts_mean", "cs_rank", "cross_mean", "ts_pearson",
+                "ts_spearman"} & flagged(a)
+    searchable = {s.name for s in a.searchable(include_boolean=False, include_resource_risk=False)}
+    assert "in_mask_nearby_ones" not in searchable and "in_mask_nearby_ones" in {s.name for s in a.list_all()}
