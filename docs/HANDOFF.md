@@ -5,19 +5,28 @@
 
 ---
 
-## 0. 现在的状态(2026-09-18 23:30)
+## 0. 现在的状态(2026-09-19 00:40)
 
 **一个全市场挖掘任务正在跑**,别动它,除非你有理由停。
 
 ```
-run-id   gpu7              screen 会话 gpu7(任务)+ gpu7rep(每 5 分钟快照 -> gpu7_report.log,带 anon 内存)
-pid      306834            23:20 启动(scripts/gpu7.sh)
+run-id   gpu8              screen 会话 gpu8(任务)+ gpu8rep(每 5 分钟快照 -> gpu8_report.log,带 anon 内存)
+pid      313998            00:34 启动(scripts/gpu8.sh)
 配置     20 代 = 4 块 x 5 代,全市场 5220 只 x 20180102~20251231,seed 0
-         池子上限 30、块结算前 120 条、最终入池前 60 条(用户:设上限,选不会爆的版本)
-         开局即 --ban 6 个结构 = gpu5 前两块封掉的:log(Amt)、nt_ts_argmax(High)|w3、cross_decay_linear(Amt)|w3、
-         day_ar1_coefficient(High)、day_ar1_coefficient(Close)、day_durbin_watson(Close)
-代码     commit 8f5ca07 启动;组合层 NaN 修复(7e50681)在第 1 块之前同步 —— post_combine 是懒导入,会用上新版
+         池子上限 30、块结算前 120 条、最终入池前 60 条
+         开局 --ban 9 个结构:gpu5 两块的 6 个 + gpu7 第 1 块的 nt_ts_kurt(Vwap)|w30、pow_1_5(Amt)、day_max(Amt)
+         --ban-rank-corr 0.95:和被封结构的因子样本 |rank 相关| >= 0.95 的候选一律拒绝(用户定的口径)
+         样本 = gpu5 第 10 代 + gpu7 第 7 代 archive 中含这 9 个键的 206 条(--ban-archive),启动时先求值
+代码     commit 29e2559
 ```
+
+**为什么有 rank 封禁**:gpu7 第 1 块证明按一层结构封禁能被单调改写绕过 —— `log(Amt)` 封了,
+GP 写成 `log(pow_1_5(Amt))`、`pow_05(pow_05(day_max(Amt)))`,日截面排名与 `day_max(log(Amt))` 逐位相同。
+rank 相关对任何单调改写(含反号)恰为 1.0。生成日志每代多 `similar`(本代被拒数)与 `exemplars`(样本数)。
+
+**gpu7 已停**(用户批准,00:33,第 7 代后):第 1 块报告 —— 头部 10 条只是 2 个因子:日内 Vwap 峰度
+(`nt_ts_kurt(Vwap, 30)` 族,IC 0.031~0.032,日换手 81~89%,扣费夏普 −9.5~−18.6)与换写法回来的 `day_max(Amt)`;
+融合回测扣 15bp 后只有 equal 为正(+0.24),限换手 30% 时 equal/ic/icir/lstsq/ridge 约 1.0~1.25,树模型为负。
 
 **内存:容器上限 90 GiB(`/sys/fs/cgroup/memory.max`),不是 `free` 显示的 754 GB。** `ps` 的 RSS 含 mmap 数据文件页
 (可回收,gpu7 启动 5 分钟 RSS 71.9 GB 而 anon 只有 19.8 GB),判断要看 `memory.stat` 的 `anon`。
@@ -98,13 +107,13 @@ ssh -o BatchMode=yes -o ControlPath=none -p 29982 root@connect.westd.seetacloud.
 
 ```bash
 ssh -o BatchMode=yes -o ControlPath=none -p 29982 root@connect.westd.seetacloud.com \
-  'cd /root/autodl-tmp/AlphaCube && for f in "" _report; do cp scripts/gpu7$f.sh scripts/gpu8$f.sh;
-   sed -i s/gpu7/gpu8/g scripts/gpu8$f.sh; done &&
-   screen -dmS gpu8 bash -c "./scripts/gpu8.sh > gpu8_run.log 2>&1" &&
-   screen -dmS gpu8rep bash -c "./scripts/gpu8_report.sh"'
+  'cd /root/autodl-tmp/AlphaCube && for f in "" _report; do cp scripts/gpu8$f.sh scripts/gpu9$f.sh;
+   sed -i s/gpu8/gpu9/g scripts/gpu9$f.sh; done &&
+   screen -dmS gpu9 bash -c "./scripts/gpu9.sh > gpu9_run.log 2>&1" &&
+   screen -dmS gpu9rep bash -c "./scripts/gpu9_report.sh"'
 ```
 
-`scripts/gpu7.sh` 是当前配置的样板(只在服务器上,不在 git 里),改参数复用。**脚本里写死了
+`scripts/gpu8.sh` 是当前配置的样板(只在服务器上,不在 git 里),改参数复用。**脚本里写死了
 `--run-id`**:直接拿旧脚本起新任务会写进旧的 `mining_runs/<id>`,所以先复制再改名(上面那条命令就是)。
 **长任务一律用 `screen`** —— 它与 ssh 连接无关,断网、关机、退出 IDE 都不影响。`nohup` 不够可靠,试过。
 停任务用 `kill -INT <pid>`:KeyboardInterrupt 会走引擎的 `finally`,落盘临时目录会被清掉
@@ -145,8 +154,8 @@ ssh -o BatchMode=yes -o ControlPath=none -p 29982 root@connect.westd.seetacloud.
 ```bash
 S='ssh -o BatchMode=yes -o ControlPath=none -p 29982 root@connect.westd.seetacloud.com'
 
-$S 'cd /root/autodl-tmp/AlphaCube && tail -20 gpu7_run.log'            # 进度
-$S 'cd /root/autodl-tmp/AlphaCube && ls mining_runs/gpu7/checkpoints'  # 每代产物
+$S 'cd /root/autodl-tmp/AlphaCube && tail -20 gpu8_run.log'            # 进度
+$S 'cd /root/autodl-tmp/AlphaCube && ls mining_runs/gpu8/checkpoints'  # 每代产物
 $S 'ps -eo pid,etime,pcpu,rss,args | grep "[c]li mine"'                # 活没活着
 $S 'nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv'   # GPU
 $S 'df -h / /root/autodl-tmp'                                          # 磁盘(系统盘必看)
