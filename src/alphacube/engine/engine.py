@@ -145,6 +145,13 @@ class CubeEngine:
         S, D = self.view.n_symbols, self.view.n_days
         panels: Dict[str, np.ndarray] = {}          # key -> (S, D) float32
         bounds: Dict[str, np.memmap] = {}           # key -> (S, D, M) memmap
+        # Boundaries are new mappings every call, so the advice they were given
+        # must not outlive the call: keyed by node, a key whose boundary ended the
+        # previous call in a D round was taken as already advised, and its fresh
+        # file was read strided with full read-ahead -- gpu11's second call ran
+        # its D round at 95 days a minute on that one file ("rr" missing from its
+        # VmFlags in /proc/<pid>/smaps while the other three had it).
+        self._bound_advice = {}
         tmp = None
         if plan.boundaries:
             tmp = tempfile.TemporaryDirectory(dir=self.workdir, prefix="alphacube_")

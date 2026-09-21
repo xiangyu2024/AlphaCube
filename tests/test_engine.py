@@ -303,3 +303,20 @@ def test_boundary_reads_and_writes_follow_the_access_pattern(view, monkeypatch):
     assert calls == [False, True], "one syscall per pattern change, not per chunk"
     plain = CubeEngine(view, chunk_symbols=3, chunk_days=5).evaluate([e])
     assert np.array_equal(res.panels[0], plain.panels[0], equal_nan=True)
+
+    # Every call makes NEW boundary files, so every call must advise them afresh.
+    # It did not: advice was remembered per node key, so a boundary written in a D
+    # round and last read in a D round (D -> S -> D below) came back in the next
+    # call as "already advised" and its fresh file was written and read strided
+    # with full read-ahead -- gpu11's second engine call ran its D round at 95
+    # days a minute on that one file, the one mapping without "rr" in its VmFlags.
+    dsd = parse("day_last(nt_cs_rank(add(nt_cs_rank(Close), cross_mean(nt_cs_rank(Open), 3))))")
+    eng = CubeEngine(view, chunk_symbols=3, chunk_days=5)
+    assert [r.mode for r in eng.plan([dsd]).rounds] == [MODE_D, MODE_S, MODE_D]
+    calls.clear()
+    first = eng.evaluate([dsd])
+    c1 = list(calls)
+    calls.clear()
+    second = eng.evaluate([dsd])
+    assert c1.count(True) == 3 and calls == c1, (c1, calls)
+    assert np.array_equal(first.panels[0], second.panels[0], equal_nan=True)
