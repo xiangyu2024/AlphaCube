@@ -151,13 +151,20 @@ class CubeStore:
             block = mirror[d0:d1]                                     # (d, S, M)
             block = block[:, rows, :] if not isinstance(rows, slice) else block[:, rows, :]
             return np.ascontiguousarray(np.transpose(np.asarray(block, dtype=np.float32), (1, 0, 2)))
+        arr = self.advised_field(name, strided)
+        return np.array(arr[rows, d0:d1, :], dtype=np.float32, copy=True)
+
+    def advised_field(self, name: str, strided: bool) -> np.ndarray:
+        """``field(name)`` with the kernel told how it is about to be read.
+        Read-ahead is worth its cost only on the contiguous pattern; on the strided
+        one it multiplied the bytes off the disk by ~350 (``advise_access``). Every
+        reader of a field must come through here -- ``SegmentedCubeStore`` reads
+        its segments' fields directly, and for a day it did not."""
         arr = self.field(name)
-        # Read-ahead is worth its cost only on the contiguous pattern; on the
-        # strided one it multiplied the bytes off the disk by ~200 (advise_access).
         if self._advised.get(name) is not strided:
             advise_access(arr, random=strided)
             self._advised[name] = strided
-        return np.array(arr[rows, d0:d1, :], dtype=np.float32, copy=True)
+        return arr
 
     def read_status(self, rows, d0: int, d1: int) -> np.ndarray:
         return np.array(self.day_status()[rows, d0:d1], dtype=np.int8, copy=True)
@@ -321,8 +328,13 @@ class SegmentedCubeStore:
         n_rows = len(range(self.n_symbols)[rows]) if isinstance(rows, slice) else len(rows)
         out = np.empty((n_rows, d1 - d0, self.n_minutes), dtype=np.float32)
         covered = np.zeros((n_rows, d1 - d0), dtype=bool)
+        # The same pattern test as CubeStore.read_cube. This reader used to take
+        # store.field() directly and so skipped the advice altogether: gpu12's
+        # third-block rebuild ran its D round at 5 days a minute, 987 MB/s off the
+        # disk, with no "rr" on any of the eight field mappings.
+        strided = (d1 - d0) * 4 <= n_rows
         for store, out_ix, src_ix in self._pieces(rows, d0, d1):
-            out[out_ix] = store.field(name)[src_ix]
+            out[out_ix] = store.advised_field(name, strided)[src_ix]
             covered[out_ix] = True
         if not covered.all():
             out[~covered] = np.nan

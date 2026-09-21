@@ -195,3 +195,28 @@ def test_segmented_contiguous_reads_are_stripe_copies(layouts, monkeypatch):
     seg.read_cube("Close", slice(0, 10), 40, 50)         # NEW.1 is absent from segment A
     assert len(keys) == 6
     assert all(isinstance(k, slice) for key in keys for k in key), keys
+
+
+def test_segmented_reads_advise_every_segment_they_touch(layouts, monkeypatch):
+    """SegmentedCubeStore reads its segments' fields directly, so the read-ahead
+    advice CubeStore.read_cube gives never reached them -- and the production
+    store IS segmented. gpu12's third-block rebuild ran its D round at 5 days a
+    minute, 987 MB/s off the disk, with no "rr" on any field mapping in
+    /proc/<pid>/smaps (the boundary files had it)."""
+    from alphacube import store as store_mod
+
+    mono, comp, cubes, status = layouts
+    seg = SegmentedCubeStore(comp)
+    calls = []
+    real = store_mod.advise_access
+    monkeypatch.setattr(store_mod, "advise_access",
+                        lambda arr, random: calls.append((id(arr), bool(random))) or real(arr, random))
+    strided = seg.read_cube("Close", slice(0, 9), 29, 31)       # 9 symbols x 2 days, base + segment A
+    assert [r for _, r in calls] == [True, True] and len({a for a, _ in calls}) == 2, calls
+    calls.clear()
+    seg.read_cube("Close", slice(0, 9), 27, 29)                 # same pattern, base only: already advised
+    assert calls == []
+    contiguous = seg.read_cube("Close", slice(0, 2), 0, 50)     # 2 symbols x all days: every segment
+    assert [r for _, r in calls] == [False, False, False], calls
+    assert np.array_equal(strided, mono.read_cube("Close", slice(0, 9), 29, 31), equal_nan=True)
+    assert np.array_equal(contiguous, mono.read_cube("Close", slice(0, 2), 0, 50), equal_nan=True)
