@@ -279,3 +279,27 @@ def test_kernels_never_write_into_operands(registry, tmp_path_factory, monkeypat
     res = E.CubeEngine(st.view(), chunk_symbols=2, chunk_days=11).evaluate(exprs, tolerant=True)
     assert len(exprs) == len(registry) and not res.errors
     assert not dirty, f"kernels that wrote into an operand: {sorted(set(dirty))}"
+
+
+def test_boundary_reads_and_writes_follow_the_access_pattern(view, monkeypatch):
+    """A boundary file is (S, D, M) like the store, so the D round reads (and
+    writes) it in the same strided way -- 9.8 GB of it per boundary on the
+    production cube -- and read-ahead is the same waste there. The advice must
+    reach it, and follow the round's pattern: contiguous in an S round, random in
+    a D round. Values may not change either way."""
+    from alphacube.engine import engine as engine_mod
+
+    calls = []
+    real = engine_mod.advise_access
+    monkeypatch.setattr(engine_mod, "advise_access",
+                        lambda arr, random: calls.append(bool(random)) or real(arr, random))
+
+    e = parse("day_last(nt_cs_rank(cross_mean(Close, 3)))")   # S round -> boundary -> D round
+    eng = CubeEngine(view, chunk_symbols=3, chunk_days=5)
+    assert [r.mode for r in eng.plan([e]).rounds] == [MODE_S, MODE_D]
+    res = eng.evaluate([e])
+    assert calls[0] is False, "the S round writes the boundary contiguously"
+    assert True in calls, "the D round reads it strided"
+    assert calls == [False, True], "one syscall per pattern change, not per chunk"
+    plain = CubeEngine(view, chunk_symbols=3, chunk_days=5).evaluate([e])
+    assert np.array_equal(res.panels[0], plain.panels[0], equal_nan=True)

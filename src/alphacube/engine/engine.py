@@ -30,7 +30,7 @@ import torch
 
 from ..axes import MODE_D, MODE_P, MODE_S
 from ..expression import Constant, Expression, Feature
-from ..store import CubeView
+from ..store import CubeView, advise_access
 from .dag import Dag, Node
 from .kernels import apply_cube, apply_panel
 from .schedule import Plan, Round, plan_rounds
@@ -108,6 +108,7 @@ class CubeEngine:
         self.workdir = Path(workdir) if workdir is not None else default_workdir()
         if torch_threads is not None:
             torch.set_num_threads(int(torch_threads))
+        self._bound_advice: Dict[str, bool] = {}     # boundary key -> last access advice given
         self._tradable = torch.from_numpy(view.tradable()).to(self.device)   # (S, D) bool
         self._mask_needed = self.apply_mask and not bool(view.tradable().all())
 
@@ -224,8 +225,17 @@ class CubeEngine:
 
     def _bound_slice(self, key: str, bounds: Dict[str, np.memmap], mode: str, lo: int, hi: int) -> torch.Tensor:
         b = bounds[key]
+        # A boundary is (S, D, M) like the store, so a D-round slice of it is the
+        # same strided crumb-per-stride read, and read-ahead the same waste.
+        self._advise_bound(key, b, mode)
         sl = b[lo:hi] if mode == MODE_S else b[:, lo:hi]
         return torch.from_numpy(np.ascontiguousarray(sl)).to(self.device, self.dtype)
+
+    def _advise_bound(self, key: str, b: np.memmap, mode: str) -> None:
+        strided = mode != MODE_S
+        if self._bound_advice.get(key) is not strided:
+            advise_access(b, random=strided)
+            self._bound_advice[key] = strided
 
     def _run_cube_chunk(self, rnd: Round, lo: int, hi: int, panels, bounds, tmp, tolerant: bool) -> None:
         mode = rnd.mode
@@ -301,6 +311,7 @@ class CubeEngine:
                     path = Path(tmp.name) / f"bound_{len(bounds):04d}.npy"
                     b = bounds[n.key] = np.lib.format.open_memmap(path, mode="w+", dtype=self.np_dtype,
                                                                    shape=(S, D, int(arr.shape[-1])))
+                self._advise_bound(n.key, b, mode)      # a strided write faults its pages in too
                 if mode == MODE_S:
                     b[lo:hi] = arr
                 else:

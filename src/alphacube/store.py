@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import mmap
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
@@ -53,6 +54,38 @@ def canonical_hash(payload: object) -> str:
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
+_ADVICE = {True: getattr(mmap, "MADV_RANDOM", None), False: getattr(mmap, "MADV_NORMAL", None)}
+
+
+def advise_access(arr, random: bool) -> bool:
+    """Tell the kernel how a memmap is about to be read, and whether it was told.
+
+    A cube is ``(S, D, M)``, so a read of many symbols over few days -- the D
+    round's pattern, and every boundary read in it -- takes ~1 KB out of every
+    1.9 MB. The kernel's read-ahead then fetches whole windows around each of
+    those crumbs: measured on the production store (9.8 GB field, 6 days x 5207
+    symbols, cold ranges) it read 5649 MB for the 28.7 MB actually wanted --
+    197x -- in 6.9 s, against 13 MB in 0.37 s with MADV_RANDOM. Extrapolated
+    over 1942 days that is 37 minutes a field against 2. It is what made gpu10's
+    first D round crawl at 3 days a minute.
+
+    Contiguous reads must keep read-ahead: the same slice read at 47 MB/s under
+    MADV_RANDOM, because every page then faults on its own.
+
+    A no-op (returning False) where the platform, numpy or the mapping does not
+    support it -- the advice is a performance hint, never a correctness one.
+    """
+    mm = getattr(arr, "_mmap", None)
+    flag = _ADVICE[bool(random)]
+    if mm is None or flag is None or not hasattr(mm, "madvise"):
+        return False
+    try:
+        mm.madvise(flag)
+    except (OSError, ValueError):                 # e.g. a mapping the kernel will not advise
+        return False
+    return True
+
+
 class CubeStore:
     def __init__(self, directory: PathLike) -> None:
         self.directory = Path(directory)
@@ -66,6 +99,7 @@ class CubeStore:
         self.dates: List[str] = [str(d) for d in (self.meta.get("dates") or range(self.n_days))]
         self._codes = {**DAY_STATUS_CODES, **self.meta.get("day_status_codes", {})}
         self._cache: Dict[str, np.ndarray] = {}
+        self._advised: Dict[str, bool] = {}          # field -> last access advice given
         self._mirror: Dict[str, np.ndarray] = {}
         self._status: Optional[np.ndarray] = None
         self.contract_hash = canonical_hash({"meta_sha256": sha256_file(self.directory / META_FILE)})
@@ -112,11 +146,18 @@ class CubeStore:
         """(len(rows), d1 - d0, M) float32 copy; ``rows`` is a slice or an index array."""
         mirror = self.mirror(name)
         n_rows = (rows.stop - rows.start) if isinstance(rows, slice) else len(rows)
-        if mirror is not None and (d1 - d0) * 4 <= n_rows:          # few days, many symbols: contiguous in the mirror
+        strided = (d1 - d0) * 4 <= n_rows                           # few days, many symbols
+        if mirror is not None and strided:                          # contiguous in the mirror
             block = mirror[d0:d1]                                     # (d, S, M)
             block = block[:, rows, :] if not isinstance(rows, slice) else block[:, rows, :]
             return np.ascontiguousarray(np.transpose(np.asarray(block, dtype=np.float32), (1, 0, 2)))
-        return np.array(self.field(name)[rows, d0:d1, :], dtype=np.float32, copy=True)
+        arr = self.field(name)
+        # Read-ahead is worth its cost only on the contiguous pattern; on the
+        # strided one it multiplied the bytes off the disk by ~200 (advise_access).
+        if self._advised.get(name) is not strided:
+            advise_access(arr, random=strided)
+            self._advised[name] = strided
+        return np.array(arr[rows, d0:d1, :], dtype=np.float32, copy=True)
 
     def read_status(self, rows, d0: int, d1: int) -> np.ndarray:
         return np.array(self.day_status()[rows, d0:d1], dtype=np.int8, copy=True)
@@ -438,5 +479,5 @@ def write_segment(compute_root: PathLike, relative_path: str, cubes: Dict[str, n
 
 
 __all__ = ["CubeStore", "SegmentedCubeStore", "CubeView", "open_cube_store", "build_cube_store",
-           "build_d_major_mirror", "write_segment", "DAY_STATUS_CODES", "TRADABLE_CODES", "INDEX_SCHEMA_VERSION",
+           "advise_access", "build_d_major_mirror", "write_segment", "DAY_STATUS_CODES", "TRADABLE_CODES", "INDEX_SCHEMA_VERSION",
            "sha256_file", "canonical_hash"]
