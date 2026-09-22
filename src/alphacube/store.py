@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import mmap
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +40,7 @@ PathLike = Union[str, Path]
 DAY_STATUS_CODES = {"OUTSIDE_LIFECYCLE": 0, "TRADING": 1, "RESUMED": 2, "SUSPENDED": 3}
 TRADABLE_CODES = (DAY_STATUS_CODES["TRADING"], DAY_STATUS_CODES["RESUMED"])
 META_FILE = "dt_meta.json"
+MIRROR_META_FILE = "mirror_meta.json"      # an external D-major mirror's own meta
 INDEX_SCHEMA_VERSION = "qmt-v2-fast-factor-segment-index-1"
 
 
@@ -87,8 +89,12 @@ def advise_access(arr, random: bool) -> bool:
 
 
 class CubeStore:
-    def __init__(self, directory: PathLike) -> None:
+    def __init__(self, directory: PathLike, mirror_dir: Optional[PathLike] = None) -> None:
         self.directory = Path(directory)
+        # Where to look for a D-major mirror when the store's own meta lists none --
+        # a directory of our own, since the production store is read-only.
+        self.mirror_dir = Path(mirror_dir) if mirror_dir else None
+        self._mirror_src: Optional[Tuple[Path, Dict[str, str]]] = None
         with open(self.directory / META_FILE, "r", encoding="utf-8") as f:
             self.meta = json.load(f)
         self.fields: List[str] = list(self.meta["fields"])
@@ -102,7 +108,8 @@ class CubeStore:
         self._advised: Dict[str, bool] = {}          # field -> last access advice given
         self._mirror: Dict[str, np.ndarray] = {}
         self._status: Optional[np.ndarray] = None
-        self.contract_hash = canonical_hash({"meta_sha256": sha256_file(self.directory / META_FILE)})
+        self.meta_sha256 = sha256_file(self.directory / META_FILE)
+        self.contract_hash = canonical_hash({"meta_sha256": self.meta_sha256})
 
     # -- raw access ---------------------------------------------------------------------
     def field(self, name: str) -> np.ndarray:
@@ -115,13 +122,28 @@ class CubeStore:
             self._cache[name] = arr
         return self._cache[name]
 
+    def _mirror_files(self) -> Tuple[Path, Dict[str, str]]:
+        """(directory, {field: file}) of this store's D-major mirror: the files its
+        own meta lists, else an external mirror built for exactly this store (its
+        ``mirror_meta.json`` names the sha256 of this store's meta -- a mirror of an
+        older or different store is never read)."""
+        if self._mirror_src is None:
+            files = dict(self.meta.get("d_major_files", {}))
+            root = self.directory
+            if not files and self.mirror_dir is not None and (self.mirror_dir / MIRROR_META_FILE).is_file():
+                mm = json.loads((self.mirror_dir / MIRROR_META_FILE).read_text(encoding="utf-8"))
+                if mm.get("source_meta_sha256") == self.meta_sha256:
+                    root, files = self.mirror_dir, dict(mm.get("files", {}))
+            self._mirror_src = (root, files)
+        return self._mirror_src
+
     def mirror(self, name: str) -> Optional[np.ndarray]:
         """(D, S, M) D-major mirror of ``name`` if one was built, else None."""
-        files = self.meta.get("d_major_files", {})
+        root, files = self._mirror_files()
         if name not in files:
             return None
         if name not in self._mirror:
-            arr = np.load(self.directory / files[name], mmap_mode="r")
+            arr = np.load(root / files[name], mmap_mode="r")
             if arr.shape != (self.n_days, self.n_symbols, self.n_minutes):
                 raise ValueError(f"mirror {name}: shape {arr.shape} != meta")
             self._mirror[name] = arr
@@ -241,9 +263,14 @@ def _outer(rows: np.ndarray, days: np.ndarray):
 class SegmentedCubeStore:
     """History base ``<root>/minute`` + segments ``<root>/incremental/<rel>/minute``."""
 
-    def __init__(self, compute_root: PathLike, include_segments: bool = True) -> None:
+    def __init__(self, compute_root: PathLike, include_segments: bool = True,
+                 mirror_root: Optional[PathLike] = None) -> None:
         self.compute_root = Path(compute_root)
-        base = CubeStore(self.compute_root / "minute")
+        # D-major mirrors live under mirror_root at each source's own relative path
+        # (minute/, incremental/<rel>/minute/) -- see scripts/build_mirror.py.
+        self.mirror_root = Path(mirror_root) if mirror_root else None
+        mdir = (lambda rel: self.mirror_root / rel) if self.mirror_root else (lambda rel: None)
+        base = CubeStore(self.compute_root / "minute", mirror_dir=mdir("minute"))
         sources = [_Source(self.compute_root, base, tuple(base.dates), tuple(base.symbols), None)]
         index_path, index = _load_index(self.compute_root)
         seen = set(base.dates)
@@ -261,7 +288,7 @@ class SegmentedCubeStore:
                     raise ValueError(f"segment meta hash mismatch: {meta_path}")
                 if json.loads(meta_path.read_text(encoding="utf-8")).get("run_status") != "COMPLETE":
                     raise ValueError(f"segment is not COMPLETE: {meta_path}")
-                seg = CubeStore(root / "minute")
+                seg = CubeStore(root / "minute", mirror_dir=mdir(Path("incremental") / rel / "minute"))
                 if tuple(seg.dates) != tuple(map(str, entry.get("dates", []))):
                     raise ValueError(f"segment dates differ from index: {root}")
                 if seg.n_minutes != base.n_minutes or seg.fields != base.fields:
@@ -319,8 +346,9 @@ class SegmentedCubeStore:
             src_rows = self._sym_row[k][rows_g]
             out_rows = np.flatnonzero(src_rows >= 0)
             if out_rows.size:
-                yield (self._sources[k].store, _outer(out_rows, out_days),
-                       _outer(src_rows[out_rows], self._day_pos[d0:d1][out_days]))
+                s_rows, s_days = src_rows[out_rows], self._day_pos[d0:d1][out_days]
+                yield (self._sources[k].store, _outer(out_rows, out_days), _outer(s_rows, s_days),
+                       (s_rows, s_days))
 
     def read_cube(self, name: str, rows, d0: int, d1: int) -> np.ndarray:
         if name not in self.fields:
@@ -333,8 +361,16 @@ class SegmentedCubeStore:
         # third-block rebuild ran its D round at 5 days a minute, 987 MB/s off the
         # disk, with no "rr" on any of the eight field mappings.
         strided = (d1 - d0) * 4 <= n_rows
-        for store, out_ix, src_ix in self._pieces(rows, d0, d1):
-            out[out_ix] = store.advised_field(name, strided)[src_ix]
+        for store, out_ix, src_ix, (s_rows, s_days) in self._pieces(rows, d0, d1):
+            mirror = store.mirror(name) if strided else None
+            if mirror is not None:
+                # few days x many symbols: contiguous in the (D, S, M) mirror, where
+                # the same read of the (S, D, M) field takes ~1 KB per 1.9 MB stride
+                r, d = _run(s_rows), _run(s_days)
+                block = mirror[d, r] if isinstance(r, slice) or isinstance(d, slice) else mirror[np.ix_(d, r)]
+                out[out_ix] = np.transpose(block, (1, 0, 2))
+            else:
+                out[out_ix] = store.advised_field(name, strided)[src_ix]
             covered[out_ix] = True
         if not covered.all():
             out[~covered] = np.nan
@@ -343,7 +379,7 @@ class SegmentedCubeStore:
     def read_status(self, rows, d0: int, d1: int) -> np.ndarray:
         n_rows = len(range(self.n_symbols)[rows]) if isinstance(rows, slice) else len(rows)
         out = np.full((n_rows, d1 - d0), self._codes["OUTSIDE_LIFECYCLE"], dtype=np.int8)
-        for store, out_ix, src_ix in self._pieces(rows, d0, d1):
+        for store, out_ix, src_ix, _ in self._pieces(rows, d0, d1):
             out[out_ix] = np.asarray(store.day_status())[src_ix]
         return out
 
@@ -357,13 +393,14 @@ class SegmentedCubeStore:
     view = CubeStore.view
 
 
-def open_cube_store(path: PathLike, include_segments: bool = True):
+def open_cube_store(path: PathLike, include_segments: bool = True, mirror_root: Optional[PathLike] = None):
     """A compute root (``<root>/minute`` exists) opens as a SegmentedCubeStore, a
-    bare minute directory as a CubeStore."""
+    bare minute directory as a CubeStore. ``mirror_root``: where D-major mirrors
+    built by scripts/build_mirror.py live (the store itself may be read-only)."""
     p = Path(path)
     if (p / "minute" / META_FILE).is_file():
-        return SegmentedCubeStore(p, include_segments)
-    return CubeStore(p)
+        return SegmentedCubeStore(p, include_segments, mirror_root=mirror_root)
+    return CubeStore(p, mirror_dir=mirror_root)
 
 
 class CubeView:
@@ -446,27 +483,47 @@ def build_cube_store(out_dir: PathLike, cubes: Dict[str, np.ndarray], symbols: S
 
 
 def build_d_major_mirror(store: CubeStore, fields: Optional[Sequence[str]] = None,
-                         days_per_chunk: int = 64) -> CubeStore:
-    """Write ``dtfield_<name>.dmajor.npy`` (D, S, M) for each field and register
-    them in the meta; reads over many symbols and few days become contiguous.
-    Built in day chunks so peak memory is one chunk, not the whole cube."""
+                         days_per_chunk: int = 64, out_dir: Optional[PathLike] = None) -> CubeStore:
+    """Write ``dtfield_<name>.dmajor.npy`` (D, S, M) for each field; reads over
+    many symbols and few days become contiguous. Built in day chunks so peak
+    memory is one chunk, not the whole cube.
+
+    ``out_dir`` None: next to the fields, registered in the store's own meta.
+    Otherwise into ``out_dir`` -- for a store we may not write to -- with a
+    ``mirror_meta.json`` naming the sha256 of the store's meta, so the mirror is
+    only ever read for the store it was built from. Each file is written under a
+    temporary name and renamed when complete, and the meta comes last: an
+    interrupted build leaves nothing that would be read."""
     names = list(fields) if fields is not None else list(store.fields)
-    files = dict(store.meta.get("d_major_files", {}))
+    root = Path(out_dir) if out_dir is not None else store.directory
+    root.mkdir(parents=True, exist_ok=True)
+    files = {} if out_dir is not None else dict(store.meta.get("d_major_files", {}))
     for name in names:
         src = store.field(name)
-        path = store.directory / f"dtfield_{name}.dmajor.npy"
-        out = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32,
+        path = root / f"dtfield_{name}.dmajor.npy"
+        tmp = root / f"dtfield_{name}.dmajor.npy.tmp"
+        out = np.lib.format.open_memmap(tmp, mode="w+", dtype=np.float32,
                                         shape=(store.n_days, store.n_symbols, store.n_minutes))
         for lo in range(0, store.n_days, days_per_chunk):
             hi = min(lo + days_per_chunk, store.n_days)
             out[lo:hi] = np.transpose(np.asarray(src[:, lo:hi, :]), (1, 0, 2))
         out.flush()
         del out
+        os.replace(tmp, path)
         files[name] = path.name
-    store.meta["d_major_files"] = files
-    with open(store.directory / META_FILE, "w", encoding="utf-8") as f:
-        json.dump(store.meta, f, ensure_ascii=False)
+    if out_dir is not None:
+        (root / MIRROR_META_FILE).write_text(json.dumps({
+            "source": str(store.directory), "source_meta_sha256": store.meta_sha256, "files": files,
+            "shape": [store.n_days, store.n_symbols, store.n_minutes]}, ensure_ascii=False, indent=1),
+            encoding="utf-8")
+        store.mirror_dir = root
+    else:
+        store.meta["d_major_files"] = files
+        with open(store.directory / META_FILE, "w", encoding="utf-8") as f:
+            json.dump(store.meta, f, ensure_ascii=False)
+        store.meta_sha256 = sha256_file(store.directory / META_FILE)
     store._mirror.clear()
+    store._mirror_src = None
     return store
 
 

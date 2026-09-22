@@ -22,6 +22,7 @@ cd /root/autodl-tmp/AlphaCube || exit 1
 export PYTHONPATH=src
 exec /root/miniconda3/envs/quant/bin/python -u -m alphacube.cli mine \
   --store /root/autodl-tmp/qmt_daily_data/fast_factor_compute \
+  --mirror-root /root/autodl-tmp/AlphaCube/mirror \
   --start 20180102 --end 20251231 \
   --label open_vwap15 --horizon 1 \
   --miner gp --budget 1280 --population 64 --min-depth 2 --max-depth 5 \

@@ -220,3 +220,48 @@ def test_segmented_reads_advise_every_segment_they_touch(layouts, monkeypatch):
     assert [r for _, r in calls] == [False, False, False], calls
     assert np.array_equal(strided, mono.read_cube("Close", slice(0, 9), 29, 31), equal_nan=True)
     assert np.array_equal(contiguous, mono.read_cube("Close", slice(0, 2), 0, 50), equal_nan=True)
+
+
+def test_external_d_major_mirror_serves_the_segmented_strided_reads(layouts, tmp_path, monkeypatch):
+    """The production store is read-only, segmented, and has no D-major mirror, so
+    every D-round read takes ~1 KB out of each 1.9 MB stride of the (S, D, M)
+    fields -- the reason a D round ran 100 days a minute on gpu13 with the page
+    cache full. A mirror built into a directory of our own serves those reads from
+    contiguous (D, S, M) blocks: bit-identical, nothing written into the store,
+    and only ever for the store it was built from."""
+    from alphacube.engine.engine import CubeEngine
+    from alphacube.store import MIRROR_META_FILE
+
+    mono, comp, cubes, status = layouts
+    plain = SegmentedCubeStore(comp)
+    files_before = sorted(str(p.relative_to(comp)) for p in comp.rglob("*"))
+    mroot = tmp_path / "mirror"
+    for src in plain._sources:
+        build_d_major_mirror(src.store, out_dir=mroot / src.root.relative_to(comp) / "minute")
+    assert sorted(str(p.relative_to(comp)) for p in comp.rglob("*")) == files_before, "the store is read-only"
+    assert not list(mroot.rglob("*.tmp"))
+
+    seg = SegmentedCubeStore(comp, mirror_root=mroot)
+    assert all(s.store.mirror("Close") is not None for s in seg._sources)
+    fetched = []
+    for s in seg._sources:
+        real = s.store.advised_field
+        monkeypatch.setattr(s.store, "advised_field", lambda name, strided, _r=real: fetched.append(strided) or _r(name, strided))
+    reads = [("Close", slice(0, 9), 29, 31), ("Vwap", np.array([0, 3, 9, 4, 7]), 40, 42),
+             ("Ret", slice(0, 10), 25, 47), ("Close", slice(2, 6), 0, 30), ("High", np.array([8, 1]), 10, 50)]
+    for name, rows, d0, d1 in reads:
+        got, want = seg.read_cube(name, rows, d0, d1), plain.read_cube(name, rows, d0, d1)
+        assert np.array_equal(got, want, equal_nan=True), (name, rows, d0, d1)
+    assert fetched.count(True) == 0, "a strided read must come from the mirror, not the (S, D, M) field"
+    assert fetched.count(False) > 0, "contiguous reads still take the field itself"
+
+    # a mirror built for another store is never read
+    other = CubeStore(comp / "minute", mirror_dir=tmp_path / "wrong")
+    build_d_major_mirror(CubeStore(mono.directory), out_dir=tmp_path / "wrong")
+    assert (tmp_path / "wrong" / MIRROR_META_FILE).is_file() and other.mirror("Close") is None
+
+    view_m, view_p = seg.view(), plain.view()
+    for e in EXPRS:
+        a = CubeEngine(view_m, chunk_symbols=4, chunk_days=3).evaluate([parse(e)]).panels[0]
+        b = CubeEngine(view_p, chunk_symbols=4, chunk_days=3).evaluate([parse(e)]).panels[0]
+        assert np.array_equal(a, b, equal_nan=True), e

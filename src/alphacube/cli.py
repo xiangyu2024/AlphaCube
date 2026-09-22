@@ -133,6 +133,7 @@ def cmd_mine(a) -> int:
         max_expr_len=a.max_expr_len, combine_methods=tuple(x for x in a.combine.split(",") if x),
         combine_train_frac=a.combine_train_frac, out_root=a.out, run_id=a.run_id,
         smooth_halflives=tuple(float(x) for x in a.smooth_halflives.split(",") if x),
+        mirror_root=a.mirror_root,
     )
     return 0 if res.pool_size else 1
 
@@ -153,6 +154,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--store", required=True, help="cube store directory (V2 minute-store layout)")
+    common.add_argument("--mirror-root", default=None,
+                        help="D-major mirrors built by scripts/build_mirror.py (a store may be read-only); "
+                             "D rounds then read contiguous (D, S, M) blocks instead of strided (S, D, M) ones")
     common.add_argument("--start", default=None, help="YYYYMMDD, snaps to the first trading day >= it")
     common.add_argument("--end", default=None)
     common.add_argument("--max-symbols", type=int, default=None)

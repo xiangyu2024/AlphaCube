@@ -168,6 +168,7 @@ def run_mining(
     combine_methods: Sequence[str] = ("equal", "ic", "icir", "lstsq", "ridge", "gbdt"),
     combine_train_frac: float = 0.7,
     smooth_halflives: Sequence[float] = (),
+    mirror_root: Optional[Union[str, Path]] = None,
     out_root: Optional[Union[str, Path]] = None,
     run_id: Optional[str] = None,
     save_values: bool = True,
@@ -184,7 +185,7 @@ def run_mining(
     say = log or (lambda s: None)
     t0 = time.time()
     if not isinstance(store, (CubeStore, SegmentedCubeStore)):
-        store = open_cube_store(store)
+        store = open_cube_store(store, mirror_root=mirror_root)
     view, trim = warmed_view(store, start, end, warmup=warmup, symbols=symbols, max_symbols=max_symbols)
     lab = make_label(label, horizon, label_params)
     target, realized = lab.compute(view), lab.realized(view)
