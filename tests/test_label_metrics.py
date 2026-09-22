@@ -282,3 +282,13 @@ def test_ema_rows_is_causal_with_the_stated_half_life():
     y[20:] = -5.0
     assert np.array_equal(ema_rows(y, 4)[:20], s[:20], equal_nan=True), "the future does not move the past"
     assert np.array_equal(ema_rows(x, 0), x, equal_nan=True)
+
+
+def test_one_infinite_cell_does_not_erase_its_day():
+    """nanmean/nanstd take inf as a value, so a single -inf (log of a zero) made
+    a whole day's z-scores NaN. gpu12's third block pooled log(add(...)) factors
+    with a -inf on some stock every day and lost its entire test period: coverage
+    0 for every weighted combination, a constant signal for the trees."""
+    z = zscore_rows(np.array([[1.0, 2.0, 3.0, -np.inf], [np.inf, 5.0, 7.0, np.nan]]))
+    assert np.isnan(z[0, 3]) and np.allclose(z[0, :3], [-1.2247449, 0.0, 1.2247449])
+    assert np.isnan(z[1, 0]) and np.allclose(z[1, 1:3], [-1.0, 1.0]) and np.isnan(z[1, 3])

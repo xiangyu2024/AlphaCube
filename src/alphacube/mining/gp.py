@@ -52,6 +52,8 @@ FITNESS_KINDS = ("ic", "rank_ic")
 # The book every report trades -- top/bottom decile, equal weight, gross 1
 # (backtest_metrics' default) -- and so the one whose turnover the fitness charges.
 BOOK_TOP_FRAC = 0.1
+# Rank-ban exemplars per engine call (see GPMiner._add_exemplars).
+EXEMPLAR_BATCH = 150
 
 
 def cpu_quota(path: str = "/sys/fs/cgroup/cpu.max") -> Optional[int]:
@@ -282,7 +284,9 @@ class GPMiner:
             return False
         return any(n.spec is not None and n.spec.name in self.skip_kernels for n in expr.nodes())
 
-    def _panels(self, population: Sequence[Expression]) -> List[Optional[np.ndarray]]:
+    def _panels(self, population: Sequence[Expression], cache: bool = True) -> List[Optional[np.ndarray]]:
+        """Panels of ``population``, from the cache where resident. ``cache=False``
+        leaves newly evaluated panels out of the cache (panels needed once)."""
         out: List[Optional[np.ndarray]] = [None] * len(population)
         todo: Dict[str, List[int]] = {}
         for i, e in enumerate(population):
@@ -315,7 +319,8 @@ class GPMiner:
             for (k, idx), p in zip(todo.items(), res.panels):
                 if p is None:
                     continue
-                self._panel_cache[k] = p
+                if cache:
+                    self._panel_cache[k] = p
                 for i in idx:
                     out[i] = p
             while len(self._panel_cache) > self._panel_cache_items:
@@ -382,14 +387,24 @@ class GPMiner:
                     self.similar_refused += 1
         return fit
 
-    def _add_exemplars(self, exprs: Sequence[Expression]) -> int:
-        """Store the panels of ``exprs`` as rank-ban exemplars; how many were new."""
+    def _add_exemplars(self, exprs: Sequence[Expression], batch: int = EXEMPLAR_BATCH) -> int:
+        """Store the panels of ``exprs`` as rank-ban exemplars; how many were new.
+
+        In batches, and without keeping the panels: an exemplar is needed once, to
+        compute the rows the ban index keeps. gpu12 evaluated its 462 start-up
+        exemplars in ONE engine call -- 31.9 of the GPU's 32.6 GB, where a CUDA OOM
+        in the tolerant engine drops trees silently, here exemplars -- and then
+        held all 462 panels (~18 GB) in the panel cache, where nothing read them
+        again. Same exemplars in the same order either way."""
         if self._rank_ban is None or not exprs:
             return 0
         added = 0
-        for e, p in zip(exprs, self._panels(list(exprs))):
-            if p is not None and self._rank_ban.add(e, p):
-                added += 1
+        exprs = list(exprs)
+        for lo in range(0, len(exprs), max(1, int(batch))):
+            part = exprs[lo:lo + batch]
+            for e, p in zip(part, self._panels(part, cache=False)):
+                if p is not None and self._rank_ban.add(e, p):
+                    added += 1
         return added
 
     def _roll(self, population, fit, generation: int) -> List[str]:

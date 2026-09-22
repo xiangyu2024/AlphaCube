@@ -47,7 +47,14 @@ def rank_rows(x: np.ndarray) -> np.ndarray:
 
 
 def zscore_rows(x: np.ndarray) -> np.ndarray:
+    """Per-row z-scores over the finite cells; NaN elsewhere. ``nanmean`` /
+    ``nanstd`` take inf as a value, so ONE inf cell made the row's mean inf and
+    every z-score of that day NaN: gpu12's third block was built from
+    ``log(add(...))`` factors with a -inf on some stock each day, and its pool
+    lost the whole test period that way -- coverage 0 for every weighted
+    combination, a constant signal for the trees."""
     x = np.asarray(x, dtype=np.float64)
+    x = np.where(np.isfinite(x), x, np.nan)
     with np.errstate(invalid="ignore", divide="ignore"), warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)         # all-NaN rows are legitimate
         m = np.nanmean(x, axis=1, keepdims=True)

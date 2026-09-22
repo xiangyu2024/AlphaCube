@@ -689,3 +689,28 @@ def test_scoring_threads_follow_the_container_quota(tmp_path):
     assert torch.get_num_threads() == before
     with torch_threads(None):
         assert torch.get_num_threads() == before
+
+
+def test_exemplars_are_evaluated_in_batches_and_not_cached(registry, view, monkeypatch):
+    """gpu12 evaluated its 462 start-up exemplars in one engine call -- 31.9 of the
+    GPU's 32.6 GB, where a CUDA OOM in the tolerant engine drops trees silently --
+    and kept every panel in the panel cache (~18 GB) although nothing read them
+    again. Batches bound the call; the exemplars stored are the same, in the same
+    order, whatever the batch size."""
+    from alphacube.label import Label
+    from alphacube.mining.pool import MsePool
+
+    target = Label("close", 1).compute(view)
+    ex = [parse(s) for s in ("day_max(log(Amt))", "day_std(Ret)", "day_mean(Close)", "day_max(Amt)",
+                             "day_min(Low)")]
+    stored = []
+    for batch in (2, 100):
+        m = GPMiner(registry, view, target, MsePool(4, target), seed=0, ban_rank_corr=0.95)
+        calls = []
+        real = m.engine.evaluate
+        monkeypatch.setattr(m.engine, "evaluate", lambda exprs, **kw: calls.append(len(exprs)) or real(exprs, **kw))
+        m._add_exemplars(ex, batch=batch)
+        assert calls == ([2, 2, 1] if batch == 2 else [5]), calls
+        assert len(m._panel_cache) == 0, "an exemplar panel is needed once"
+        stored.append(list(m._rank_ban.exemplars))
+    assert stored[0] == stored[1] and len(stored[0]) >= 3, stored
