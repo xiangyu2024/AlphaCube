@@ -282,11 +282,13 @@ def test_kernels_never_write_into_operands(registry, tmp_path_factory, monkeypat
 
 
 def test_boundary_reads_and_writes_follow_the_access_pattern(view, monkeypatch):
-    """A boundary file is (S, D, M) like the store, so the D round reads (and
-    writes) it in the same strided way -- 9.8 GB of it per boundary on the
-    production cube -- and read-ahead is the same waste there. The advice must
-    reach it, and follow the round's pattern: contiguous in an S round, random in
-    a D round. Values may not change either way."""
+    """A boundary file is read by later rounds; in (S, D, M) a D round's read of it
+    is the strided crumb-per-stride pattern (~1 KB per 1.9 MB), which is what held
+    gpu14's heaviest start-up batch -- four such files. A boundary read only by D
+    rounds is therefore stored (D, S, M): its D-round reads are contiguous and the
+    strided side becomes the S round's WRITE into a fresh file, which reads nothing.
+    The read-ahead advice follows whichever access is strided, is given afresh
+    every call (boundaries are new files), and the values never change."""
     from alphacube.engine import engine as engine_mod
 
     calls = []
@@ -296,27 +298,43 @@ def test_boundary_reads_and_writes_follow_the_access_pattern(view, monkeypatch):
 
     e = parse("day_last(nt_cs_rank(cross_mean(Close, 3)))")   # S round -> boundary -> D round
     eng = CubeEngine(view, chunk_symbols=3, chunk_days=5)
-    assert [r.mode for r in eng.plan([e]).rounds] == [MODE_S, MODE_D]
+    plan = eng.plan([e])
+    assert [r.mode for r in plan.rounds] == [MODE_S, MODE_D] and [b.bound_layout for b in plan.boundaries] == ["D"]
     res = eng.evaluate([e])
-    assert calls[0] is False, "the S round writes the boundary contiguously"
-    assert True in calls, "the D round reads it strided"
-    assert calls == [False, True], "one syscall per pattern change, not per chunk"
-    plain = CubeEngine(view, chunk_symbols=3, chunk_days=5).evaluate([e])
+    assert list(eng._bound_layout.values()) == ["D"]
+    assert calls == [True, False], "strided write from the S round, contiguous read in the D round"
+    old = CubeEngine(view, chunk_symbols=3, chunk_days=5, boundary_layout="S")
+    calls.clear()
+    plain = old.evaluate([e])
+    assert calls == [False, True], "the (S, D, M) layout: contiguous write, strided read"
     assert np.array_equal(res.panels[0], plain.panels[0], equal_nan=True)
 
-    # Every call makes NEW boundary files, so every call must advise them afresh.
-    # It did not: advice was remembered per node key, so a boundary written in a D
-    # round and last read in a D round (D -> S -> D below) came back in the next
-    # call as "already advised" and its fresh file was written and read strided
-    # with full read-ahead -- gpu11's second engine call ran its D round at 95
-    # days a minute on that one file, the one mapping without "rr" in its VmFlags.
+    # D -> S -> D: a boundary read only by the second D round (day-major), one read by
+    # the S round (symbol-major), one written by the S round for the second D round
+    # (day-major). Every read is contiguous; each call advises its new files afresh.
     dsd = parse("day_last(nt_cs_rank(add(nt_cs_rank(Close), cross_mean(nt_cs_rank(Open), 3))))")
     eng = CubeEngine(view, chunk_symbols=3, chunk_days=5)
-    assert [r.mode for r in eng.plan([dsd]).rounds] == [MODE_D, MODE_S, MODE_D]
+    plan = eng.plan([dsd])
+    assert [r.mode for r in plan.rounds] == [MODE_D, MODE_S, MODE_D]
+    assert sorted(b.bound_layout for b in plan.boundaries) == ["D", "D", "S"]
     calls.clear()
     first = eng.evaluate([dsd])
     c1 = list(calls)
     calls.clear()
     second = eng.evaluate([dsd])
-    assert c1.count(True) == 3 and calls == c1, (c1, calls)
+    assert calls == c1 and c1.count(True) == 2, (c1, calls)
     assert np.array_equal(first.panels[0], second.panels[0], equal_nan=True)
+
+
+@pytest.mark.parametrize("src", ["day_last(nt_cs_rank(cross_mean(Close, 3)))",
+                                 "day_last(nt_cs_rank(add(nt_cs_rank(Close), cross_mean(nt_cs_rank(Open), 3))))",
+                                 "day_mean(nt_cs_rank(mul(cross_mean(Vwap, 5), in_rank(Volume))))",
+                                 "day_std(nt_ts_mean(cross_max(High, 3), 5))"])
+@pytest.mark.parametrize("cs, cd", [(1, 1), (3, 7), (10, 60)])
+def test_day_major_boundaries_give_the_same_values(view, src, cs, cd):
+    """Storing a boundary (D, S, M) transposes every write and read of it; the
+    values must be exactly those of the (S, D, M) layout, at every chunking."""
+    e = parse(src)
+    a = CubeEngine(view, chunk_symbols=cs, chunk_days=cd).evaluate([e]).panels[0]
+    b = CubeEngine(view, chunk_symbols=cs, chunk_days=cd, boundary_layout="S").evaluate([e]).panels[0]
+    assert np.array_equal(a, b, equal_nan=True), src

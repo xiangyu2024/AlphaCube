@@ -137,6 +137,8 @@ def plan_rounds(dag: Dag) -> Plan:
     # to disk in canonical (S, D, M) order.
     for n in dag.computed:
         n.boundary = n.panel_out = False
+        n.bound_layout = "S"
+        readers = set()
         if n.is_root and n.mode != MODE_P:
             n.panel_out = True
         for p in n.parents:
@@ -145,6 +147,15 @@ def plan_rounds(dag: Dag) -> Plan:
                     n.panel_out = True
                 else:
                     n.boundary = True
+                    readers.add(rounds[p.round_id].mode)
+        # A boundary read only by D rounds is stored day-major: a D round reads every
+        # symbol over a few days, which in (S, D, M) is ~1 KB out of each 1.9 MB
+        # stride and in (D, S, M) one contiguous block. Writing it that way from an
+        # S round is a strided write into a FRESH file -- pages that do not exist
+        # yet are zero-filled, never read -- so the cost moves to where it is free.
+        # (gpu14's heaviest start-up batch ran its D round on four such files.)
+        if n.boundary and readers == {MODE_D}:
+            n.bound_layout = "D"
         # Where the tradability mask must be re-applied under the "boundaries"
         # policy: an intraday (M-axis / elementwise) node can only produce a fake
         # finite value inside its own stock-day, so masking is only needed where a

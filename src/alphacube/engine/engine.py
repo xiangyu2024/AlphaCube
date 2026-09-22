@@ -75,7 +75,7 @@ class CubeEngine:
                  chunk_days: Optional[int] = None, chunk_bytes: int = 2 << 30,
                  apply_mask: bool = True, mask_policy: str = "boundaries",
                  workdir: Optional[os.PathLike] = None, torch_threads: Optional[int] = None,
-                 dtype: str = "float32") -> None:
+                 dtype: str = "float32", boundary_layout: str = "auto") -> None:
         """``mask_policy``: "all" re-applies the stock-day mask at every computed
         node; "boundaries" (default) only where a fake finite value could leak
         -- inputs of day-axis / NT operators and values leaving a round -- which
@@ -105,6 +105,11 @@ class CubeEngine:
         self.chunk_bytes = int(chunk_bytes)
         self.apply_mask = bool(apply_mask)
         self.mask_policy = mask_policy
+        # "auto": each boundary file in the axis order of the rounds that read it
+        # (schedule.plan_rounds); "S": always (S, D, M), the original layout.
+        if boundary_layout not in ("auto", "S"):
+            raise ValueError("boundary_layout must be 'auto' or 'S'")
+        self.boundary_layout = boundary_layout
         self.workdir = Path(workdir) if workdir is not None else default_workdir()
         if torch_threads is not None:
             torch.set_num_threads(int(torch_threads))
@@ -152,6 +157,7 @@ class CubeEngine:
         # its D round at 95 days a minute on that one file ("rr" missing from its
         # VmFlags in /proc/<pid>/smaps while the other three had it).
         self._bound_advice = {}
+        self._bound_layout: Dict[str, str] = {}      # boundary key -> "S" / "D" (axis order of its file)
         tmp = None
         if plan.boundaries:
             tmp = tempfile.TemporaryDirectory(dir=self.workdir, prefix="alphacube_")
@@ -231,15 +237,19 @@ class CubeEngine:
         return torch.from_numpy(np.ascontiguousarray(sl)).to(self.device, self.dtype).unsqueeze(-1)
 
     def _bound_slice(self, key: str, bounds: Dict[str, np.memmap], mode: str, lo: int, hi: int) -> torch.Tensor:
+        """This chunk's slice of a boundary, always as (symbols, days, width).
+        A (S, D, M) boundary read by a D round, or a (D, S, M) one by an S round,
+        is the strided crumb-per-stride pattern, where read-ahead is waste."""
         b = bounds[key]
-        # A boundary is (S, D, M) like the store, so a D-round slice of it is the
-        # same strided crumb-per-stride read, and read-ahead the same waste.
-        self._advise_bound(key, b, mode)
-        sl = b[lo:hi] if mode == MODE_S else b[:, lo:hi]
+        day_major = self._bound_layout[key] == "D"
+        self._advise_bound(key, b, strided=(mode == MODE_S) == day_major)
+        if day_major:
+            sl = np.transpose(b[:, lo:hi] if mode == MODE_S else b[lo:hi], (1, 0, 2))
+        else:
+            sl = b[lo:hi] if mode == MODE_S else b[:, lo:hi]
         return torch.from_numpy(np.ascontiguousarray(sl)).to(self.device, self.dtype)
 
-    def _advise_bound(self, key: str, b: np.memmap, mode: str) -> None:
-        strided = mode != MODE_S
+    def _advise_bound(self, key: str, b: np.memmap, strided: bool) -> None:
         if self._bound_advice.get(key) is not strided:
             advise_access(b, random=strided)
             self._bound_advice[key] = strided
@@ -316,10 +326,19 @@ class CubeEngine:
                 if b is None:
                     # width comes from the RESULT: a width-changing call (in_slice) is narrower than M
                     path = Path(tmp.name) / f"bound_{len(bounds):04d}.npy"
+                    layout = n.bound_layout if self.boundary_layout == "auto" else "S"
+                    shape = (D, S, int(arr.shape[-1])) if layout == "D" else (S, D, int(arr.shape[-1]))
                     b = bounds[n.key] = np.lib.format.open_memmap(path, mode="w+", dtype=self.np_dtype,
-                                                                   shape=(S, D, int(arr.shape[-1])))
-                self._advise_bound(n.key, b, mode)      # a strided write faults its pages in too
-                if mode == MODE_S:
+                                                                   shape=shape)
+                    self._bound_layout[n.key] = layout
+                day_major = self._bound_layout[n.key] == "D"
+                self._advise_bound(n.key, b, strided=(mode == MODE_S) == day_major)
+                if day_major:
+                    if mode == MODE_S:
+                        b[:, lo:hi] = np.transpose(arr, (1, 0, 2))
+                    else:
+                        b[lo:hi] = np.transpose(arr, (1, 0, 2))
+                elif mode == MODE_S:
                     b[lo:hi] = arr
                 else:
                     b[:, lo:hi] = arr

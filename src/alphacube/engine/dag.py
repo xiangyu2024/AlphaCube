@@ -10,7 +10,7 @@ from ..expression import Constant, Expression, Feature, Shape
 
 class Node:
     __slots__ = ("expr", "key", "children", "parents", "root_indices", "mode", "round_id",
-                 "boundary", "panel_out", "mask_out", "failed", "error")
+                 "boundary", "bound_layout", "panel_out", "mask_out", "failed", "error")
 
     def __init__(self, expr: Expression) -> None:
         self.expr = expr
@@ -21,6 +21,7 @@ class Node:
         self.mode: Optional[str] = None
         self.round_id: int = -1
         self.boundary = False       # full-width output needed by another cube mode -> disk
+        self.bound_layout = "S"     # its file's axis order: "S" = (S, D, M), "D" = (D, S, M)
         self.panel_out = False      # degenerate output needed as a (S, D) panel -> memory
         self.mask_out = True        # re-apply the tradability mask at this node's output
         self.failed = False
