@@ -31,7 +31,7 @@ from alphacube.catalog import default_registry
 from alphacube.mining.generator import one_layer_keys
 from alphacube.parser import parse
 
-# Structures banned so far (gpu5 x6, gpu7 x3, gpu8 x3, gpu9 x6) -- keep in step with the latest run's --ban list.
+# Structures banned so far (gpu5 x6, gpu7 x3, gpu8 x3, gpu9 x6, gpu12 x12) -- keep in step with the latest run's --ban list.
 BANNED = {
     "O:log(F:Amt)", "O:nt_ts_argmax(F:High)|w3", "O:cross_decay_linear(F:Amt)|w3",
     "O:day_ar1_coefficient(F:High)", "O:day_ar1_coefficient(F:Close)", "O:day_durbin_watson(F:Close)",
@@ -39,6 +39,11 @@ BANNED = {
     "O:day_ar1_coefficient(F:Volume)", "O:day_ar1_coefficient(F:Ret)", "O:in_cov(F:Ret,F:Close)|w30",
     "O:day_min(F:Ret)", "O:day_max(F:Ret)", "O:day_quantile_q25(F:Volume)",
     "O:nt_ts_autocorr_s1(F:Ret)|w3", "O:pow_2(F:Ret)", "O:day_kurt(F:Ret)",
+    # gpu12's four blocks
+    "O:day_cov(F:Amt,F:Amt)", "O:day_quantile_q25(F:Amt)", "O:cross_delta(F:Amt)|w30",
+    "O:day_var(F:Ret)", "O:day_max(F:High)", "O:day_argmin(F:Amt)",
+    "O:day_last(F:Volume)", "O:day_max(F:Low)", "O:day_std(F:Vwap)",
+    "O:day_q_stat_std(F:Volume)", "O:cross_rank(F:High)|w241", "O:day_q_stat_std(F:Amt)",
 }
 
 runs_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "mining_runs")
