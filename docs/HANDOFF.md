@@ -1,4 +1,4 @@
-# AlphaCube 交接(2026-09-21 17:20 北京时间)
+# AlphaCube 交接(2026-09-22 11:40 北京时间)
 
 你正在接手 AlphaCube。这份文件自足 —— 读完就能接着干,不需要任何对话历史。
 设计细节在 `docs/design.md`(中文,权威);这份讲**现状、地址、怎么跑、踩过什么坑、还欠什么**。
@@ -12,20 +12,10 @@
 —— 包括 rsync、scp、启动任务;写入会挂在内核里,连你的命令一起卡住。读是正常的。
 **容器里 `/sys` 是只读挂载**:停校验(`echo idle > sync_action`)在容器里做不到,连用户也不行,只能 AutoDL 在宿主机上处理。
 
-**gpu10 的代码已就绪、用户已批准"恢复后直接起跑"**(§11 三个决定已由用户拍板并实现,见 §11)。接手后按顺序做:
-
-1. **看数据盘恢复没有**(只读):
-   ```bash
-   ssh -o BatchMode=yes -o ControlPath=none -p 29982 root@connect.westd.seetacloud.com 'cat /sys/block/md0/md/array_state; cat /proc/mdstat'
-   ```
-   `write-pending` = 还卡着;`clean` / `active` = 恢复了。修复是系统层的事(§4),由用户或 AutoDL 处理,**你不能动**。
-2. **恢复后收尾 gpu9**:用户要求直接杀掉;SIGINT 和 SIGKILL 都已发出(`/proc/332647/status` 的
-   `ShdPnd 0x102`),写入一返回就会死。**因为是 SIGKILL,引擎的临时目录不会自动删**:确认
-   `ps -p 332647` 已退出、GPU 显存已释放(它占着 28.9 GB)后,手动删 `tmp/alphacube_bvh5ou93/`(3 个边界文件约 29 GB),
-   `screen -ls` 里的 `gpu9` 会随之消失。
-3. **同步仓库到服务器**(§5.2)。服务器上还是 gpu9 的代码:`docs/`、新脚本和本次的适应度 / 族 / 平滑改动都还没过去。
-4. **直接起跑 gpu10**:`scripts/gp_full_market.sh gpu10`(§5.3,已含新参数),确认第 1 代正常后向用户汇报。
-   可选:同时用 `scripts/combine_archive.py` 给 gpu9 第 10 代 archive 补一次带平滑的组合(§5.7),先看平滑在真实数据上的效果。
+**现状(09-22 11:40)**:磁盘已恢复(09-21 约 13:5x);**gpu12 已跑完 20 代**(结果见 §6);服务器空闲,GPU 空闲。
+**gpu13 已备好、未启动**:`scripts/gp_full_market.sh gpu13` 已含 30 个封禁(新增 gpu12 四个块的 12 个)+ 5 个 archive 的
+rank 样本(836 条,每批 150 条求值);代码含全部读盘修复(4da3e80 / 6c384f2 / 4d1594d)与 z 分数修复(108302e)。
+**起跑前问用户**(用户 09-22 说"尝试修复到 13,但不要停止 gpu12";gpu12 此后已自然跑完)。起跑方法见 §5.3。
 
 **挖出来的东西都在**:服务器 `mining_runs/*/checkpoints/` 完好;本地有全量备份(§2);全部表达式
 去重汇总在 `~/Desktop/AlphaCube/mining_runs/全部因子表达式.csv`(1922 条)。
@@ -201,6 +191,16 @@ cd /root/autodl-tmp/AlphaCube && PYTHONPATH=src PYTORCH_CUDA_ALLOC_CONF=expandab
 输出翻转到可交易方向后的无成本 / 扣 15bp / 限换手夏普、换手、逐年盈亏;先核对无成本数字与 checkpoint 一致。
 算完把 JSON 拷回本地 `mining_runs/evals/`,汇总表就会带上它。
 
+一个 run 的完整回测报告(单因子 + 全部组合方法的样本外净值、逐年逐月,JSON):
+
+```bash
+cd /root/autodl-tmp/AlphaCube && PYTHONPATH=src PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  /root/miniconda3/envs/quant/bin/python scripts/report_run.py \
+  mining_runs/gpu12/checkpoints/archive_gen020.csv _bench/gpu12_report_cum.json --top-factors 40 --pool-top 120
+```
+
+GPU 空闲时 `--gpu-fraction 0.95`(默认),约 15 分钟;`--pool-top 60` 是最终入池的口径。
+
 给一个 archive 补一次和块结算同口径的池 + 组合(含扣成本、限换手、组合后 EMA 平滑):
 
 ```bash
@@ -255,7 +255,7 @@ cd ~/Desktop/AlphaCube && PYTHONPATH=src ~/.venvs/alphacube/bin/python scripts/m
 | gpu9 | 03:44~(05:41 卡住) | 封 12 个 + rank 0.95,逐元素算子出搜索 | 第 3 块开头被数据盘卡住,用户要求停止(§4);09-21 磁盘恢复时已被 SIGKILL |
 | gpu10 | 09-21 14:05~14:28 | 新适应度 + 族 0.99 + 平滑,462 条 rank 样本 | 启动阶段 D 轮 3.2 天/分钟(~10 h):跨步读预读放大 ~350 倍(§12),停掉修 |
 | gpu11 | 14:35~17:14 | 同上 + 跨步读 `MADV_RANDOM` | 第 4 代后停:发现边界文件的 advice 跨调用失效(6c384f2),D 轮又回到 95 天/分钟。4 代 checkpoint 保留 |
-| **gpu12** | **17:14~** | 同上 + 6c384f2 | 运行中;同 seed 同配置,前 4 代应与 gpu11 逐字节相同 |
+| gpu12 | 09-21 17:14~09-22 05:40 | 同上 + 6c384f2 | **跑完 20 代**(11 h;前 4 代与 gpu11 逐行相同)。第 3 块起重建种群慢(每次 ~4.7 h):分段 store 绕过了读盘 advice(4d1594d 已修)。结果见下 |
 
 ### 因子家族(修复后的 gpu4~gpu9 共 1314 条,详见汇总 CSV)
 
@@ -273,6 +273,19 @@ cd ~/Desktop/AlphaCube && PYTHONPATH=src ~/.venvs/alphacube/bin/python scripts/m
 头部是 `day_cov(Amt, ·)` 的时间序列统计量:rank IC −0.035~−0.049、**日换手 1.9~3.9%、扣费夏普 +2.0~+3.0**
 (第 4 代头名 `ts_stddev(day_cov(Amt, …))` +3.02);它们的 Pearson IC 只有 −0.005 左右,在旧 |IC| 适应度下排不上。
 每代 18~21 个个体因同族被降级,4 代 archive 135 个族;rank 样本存下 230 个(462 条去重)。
+
+### gpu12 结果(修复 z 分数后离线重算,`scripts/report_run.py`;报告页 https://claude.ai/artifact/NR2N1n5xrkEyNCqDwwxa21)
+
+- **组合(样本外 = 后 30% 交易日,2023-08-08 起,扣 15bp)**:累计池(archive 前 120 条 → 池 30)ridge **+2.45**
+  (无成本 +3.19,日换手 8.6%)、lstsq +2.42、icir +1.60、ic +1.36、equal +1.31;最终池(前 60 条)ridge +1.52、
+  lstsq +1.47、icir +1.08。三种树模型日换手 40~56%,扣费 −2.9 ~ −4.8;平滑对线性方法基本中性,对树模型能减亏
+  (最终池 gbdt/lightgbm 半衰期 20 天后 +1.0 左右)。
+- **单因子(archive 前 40 族,方向按训练段 IC 定)**:扣费夏普中位数 全期 +1.30 / 训练 +1.62 / 测试 +0.80;
+  37/40 测试段为正、12/40 测试段 > 1;日换手中位数 3.3%。头部:`ts_stddev(day_cov(Amt, Amt), 30)` 全期 +3.02
+  测试 +2.25;`ts_quantile_q75(cross_cov(day_max(High), day_var(Ret), 15), 5)` 测试 +2.39(换手 11%)。
+  2025 年是弱年:40 个里 13 个当年亏损。
+- **运行时块结算表(09-21 看到的)低估了后半段**:含 `log(·)` 的因子有 −inf,旧 `zscore_rows` 让当天整个截面 z 分数
+  变 NaN(108302e 已修),第 3 块单独那张表整个为空、累计 1~4 与最终池里也夹着"死成员"。上面是修复后的数。
 
 ### 融合回测(池 30,样本外 = 后 30% 交易日)
 
@@ -339,6 +352,9 @@ cd ~/Desktop/AlphaCube && PYTHONPATH=src ~/.venvs/alphacube/bin/python scripts/m
 - **换手**:无成本夏普 4.0 配 89% 日换手,扣 15bp 后是负的。**永远看扣成本那套。**
 - **archive 里大量重复**:同一因子套单调变换(`sigmoid`、`pow_2`、`abs_(abs_(x))`、`ts_max(x, 1)`、
   `sub(0.5, x)`)各算一条;数条数不等于数方向。
+- **一个 inf 会抹掉一整天的 z 分数(已修,108302e)**:之前的 `zscore_rows` 用 nanmean/nanstd,把 inf 当值;
+  含 `log(·)` 的因子常有 −inf,于是当天整个截面 NaN,池的闸却都屏蔽 inf 照样放行 —— 108302e 之前的池/组合结果里,
+  这类因子是"死成员",数字偏低。
 - **全部是样本内**:GP 用 2018~2025 整段的 IC 选因子,组合层的"样本外"只是后 30% 交易日;
   多空口径没算 A 股融券限制、涨跌停、冲击成本。
 - **gpu2/gpu3 的高 IC 是漏洞产物**(汇总 CSV 里"含已移出搜索的算子"一列有值的都是)。
