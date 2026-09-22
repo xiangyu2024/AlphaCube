@@ -1,4 +1,4 @@
-# AlphaCube 交接(2026-09-22 11:40 北京时间)
+# AlphaCube 交接(2026-09-22 21:40 北京时间)
 
 你正在接手 AlphaCube。这份文件自足 —— 读完就能接着干,不需要任何对话历史。
 设计细节在 `docs/design.md`(中文,权威);这份讲**现状、地址、怎么跑、踩过什么坑、还欠什么**。
@@ -12,10 +12,20 @@
 —— 包括 rsync、scp、启动任务;写入会挂在内核里,连你的命令一起卡住。读是正常的。
 **容器里 `/sys` 是只读挂载**:停校验(`echo idle > sync_action`)在容器里做不到,连用户也不行,只能 AutoDL 在宿主机上处理。
 
-**现状(09-22 11:40)**:磁盘已恢复(09-21 约 13:5x);**gpu12 已跑完 20 代**(结果见 §6);服务器空闲,GPU 空闲。
-**gpu13 已备好、未启动**:`scripts/gp_full_market.sh gpu13` 已含 30 个封禁(新增 gpu12 四个块的 12 个)+ 5 个 archive 的
-rank 样本(836 条,每批 150 条求值);代码含全部读盘修复(4da3e80 / 6c384f2 / 4d1594d)与 z 分数修复(108302e)。
-**起跑前问用户**(用户 09-22 说"尝试修复到 13,但不要停止 gpu12";gpu12 此后已自然跑完)。起跑方法见 §5.3。
+**现状(09-22 21:40)**:
+- **全版本因子研究在跑**(用户要求:所有版本的健康因子重算、单因子回测汇总、一起训练)。服务器 screen `allfacpipe`
+  跑 `_bench/allfac_pipeline.sh`:守着 `scripts/eval_all_factors.py`(2784 条表达式、当前引擎全部重算,
+  面板存 `_bench/allfac/panels/`,可断点续跑,死了自动续,最多 5 次),完成后自动跑 `score_all_factors.py`
+  和 `train_all_factors.py`,结果 `_bench/allfac/train.json`。第一批 150 条 22.7 分钟,全程 ~6.7 h,预计 09-23 ~04:00。
+  日志 `_bench/allfac.log`(每批一行,`[exit N]` 记退出码)、`_bench/allfac_score.log`、`_bench/allfac_train.log`。
+  报告页:本机 scratchpad 的 `build_allfac.py` + `allfac_head.html`/`allfac_body.html`(已在测试数据上建通),
+  真数据出来后发布为 Artifact。
+- **gpu14 在第 15 代后死了**(09-22 19:12~19:17,无 traceback、容器 `oom_kill 0`;推测宿主机层面的击杀)。
+  15 个 checkpoint 已备份本地。第 1、2 块累计池样本外:ridge/lstsq +2.25/+2.26,平滑后 +2.86/+2.88。
+- **gpu15 已备好未起跑**(等全版本研究结束、用户点头):同 gpu14 配置 + 边界文件按天存(49288a3)。
+  起跑时用 `PYTHONFAULTHANDLER=1` 并在 screen 命令末尾 `; echo "[exit $? ...]" >> <run>_run.log` 记退出码。
+- **D-major 镜像已建**:`/root/autodl-tmp/AlphaCube/mirror/`(80 GB,4 分钟建完;`scripts/build_mirror.py`),
+  run 用 `--mirror-root` 读;store 变了镜像自动失效。
 
 **挖出来的东西都在**:服务器 `mining_runs/*/checkpoints/` 完好;本地有全量备份(§2);全部表达式
 去重汇总在 `~/Desktop/AlphaCube/mining_runs/全部因子表达式.csv`(1922 条)。
@@ -273,6 +283,18 @@ cd ~/Desktop/AlphaCube && PYTHONPATH=src ~/.venvs/alphacube/bin/python scripts/m
 头部是 `day_cov(Amt, ·)` 的时间序列统计量:rank IC −0.035~−0.049、**日换手 1.9~3.9%、扣费夏普 +2.0~+3.0**
 (第 4 代头名 `ts_stddev(day_cov(Amt, …))` +3.02);它们的 Pearson IC 只有 −0.005 左右,在旧 |IC| 适应度下排不上。
 每代 18~21 个个体因同族被降级,4 代 archive 135 个族;rank 样本存下 230 个(462 条去重)。
+
+### 速度优化小结(09-21~22,全部实测)
+
+| 改动 | commit | 实测 |
+|---|---|---|
+| 跨步读 `MADV_RANDOM`(store 字段) | 4da3e80 | 6 天 × 全部股票:读盘 10014 → 49 MB,9.04 → 1.05 s |
+| 边界文件的 advice 每次调用重置 | 6c384f2 | gpu11 那个没有 `rr` 的边界文件 |
+| 分段 store 也走 advice | 4d1594d | gpu12 第 3 块重建 4.7 h 的元凶 |
+| D-major 镜像 | d5acdd5 | 同一读法 7.27 → 0.48 s(15.2×),逐位相同 |
+| 边界文件只被 D 轮读时按天存 | 49288a3 | gpu14 一代 9 个边界(88 GB)、D 状态 100%、39 MB/s 的对症改动;未上线 |
+
+gpu14(镜像):15 代 5 h 45 min,后面的代 3~6 分钟,前几代和块重建仍 ~30 min(边界文件跨步)。
 
 ### gpu12 结果(修复 z 分数后离线重算,`scripts/report_run.py`;报告页 https://claude.ai/artifact/NR2N1n5xrkEyNCqDwwxa21)
 
