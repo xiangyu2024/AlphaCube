@@ -29,15 +29,32 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import numpy as np
 
-G = {}          # shared with forked workers
+G = {}          # each worker's own copy (spawned, not forked)
+
+
+def init(d, split, cost, threads):
+    """Worker set-up. The pool is SPAWNED, not forked: the parent has already run
+    torch (the label's ranks), and forking a process whose OpenMP pool is up
+    deadlocks every child at its first torch call -- this scorer sat there for 36
+    hours with eight workers asleep. Spawned workers re-import torch cleanly and
+    mmap the label the parent saved, so the pages are shared, not copied."""
+    import torch
+
+    from alphacube.mining.rankban import CompactRankIndex
+
+    torch.set_num_threads(threads)
+    target = np.load(d / "_target.npy", mmap_mode="r")
+    dates = [str(x) for x in np.load(d / "dates.npy")]
+    G.update(dir=d, target=np.asarray(target), target_ranks=torch.from_numpy(np.asarray(
+        np.load(d / "_target_ranks.npy", mmap_mode="r"))), split=split, cost=cost,
+        years=np.asarray([x[:4] for x in dates]), years_list=sorted({x[:4] for x in dates}),
+        index=CompactRankIndex(target.shape), threads=threads)
 
 
 def score(i):
-    import torch
     from alphacube.metrics import (cs_pearson, long_short_weights, nanmean_quiet, portfolio_returns,
                                    rank_ic_turnover)
 
-    torch.set_num_threads(G["threads"])
     path = G["dir"] / "panels" / f"{i:05d}.npy"
     if not path.exists():
         return i, None, None
@@ -114,22 +131,22 @@ def main() -> int:
         raise SystemExit("the view differs from the one the panels were evaluated on")
     target = Label(a.label, 1).compute(view).astype(np.float64)
     D = len(dates)
-    G.update(dir=d, target=target, target_ranks=torch_rank_rows(target), cost=a.cost_per_side,
-             split=max(1, min(D - 1, int(D * a.train_frac))), years=np.asarray([x[:4] for x in dates]),
-             years_list=sorted({x[:4] for x in dates}), index=CompactRankIndex(target.shape),
-             threads=max(1, (cpu_quota() or os.cpu_count() or 8) // max(1, a.workers)))
-    idx = G["index"]
+    split = max(1, min(D - 1, int(D * a.train_frac)))
+    np.save(d / "_target.npy", target)
+    np.save(d / "_target_ranks.npy", torch_rank_rows(target).numpy())
+    threads = max(1, (cpu_quota() or os.cpu_count() or 8) // max(1, a.workers))
+    width = CompactRankIndex(target.shape).width
     rows_all = np.lib.format.open_memmap(d / "rows.npy", mode="w+", dtype=np.float32,
-                                         shape=(len(manifest), 3, idx.width))
+                                         shape=(len(manifest), 3, width))
     out, t0 = [], time.time()
-    ctx = mp.get_context("fork")
-    with ctx.Pool(a.workers) as pool:
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(a.workers, initializer=init, initargs=(d, split, a.cost_per_side, threads)) as pool:
         for n, (i, row, rows) in enumerate(pool.imap_unordered(score, range(len(manifest)), chunksize=4), 1):
             if row is not None:
                 row.update(run=manifest[i]["run"], expression=manifest[i]["expression"])
                 out.append(row)
                 rows_all[i] = rows
-            if n % 100 == 0:
+            if n % 50 == 0:
                 print(f"  {n}/{len(manifest)} scored, {time.time() - t0:.0f}s", flush=True)
     rows_all.flush()
     out.sort(key=lambda r: r["i"])
