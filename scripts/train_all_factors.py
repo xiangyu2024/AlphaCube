@@ -127,11 +127,18 @@ def main() -> int:
                              "turnover": float(np.mean(turn))},
                     "train": {"net": curve(book(res.combined, train)[0])},
                     "rank_ic_test": res.metrics.get("rank_ic"),
+                    "metrics": {k: (float(v) if isinstance(v, (int, float, np.floating)) else v)
+                                for k, v in res.metrics.items()},
                     "by_year_net": by_year(net, years[test]), "equity_net": [float(x) for x in np.nancumsum(net)]}
             hl = res.metrics.get("halflife")
             if hl is not None:
-                s_net, _, s_turn, _ = book(ema_rows(res.combined, float(hl)), test)
+                sm_alpha = ema_rows(res.combined, float(hl))
+                s_net, _, s_turn, _ = book(sm_alpha, test)
+                from alphacube.metrics import cs_pearson, nanmean_quiet, rank_rows
                 item["smooth"] = {"halflife": float(hl), "net": curve(s_net), "turnover": float(np.mean(s_turn)),
+                                  "ic": nanmean_quiet(cs_pearson(sm_alpha[test], target[test])),
+                                  "rank_ic": nanmean_quiet(cs_pearson(rank_rows(sm_alpha[test]),
+                                                                      rank_rows(target[test]))),
                                   "by_year_net": by_year(s_net, years[test]),
                                   "equity_net": [float(x) for x in np.nancumsum(s_net)]}
             combos.append(item)
