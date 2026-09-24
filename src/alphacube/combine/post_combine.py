@@ -22,17 +22,28 @@
 方法:
     equal      等权(方向对齐后)
     ic         按训练段 |IC| 加权
+    ric        按训练段 |rank IC| 加权 —— 和挖掘期的适应度同口径
     icir       按训练段 |ICIR| 加权 —— 稳定性比绝对强度更值钱
     lstsq      OLS(池当前用的口径,作为基线)
     ridge      带正则的线性,因子间共线时比 OLS 稳
     gbdt       HistGradientBoosting(sklearn 自带,原生吃 NaN)
     lightgbm   需要 pip install lightgbm
     xgboost    需要 pip install xgboost
+    roll_ic    滚动 IC 加权:每 20 天用前 250 天的逐日 IC 均值重算权重(带符号)
+    roll_ric   滚动 rank IC 加权,同上但用逐日 rank IC
+    roll_lstsq 滚动 OLS:每 20 天用前 250 天重新拟合
+    roll_ridge 滚动岭回归
     factorgcl  超图 GNN(`combine/factorgcl/`):一天一张图、股票为节点、节点
                特征是该股当天的因子向量,在先验因子超边之外再学一组隐超边,
                训练目标是 MSE(前瞻收益) + 时序残差对比损失。它和树模型的
                区别在于**显式建模同一天股票之间的关系**,而不是把每个
                (股票,天) 当独立样本
+
+滚动方法(`roll_*`)和上面几种的区别不在算法,在**什么时候拟合**:静态方法把训练段
+一次拟合出来的权重原样用到三年以后,滚动方法每 20 个交易日用最近 250 天重来一次,
+第 t 天的权重只看得到 t 之前的数据。前 250 天没有历史可用,留 NaN(落在训练段里,
+不进测试段指标)。注意比较时的口径差异:静态方法只用训练段的信息,滚动方法在测试段
+里也在持续用"当天之前"的信息重拟合 —— 这不是前视,但它确实比静态方法更新。
 
 树模型的样本量:全市场 10 年 x 10 因子 = 1.26 亿行,直接喂进去不现实,所以
 拟合前按 `max_fit_rows` 随机下采样(预测仍在全量上做)。
@@ -52,9 +63,14 @@ import numpy as np
 
 from ..metrics import backtest_metrics, cross_sectional_pearson, ema_rows, rank_rows
 
-WEIGHT_METHODS = ("equal", "ic", "icir", "lstsq", "ridge")
+WEIGHT_METHODS = ("equal", "ic", "ric", "icir", "lstsq", "ridge")
 MODEL_METHODS = ("ridge", "gbdt", "lightgbm", "xgboost", "factorgcl")
+ROLLING_METHODS = ("roll_ic", "roll_ric", "roll_lstsq", "roll_ridge")
 DEFAULT_METHODS = ("equal", "ic", "icir", "lstsq", "gbdt")
+
+ROLL_WINDOW = 250      # 回看一年
+ROLL_STEP = 20         # 每月重拟合一次
+RIDGE_ALPHA = 1e-2     # 相对 trace(XᵀX)/n 的正则强度
 
 
 def factor_ic_series(column: np.ndarray, target: np.ndarray) -> np.ndarray:
@@ -88,15 +104,18 @@ def _weights_for(
     if method == "equal":
         return np.full(n, 1.0 / n, dtype=np.float64)
 
-    if method in ("ic", "icir"):
+    if method in ("ic", "ric", "icir"):
         scores = np.zeros(n, dtype=np.float64)
+        # "ric" 用逐日 rank IC —— 目标的秩只算一次,不是每个因子重算一遍
+        tgt = rank_rows(target[days]) if method == "ric" else target[days]
         for i, column in enumerate(columns):
-            series = factor_ic_series(column[days], target[days])
+            col = rank_rows(column[days]) if method == "ric" else column[days]
+            series = factor_ic_series(col, tgt)
             finite = series[np.isfinite(series)]
             if finite.size < 2:
                 continue
             mean = float(finite.mean())
-            if method == "ic":
+            if method in ("ic", "ric"):
                 scores[i] = abs(mean)
             else:
                 std = float(finite.std())
@@ -120,6 +139,113 @@ def _weights_for(
         return weights.astype(np.float64)
 
     raise ValueError(f"{method} 不是权重类方法")
+
+
+def _daily_ic_matrix(
+    columns: Sequence[np.ndarray], target: np.ndarray, rank: bool
+) -> np.ndarray:
+    """(n_factors, T) 的逐日 IC / rank IC 矩阵,滚动权重是它的窗口均值。
+
+    整段算一次,窗口里只做平均。否则每次重拟合都要重排一遍窗口内的秩 ——
+    100 个因子 x 85 次重拟合 = 8500 次 250x5220 的排序,二十多分钟;这样是 100 次。
+    """
+    tgt = rank_rows(target) if rank else target
+    rows = [factor_ic_series(rank_rows(c) if rank else c, tgt) for c in columns]
+    return np.asarray(rows, dtype=np.float64)
+
+
+def _daily_moments(
+    columns: Sequence[np.ndarray], target: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """逐日的 (XᵀX, Xᵀy)。窗口回归的正规方程 = 窗口内这些矩阵直接相加。
+
+    (T, n, n) 对 100 个因子是 155 MB,换来的是每次重拟合只加 250 个小矩阵,
+    而不是重新扫一遍 130 万行的设计矩阵。缺失值照池的口径记 0。
+    """
+    T = target.shape[0]
+    n = len(columns)
+    gram = np.zeros((T, n, n), dtype=np.float64)
+    rhs = np.zeros((T, n), dtype=np.float64)
+    for t in range(T):
+        y = target[t]
+        mask = np.isfinite(y)
+        if not mask.any():
+            continue
+        x = np.nan_to_num(np.stack([c[t] for c in columns], axis=-1)[mask], nan=0.0)
+        gram[t] = x.T @ x
+        rhs[t] = x.T @ y[mask]
+    return gram, rhs
+
+
+def _solve_normal(gram: np.ndarray, rhs: np.ndarray, ridge_alpha: float) -> np.ndarray:
+    n = gram.shape[0]
+    if ridge_alpha > 0:
+        scale = float(np.trace(gram)) / max(n, 1)
+        gram = gram + (ridge_alpha * scale) * np.eye(n)
+    try:
+        return np.linalg.solve(gram, rhs)
+    except np.linalg.LinAlgError:
+        return np.linalg.lstsq(gram, rhs, rcond=None)[0]
+
+
+def rolling_combination(
+    method: str,
+    columns: Sequence[np.ndarray],
+    target: np.ndarray,
+    window: int = ROLL_WINDOW,
+    step: int = ROLL_STEP,
+    ridge_alpha: float = RIDGE_ALPHA,
+) -> Tuple[np.ndarray, List[Tuple[int, np.ndarray]]]:
+    """滚动组合:第 t 天的权重只用 [t-window, t) 拟合,每 `step` 天重拟合一次。
+
+    返回 (合成面板, [(生效首日, 权重), ...])。权重历史本身就是结论之一:
+    它到底变不变 —— 不变的话滚动就只是把静态方法跑贵了。
+    """
+    if method not in ROLLING_METHODS:
+        raise ValueError(f"{method} 不是滚动类方法")
+    T, N = target.shape
+    n = len(columns)
+    if window < 2 or window >= T:
+        raise ValueError(f"滚动窗口 {window} 对 {T} 天的样本不合法")
+    if step < 1:
+        raise ValueError("step 必须 >= 1")
+
+    ic_mat = gram = rhs = None
+    if method in ("roll_ic", "roll_ric"):
+        ic_mat = _daily_ic_matrix(columns, target, rank=(method == "roll_ric"))
+    else:
+        gram, rhs = _daily_moments(columns, target)
+
+    out = np.full((T, N), np.nan, dtype=np.float64)
+    history: List[Tuple[int, np.ndarray]] = []
+    for start in range(window, T, step):
+        lo = start - window
+        if ic_mat is not None:
+            block = ic_mat[:, lo:start]
+            finite = np.isfinite(block)
+            counts = finite.sum(axis=1)
+            sums = np.where(finite, block, 0.0).sum(axis=1)
+            # 带符号:权重自己管方向,某个因子在最近一年反了就该反着用
+            scores = np.where(counts >= 2, sums / np.maximum(counts, 1), 0.0)
+            total = float(np.abs(scores).sum())
+            weights = scores / total if total > 1e-12 else np.full(n, 1.0 / n)
+        else:
+            weights = _solve_normal(gram[lo:start].sum(axis=0), rhs[lo:start].sum(axis=0),
+                                    ridge_alpha if method == "roll_ridge" else 0.0)
+        history.append((start, weights))
+
+        stop = min(start + step, T)
+        seg = slice(start, stop)
+        acc = np.zeros((stop - start, N), dtype=np.float64)
+        seen = np.zeros((stop - start, N), dtype=bool)
+        for column, weight in zip(columns, weights):
+            values = column[seg]
+            finite = np.isfinite(values)
+            acc += weight * np.where(finite, values, 0.0)
+            seen |= finite
+        acc[~seen] = np.nan
+        out[seg] = acc
+    return out, history
 
 
 def _model_prediction(
@@ -208,6 +334,8 @@ def combine(
     cost_per_side: float = 0.0,
     turnover_cap: Optional[float] = None,
     smooth_halflives: Sequence[float] = (),
+    roll_window: int = ROLL_WINDOW,
+    roll_step: int = ROLL_STEP,
 ) -> CombinationResult:
     """按 `method` 组合,指标只在 `test_days`(样本外)上算。
 
@@ -218,6 +346,10 @@ def combine(
         combined = _factorgcl_prediction(columns, target, train_days, seed,
                                          **(factorgcl_kwargs or {}))
         weights = None
+    elif method in ROLLING_METHODS:
+        # 滚动方法自己定权重,`train_days` 只用来选平滑半衰期
+        combined, history = rolling_combination(method, columns, target, roll_window, roll_step)
+        weights = history[-1][1] if history else None
     elif method in MODEL_METHODS:
         combined = _model_prediction(method, columns, target, train_days, max_fit_rows, seed)
         weights = None
@@ -241,6 +373,8 @@ def combine(
     metrics["rank_ic"] = float(np.nanmean(cross_sectional_pearson(
         rank_rows(combined[test_days]), rank_rows(target[test_days]))))
     metrics["coverage"] = float(np.isfinite(combined[test_days]).mean())
+    if method in ROLLING_METHODS:
+        metrics["refits"] = float(len(history))
     if smooth_halflives:
         metrics.update(smoothed_metrics(combined, target, real_returns, train_days, test_days,
                                         smooth_halflives, cost_per_side))
@@ -292,6 +426,8 @@ def compare(
     cost_per_side: float = 0.0,
     turnover_cap: Optional[float] = None,
     smooth_halflives: Sequence[float] = (),
+    roll_window: int = ROLL_WINDOW,
+    roll_step: int = ROLL_STEP,
 ) -> Tuple[List[CombinationResult], np.ndarray]:
     """跑一组组合方法,全部在同一个样本外切分上比较。
 
@@ -315,7 +451,7 @@ def compare(
             results.append(combine(method, columns, target, real_returns,
                                    train_days, test_days, max_fit_rows, seed,
                                    factorgcl_kwargs, cost_per_side, turnover_cap,
-                                   smooth_halflives))
+                                   smooth_halflives, roll_window, roll_step))
         except Exception as exc:  # 缺可选依赖/样本不足,跳过但要说出来
             results.append(CombinationResult(
                 method, None, np.full_like(target, np.nan, dtype=np.float64),
@@ -341,6 +477,8 @@ def leaderboard(results: Sequence[CombinationResult]) -> "object":
 
 
 __all__ = [
-    "CombinationResult", "DEFAULT_METHODS", "MODEL_METHODS", "WEIGHT_METHODS",
-    "align_signs", "combine", "compare", "factor_ic_series", "leaderboard", "smoothed_metrics",
+    "CombinationResult", "DEFAULT_METHODS", "MODEL_METHODS", "ROLLING_METHODS",
+    "ROLL_STEP", "ROLL_WINDOW", "WEIGHT_METHODS",
+    "align_signs", "combine", "compare", "factor_ic_series", "leaderboard",
+    "rolling_combination", "smoothed_metrics",
 ]

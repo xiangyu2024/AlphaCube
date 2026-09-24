@@ -46,6 +46,8 @@ def main() -> int:
     ap.add_argument("--pool-top", type=int, default=120)
     ap.add_argument("--smooth-halflives", default="1,2,3,5,10,20")
     ap.add_argument("--methods", default=",".join(METHODS))
+    ap.add_argument("--roll-window", type=int, default=250)   # 滚动方法回看多少天
+    ap.add_argument("--roll-step", type=int, default=20)      # 多少天重拟合一次
     a = ap.parse_args()
 
     from alphacube.combine.post_combine import compare
@@ -115,7 +117,8 @@ def main() -> int:
     def run_combos(label, members, columns):
         t1 = time.time()
         results, signs = compare(columns, target, target, methods=methods, train_frac=a.train_frac, align=True,
-                                 seed=0, cost_per_side=cost, turnover_cap=cap, smooth_halflives=halflives)
+                                 seed=0, cost_per_side=cost, turnover_cap=cap, smooth_halflives=halflives,
+                                 roll_window=a.roll_window, roll_step=a.roll_step)
         combos = []
         for res in results:
             if "error" in res.metrics:

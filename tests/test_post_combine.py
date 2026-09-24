@@ -252,3 +252,98 @@ def test_smoothing_is_chosen_on_training_days_and_cuts_turnover():
 
     (r3,), _ = compare([col], target, target, methods=("equal",), train_frac=0.6, cost_per_side=0.0015)
     assert "halflife" not in r3.metrics and r3.metrics["sharpe_net"] == m["sharpe_net"]
+
+
+# --- 滚动组合 -------------------------------------------------------------
+# 静态方法把训练段一次拟合的权重用到三年以后;滚动方法每 step 天用最近 window 天
+# 重来一次。要证的是两件事:它真的只看过去(否则整个样本外比较作废),以及
+# 它真的会跟着关系变化调头(否则它只是把静态方法跑贵了)。
+
+def _regime_flip(T=600, N=40, flip=None, seed=3):
+    """前半段 A 预测、后半段换成 B 预测的两因子样本。"""
+    flip = T // 2 if flip is None else flip
+    rng = np.random.default_rng(seed)
+    future = rng.normal(0, 0.02, (T, N))
+    noise_a, noise_b = rng.normal(0, 0.05, (T, N)), rng.normal(0, 0.05, (T, N))
+    a = np.where(np.arange(T)[:, None] < flip, future * 0.30, 0.0) + noise_a
+    b = np.where(np.arange(T)[:, None] < flip, 0.0, future * 0.30) + noise_b
+    return [a, b], future
+
+
+def test_rolling_weights_follow_the_regime():
+    from alphacube.combine.post_combine import rolling_combination
+
+    cols, future = _regime_flip()
+    _combined, history = rolling_combination("roll_ic", cols, future, window=100, step=20)
+    before = [w for start, w in history if start < 300]
+    after = [w for start, w in history if start >= 420]      # 一个窗口之后
+    assert abs(before[-1][0]) > 3 * abs(before[-1][1])       # 换挡前押 A
+    assert abs(after[-1][1]) > 3 * abs(after[-1][0])         # 换挡后押 B
+
+
+def test_rolling_beats_a_static_fit_after_the_regime_flips():
+    from alphacube.metrics import cs_pearson, nanmean_quiet
+    from alphacube.combine.post_combine import combine, rolling_combination
+
+    cols, future = _regime_flip()
+    test = slice(420, 600)
+    rolled, _ = rolling_combination("roll_lstsq", cols, future, window=100, step=20)
+    static = combine("lstsq", cols, future, future, slice(0, 300), test).combined
+    ic_roll = nanmean_quiet(cs_pearson(rolled[test], future[test]))
+    ic_static = nanmean_quiet(cs_pearson(static[test], future[test]))
+    assert ic_roll > ic_static + 0.05
+
+
+def test_rolling_combination_cannot_see_the_future():
+    """改掉第 k 天之后的一切,第 k 天之前的输出必须一个字节都不变。"""
+    from alphacube.combine.post_combine import rolling_combination
+
+    cols, future = _regime_flip(T=300, N=30, seed=5)
+    k = 180
+    for method in ("roll_ric", "roll_ridge"):
+        base, _ = rolling_combination(method, cols, future, window=60, step=10)
+        tampered_cols = [c.copy() for c in cols]
+        tampered = future.copy()
+        rng = np.random.default_rng(7)
+        tampered[k:] = rng.normal(0, 1.0, tampered[k:].shape)
+        for c in tampered_cols:
+            c[k:] = rng.normal(0, 1.0, c[k:].shape)
+        after, _ = rolling_combination(method, tampered_cols, tampered, window=60, step=10)
+        np.testing.assert_array_equal(base[:k], after[:k])
+
+
+def test_rolling_warmup_is_empty_not_wrong():
+    from alphacube.combine.post_combine import rolling_combination
+
+    cols, future = _regime_flip(T=300, N=30)
+    combined, history = rolling_combination("roll_ic", cols, future, window=60, step=10)
+    assert np.isnan(combined[:60]).all()          # 没有历史就不出信号
+    assert np.isfinite(combined[60:]).any()
+    assert history[0][0] == 60 and len(history) == 24
+
+
+def test_rolling_methods_report_like_the_others(planted):
+    cols, future = planted
+    results, _ = compare(cols, future, future,
+                         methods=("lstsq", "roll_lstsq", "roll_ic", "roll_ric", "roll_ridge"),
+                         cost_per_side=0.0015, roll_window=100, roll_step=20)
+    for result in results:
+        assert "error" not in result.metrics, (result.method, result.metrics)
+        assert np.isfinite(result.metrics["rank_ic"])
+        assert np.isfinite(result.metrics["sharpe_net"])
+    for result in results[1:]:
+        assert result.metrics["refits"] > 0
+
+
+def test_rank_ic_weighting_prefers_the_monotone_factor():
+    """ric 和 ic 的区别要在非线性单调的因子上看得出来。"""
+    from alphacube.combine.post_combine import _weights_for
+
+    rng = np.random.default_rng(11)
+    future = rng.normal(0, 0.02, (T, N))
+    monotone = np.sign(future) * np.sqrt(np.abs(future))       # 秩几乎完美,线性很弱
+    linear_noisy = future * 0.05 + rng.normal(0, 0.12, (T, N))
+    days = slice(0, T)
+    w_ric = _weights_for("ric", [monotone, linear_noisy], future, days)
+    assert w_ric[0] > w_ric[1]
+    assert abs(w_ric.sum() - 1.0) < 1e-9
