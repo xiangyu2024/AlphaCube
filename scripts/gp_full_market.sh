@@ -9,9 +9,9 @@
 # From gpu15 on: --panel-cache-gb caps the panel LRU in bytes (the item cap does not know how big a
 # panel is -- 1024 items is 38.7 GiB here), the ban index stores sampled symbols in float32
 # (2.9 MiB an exemplar, not 29.9), and every generation logs rss/cache/exemplars/cgroup.
-# Starts with every structure earlier runs banned (36: gpu5..gpu9, gpu12's four blocks, gpu14's two) plus the
+# Starts with every structure earlier runs banned (46: gpu5..gpu9, gpu12, gpu14's two blocks, gpu15's four) plus the
 # rank ban: a candidate whose daily ranks correlate >= 0.95 with a factor of a banned family is refused
-# (exemplars from the six archives below, evaluated 150 per engine call). Costs 15 bp/side, 30% turnover cap in every report.
+# (exemplars from the seven archives below, evaluated 150 per engine call). Costs 15 bp/side, 30% turnover cap in every report.
 # From gpu10 on (user's decisions of 2026-09-19):
 #   fitness = |rank IC| - 0.14 x daily turnover of the decile book (0.14 = 15 bp/side in rank-IC units);
 #   archive families: trees whose daily ranks correlate >= 0.99 are one factor -- the archive keeps
@@ -51,6 +51,10 @@ PYTHONFAULTHANDLER=1 /root/miniconda3/envs/quant/bin/python -u -m alphacube.cli 
   --ban "O:day_q_stat_std(F:Volume)" --ban "O:cross_rank(F:High)|w241" --ban "O:day_q_stat_std(F:Amt)" \
   --ban "O:day_close(F:High)" --ban "O:cross_delta(F:High)|w30" --ban "O:day_quantile_q25(F:Ret)" \
   --ban "O:day_durbin_watson(F:Vwap)" --ban "O:day_durbin_watson(F:Volume)" --ban "O:inv(F:Low)" \
+  --ban "O:day_autocorr_n1(F:Volume)" --ban "O:day_durbin_watson(F:High)" --ban "O:day_durbin_watson(F:Ret)" \
+  --ban "O:day_mean(F:Ret)" --ban "O:day_cov(F:Ret,F:Volume)" --ban "O:day_mean(F:Amt)" \
+  --ban "O:day_cov(F:Ret,F:Ret)" --ban "O:day_argmin(F:Volume)" --ban "O:day_sum(F:Volume)" \
+  --ban "O:day_quantile_q75(F:High)" \
   --ban-rank-corr 0.95 \
   --ban-archive mining_runs/gpu5/checkpoints/archive_gen010.csv \
   --ban-archive mining_runs/gpu7/checkpoints/archive_gen007.csv \
@@ -58,6 +62,7 @@ PYTHONFAULTHANDLER=1 /root/miniconda3/envs/quant/bin/python -u -m alphacube.cli 
   --ban-archive mining_runs/gpu9/checkpoints/archive_gen010.csv \
   --ban-archive mining_runs/gpu12/checkpoints/archive_gen020.csv \
   --ban-archive mining_runs/gpu14/checkpoints/archive_gen015.csv \
+  --ban-archive mining_runs/gpu15/checkpoints/archive_gen020.csv \
   --device cuda --seed 0 --warmup 60 \
   --checkpoint-every 1 --progress-every 60 --panel-cache 1024 --panel-cache-gb 16 \
   --combine equal,ic,icir,lstsq,ridge,gbdt,lightgbm,xgboost --combine-train-frac 0.7 \
