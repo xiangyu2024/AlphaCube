@@ -59,7 +59,7 @@ PYTHONFAULTHANDLER=1 /root/miniconda3/envs/quant/bin/python -u -m alphacube.cli 
   --ban-archive mining_runs/gpu12/checkpoints/archive_gen020.csv \
   --ban-archive mining_runs/gpu14/checkpoints/archive_gen015.csv \
   --device cuda --seed 0 --warmup 60 \
-  --checkpoint-every 1 --progress-every 60 --panel-cache 1024 --panel-cache-gb 12 \
+  --checkpoint-every 1 --progress-every 60 --panel-cache 1024 --panel-cache-gb 16 \
   --combine equal,ic,icir,lstsq,ridge,gbdt,lightgbm,xgboost --combine-train-frac 0.7 \
   --run-id "$RUN_ID" --out /root/autodl-tmp/AlphaCube/mining_runs
 code=$?
