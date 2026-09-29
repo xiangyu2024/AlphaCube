@@ -68,6 +68,7 @@ MODEL_METHODS = ("ridge", "gbdt", "lightgbm", "xgboost", "factorgcl")
 ROLLING_METHODS = ("roll_ic", "roll_ric", "roll_lstsq", "roll_ridge")
 DEFAULT_METHODS = ("equal", "ic", "icir", "lstsq", "gbdt")
 
+PREDICT_CELLS = 20_000_000    # 分块预测时一块最多这么多个格子(n 个因子 -> 行数 = 它 / n)
 ROLL_WINDOW = 250      # 回看一年
 ROLL_STEP = 20         # 每月重拟合一次
 RIDGE_ALPHA = 1e-2     # 相对 trace(XᵀX)/n 的正则强度
@@ -94,7 +95,9 @@ def align_signs(
         ic = float(np.nanmean(factor_ic_series(sub_c, sub_t)))
         if np.isfinite(ic) and ic < 0:
             signs[i] = -1.0
-    return [s * c for s, c in zip(signs, columns)], signs
+    # 没翻的列直接复用,不复制:块边界上 30 条 (1942, 5220) float64 是 2.4 GB,
+    # `s * c` 会把其中一半白白再存一份。调用方不改这些数组(本模块只读它们)。
+    return [c if s > 0 else -c for s, c in zip(signs, columns)], signs
 
 
 def _weights_for(
@@ -266,8 +269,12 @@ def _model_prediction(
             "lightgbm/xgboost 是可选依赖,需要单独 pip install。"
         )
     T, N = target.shape
-    stacked = np.stack(columns, axis=-1)          # (T, N, n_factors)
-    X_all = stacked.reshape(T * N, len(columns))
+    n = len(columns)
+    # Never materialise the whole (T*N, n) design matrix: 30 members of the
+    # production cube is 2.4 GB in float64 and 100 is 8.1 GB, allocated at the
+    # block boundary on top of everything the search is already holding. The fit
+    # takes only the sampled rows, and the prediction goes chunk by chunk.
+    flat = [c.reshape(-1) for c in columns]
 
     train = np.zeros((T, N), dtype=bool)
     train[days] = True
@@ -287,8 +294,21 @@ def _model_prediction(
         model = ESTIMATOR_REGISTRY[key](random_state=seed)
     except TypeError:                                  # an estimator without a seed
         model = ESTIMATOR_REGISTRY[key]()
-    model.fit(X_all[fit_rows], y[fit_rows])
-    return np.asarray(model.predict(X_all), dtype=np.float64).reshape(T, N)
+    X_fit = np.empty((fit_rows.size, n), dtype=np.float64)
+    for j, column in enumerate(flat):
+        X_fit[:, j] = column[fit_rows]
+    model.fit(X_fit, y[fit_rows])
+    del X_fit
+
+    out = np.empty(T * N, dtype=np.float64)
+    step = max(1, PREDICT_CELLS // max(n, 1))
+    for lo in range(0, T * N, step):
+        hi = min(lo + step, T * N)
+        chunk = np.empty((hi - lo, n), dtype=np.float64)
+        for j, column in enumerate(flat):
+            chunk[:, j] = column[lo:hi]
+        out[lo:hi] = model.predict(chunk)
+    return out.reshape(T, N)
 
 
 def _factorgcl_prediction(

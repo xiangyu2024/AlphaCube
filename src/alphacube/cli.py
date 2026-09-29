@@ -108,7 +108,9 @@ def cmd_mine(a) -> int:
     from .pipeline import run_mining
 
     gp = dict(population_size=a.population, max_depth=a.max_depth, min_depth=a.min_depth, top_k=a.top_k,
-              panel_cache_items=a.panel_cache, banned_substructures=tuple(a.ban),
+              panel_cache_items=a.panel_cache,
+              panel_cache_bytes=int(a.panel_cache_gb * 1024 ** 3),
+              banned_substructures=tuple(a.ban),
               ban_rank_corr=a.ban_rank_corr, fitness_kind=a.fitness, turnover_penalty=a.turnover_penalty,
               archive_dedup=a.archive_dedup)
     if a.ban_archive:
@@ -237,6 +239,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "every field the tree touches -- 9.1 GB each on the production cube -- so on a big "
                         "machine this is the cheapest speed knob there is. One panel is n_days x n_symbols x 4 "
                         "bytes (40 MB at 1942 x 5219), so 512 is ~21 GB and 2048 is ~83 GB")
+    m.add_argument("--panel-cache-gb", type=float, default=12.0,
+                   help="hard cap on the same LRU in GiB -- whichever of the two binds first wins. "
+                        "The item cap alone does not know how big a panel is, and it does not shrink "
+                        "when the rest of the run grows: gpu14 ran --panel-cache 1024 (41 GB) beside a "
+                        "23 GB ban index in a 90 GiB container and died at a block boundary. 0 = no "
+                        "byte cap")
     m.add_argument("--top-k", type=int, default=None,
                    help="archive leaders offered to the pool at the end (default: 2 x pool capacity; the whole archive when the pool has no cap; 0 = the whole archive)")
     m.add_argument("--block-combine-top", type=int, default=120,

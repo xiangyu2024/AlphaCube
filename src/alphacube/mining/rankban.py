@@ -26,28 +26,22 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from ..metrics import rank_rows, zscore_rows
-from .pool import _DedupIndex
-
-
-class _RankIndex(_DedupIndex):
-    """``_DedupIndex`` on standardised daily ranks instead of values."""
-
-    def _rows(self, panel: np.ndarray):
-        r = zscore_rows(rank_rows(np.asarray(panel, dtype=np.float64)[self.idx]))
-        x = r.reshape(-1)
-        fin = np.isfinite(x)
-        x0 = np.where(fin, x, 0.0)
-        return x0, fin.astype(np.float64), x0 * x0
 
 
 class RankSimilarityBan:
     def __init__(self, shape: Tuple[int, int], threshold: float, sample_days: int = 250,
-                 exemplar_dedup: float = 0.99) -> None:
+                 exemplar_dedup: float = 0.99, sample_symbols: int = 1024) -> None:
         if not 0.0 < threshold <= 1.0:
             raise ValueError("threshold must be in (0, 1]")
         self.threshold = float(threshold)
         self.exemplar_dedup = float(exemplar_dedup)
-        self.index = _RankIndex(shape, sample_days)
+        # Sampled symbols in float32 (`CompactRankIndex`), not every symbol in
+        # float64: 3.1 MB an exemplar instead of 31 MB. gpu14 held 748 exemplars
+        # -- 23 GB of a 90 GiB container, second only to its panel cache -- and
+        # died at the block-3 boundary where the pool fit and four tree models
+        # land on top of that. 1024 symbols is twice what the family index uses
+        # at a stricter threshold; the decisions are the same (test_rankban).
+        self.index = CompactRankIndex(shape, sample_days, sample_symbols)
         self.exemplars: List[str] = []          # repr of each stored exemplar, in index order
         self.version = 0                         # bumps whenever an exemplar is stored
 
@@ -56,11 +50,11 @@ class RankSimilarityBan:
 
     def add(self, expr, panel: np.ndarray) -> bool:
         """Store ``panel`` as an exemplar unless one already ranks like it."""
+        rows = self.index.rows(panel)
         if self.index.k:
-            c = self.index.abs_corr(panel)
-            if np.any(c >= self.exemplar_dedup):
+            if np.any(self.index.corr(rows[:, None, :])[0] >= self.exemplar_dedup):
                 return False
-        self.index.add(panel)
+        self.index.add(rows)
         self.exemplars.append(repr(expr))
         self.version += 1
         return True
@@ -142,6 +136,15 @@ class CompactRankIndex:
     def corr(self, X: np.ndarray) -> np.ndarray:
         """|corr| of candidates ``X`` (3, m, w) against every stored row -> (m, k)."""
         return self._corr(X, self._y[:, :self.k])
+
+    def abs_corr(self, panel: np.ndarray) -> np.ndarray:
+        """|corr| of one panel against every stored row -> (k,)."""
+        return self.corr(self.rows(panel)[:, None, :])[0]
+
+    @property
+    def nbytes(self) -> int:
+        """Bytes the index holds, allocation included (it grows by k // 2)."""
+        return int(self._y.nbytes)
 
     @classmethod
     def pairwise(cls, X: np.ndarray) -> np.ndarray:

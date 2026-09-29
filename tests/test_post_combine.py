@@ -347,3 +347,16 @@ def test_rank_ic_weighting_prefers_the_monotone_factor():
     w_ric = _weights_for("ric", [monotone, linear_noisy], future, days)
     assert w_ric[0] > w_ric[1]
     assert abs(w_ric.sum() - 1.0) < 1e-9
+
+
+def test_chunked_prediction_matches_one_shot(planted, monkeypatch):
+    """树模型的预测改成分块做(块边界上不再一次性铺开 (T*N, n) 设计矩阵),
+    结果必须逐位相同 —— 分块是内存手段,不是数值手段。"""
+    from alphacube.combine import post_combine as pc
+
+    cols, future = planted
+    days = slice(0, int(T * 0.7))
+    one = pc._model_prediction("gbdt", cols, future, days, 2_000_000, 0)
+    monkeypatch.setattr(pc, "PREDICT_CELLS", 997)            # 块小到必然切很多刀
+    many = pc._model_prediction("gbdt", cols, future, days, 2_000_000, 0)
+    np.testing.assert_array_equal(one, many)

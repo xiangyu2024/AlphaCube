@@ -71,6 +71,33 @@ def cpu_quota(path: str = "/sys/fs/cgroup/cpu.max") -> Optional[int]:
         return None
 
 
+def rss_anon(path: str = "/proc/self/status") -> float:
+    """Anonymous RSS in bytes. Plain RSS also counts the mmap'd cube's page cache,
+    which is reclaimable and not what runs us out of room; anon is."""
+    try:
+        with open(path) as fh:
+            for line in fh:
+                if line.startswith("RssAnon:"):
+                    return float(line.split()[1]) * 1024.0
+    except OSError:
+        pass
+    return float("nan")
+
+
+def cgroup_memory(root: str = "/sys/fs/cgroup") -> Tuple[float, float]:
+    """(current, max) bytes of the container's memory cgroup; NaN/inf when unset.
+    The limit the container is actually killed at -- 90 GiB here -- lives here,
+    not in ``free``, which reports the 754 GB host."""
+    def read(name: str) -> float:
+        try:
+            with open(f"{root}/{name}") as fh:
+                raw = fh.read().strip()
+            return float("inf") if raw == "max" else float(raw)
+        except (OSError, ValueError):
+            return float("nan")
+    return read("memory.current"), read("memory.max")
+
+
 @contextmanager
 def torch_threads(n: Optional[int]):
     """Run the block with ``n`` torch CPU threads, then restore the pool size."""
@@ -128,6 +155,7 @@ class GPMiner:
                  top_k: Optional[int] = None, fitness_signed: bool = False, min_coverage: float = 0.5,
                  min_scored_days: float = 0.5,
                  cull_rel_threshold: float = 0.5, merge_threshold: float = 0.8, panel_cache_items: int = 512,
+                 panel_cache_bytes: Optional[int] = 12 * 1024 ** 3,
                  device: str = "cpu", chunk_symbols: Optional[int] = None, chunk_days: Optional[int] = None,
                  fields: Optional[Sequence[str]] = None, allow_boolean_ops: bool = False,
                  allow_resource_risk: bool = False, skip_kernels: "frozenset[str]" = frozenset(),
@@ -274,6 +302,13 @@ class GPMiner:
         self.dup_demoted = 0
         self._panel_cache: "OrderedDict[str, np.ndarray]" = OrderedDict()
         self._panel_cache_items = int(panel_cache_items)
+        # An item cap does not know how big a panel is. One panel is D x S x 4 =
+        # 40 MB on the production cube, so gpu14's --panel-cache 1024 was a 41 GB
+        # cache inside a 90 GiB container, next to a 23 GB ban index; it died at a
+        # block boundary, where the pool fit and four tree models land on top.
+        # Whichever cap binds first wins.
+        self._panel_cache_bytes = int(panel_cache_bytes) if panel_cache_bytes else 0
+        self._cache_bytes = 0
         self._archive: Dict[str, Tuple[Expression, float]] = {}
         self.engine_seconds = 0.0
         self.evaluated = 0
@@ -320,12 +355,28 @@ class GPMiner:
                 if p is None:
                     continue
                 if cache:
-                    self._panel_cache[k] = p
+                    self._cache_panel(k, p)
                 for i in idx:
                     out[i] = p
-            while len(self._panel_cache) > self._panel_cache_items:
-                self._panel_cache.popitem(last=False)
+            self._evict_panels()
         return out
+
+    def _cache_panel(self, key: str, panel: np.ndarray) -> None:
+        old = self._panel_cache.pop(key, None)
+        if old is not None:
+            self._cache_bytes -= old.nbytes
+        self._panel_cache[key] = panel
+        self._cache_bytes += panel.nbytes
+
+    def _evict_panels(self) -> None:
+        """LRU down to BOTH caps. Evicting a panel this generation still holds is
+        harmless -- the list returned by ``_panels`` keeps it alive until the
+        generation is scored, which is exactly how long it is needed."""
+        while self._panel_cache and (
+                len(self._panel_cache) > self._panel_cache_items
+                or (self._panel_cache_bytes and self._cache_bytes > self._panel_cache_bytes)):
+            _key, panel = self._panel_cache.popitem(last=False)
+            self._cache_bytes -= panel.nbytes
 
     def _score(self, key: str, panel: np.ndarray) -> Dict[str, float]:
         """Fitness and what it is made of, for one panel -- cached by structural key:
@@ -656,15 +707,39 @@ class GPMiner:
         report.engine_seconds = self.engine_seconds
         return report
 
+    def memory_report(self) -> Dict[str, float]:
+        """Bytes in the three structures that grow with the search, plus the process
+        and its cgroup. Printed every generation so the next silent death comes with
+        a memory curve instead of a guess: gpu14 left none."""
+        ban, fam = self._rank_ban, self._families
+        cur, cap = cgroup_memory()
+        return {"cache_items": float(len(self._panel_cache)), "cache_bytes": float(self._cache_bytes),
+                "exemplars": float(len(ban)) if ban is not None else 0.0,
+                "exemplar_bytes": float(ban.index.nbytes) if ban is not None else 0.0,
+                "families": float(len(fam)) if fam is not None else 0.0,
+                "family_bytes": float(fam.nbytes) if fam is not None else 0.0,
+                "rss_anon": rss_anon(), "cgroup_current": cur, "cgroup_max": cap}
+
+    def memory_line(self) -> str:
+        r = self.memory_report()
+        g = 1024.0 ** 3
+        out = (f"rss {r['rss_anon'] / g:.1f}G cache {r['cache_bytes'] / g:.1f}G/{int(r['cache_items'])} "
+               f"exem {r['exemplar_bytes'] / g:.2f}G/{int(r['exemplars'])} "
+               f"fam {r['family_bytes'] / g:.2f}G/{int(r['families'])}")
+        if np.isfinite(r["cgroup_current"]) and np.isfinite(r["cgroup_max"]):
+            out += f" cg {r['cgroup_current'] / g:.0f}/{r['cgroup_max'] / g:.0f}G"
+        return out
+
     def _similar_info(self) -> Dict[str, int]:
         """Rank-ban and family counters for the generation line (each only when on):
         ``similar`` refused by the rank ban, ``dup`` demoted as a lesser member of a
-        family in the same generation."""
+        family in the same generation -- and ``mem``, always."""
         out: Dict[str, int] = {}
         if self._rank_ban is not None:
             out.update(similar=self._gen_similar, exemplars=len(self._rank_ban))
         if self._families is not None:
             out["dup"] = self._gen_dup
+        out["mem"] = self.memory_line()
         return out
 
     def _commit(self) -> MiningReport:

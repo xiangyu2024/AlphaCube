@@ -577,7 +577,9 @@ def test_archive_keeps_one_member_per_rank_family(registry, view):
     assert rep.key() == pop[best].key() and m._archive[rep.key()][1] == raw[best]
     assert m._absorbed[rep.key()] == {e.key() for e in fam} - {rep.key()}
     assert m._absorbed[other.key()] == set()
-    assert m._similar_info() == {"dup": 4}
+    info = m._similar_info()
+    assert {k: v for k, v in info.items() if k != "mem"} == {"dup": 4}
+    assert "rss" in info["mem"]          # 每代都带内存,见 test_memory_report_counts_what_grows
 
 
 def test_a_better_family_member_takes_over_the_archive_place(registry, view):
@@ -714,3 +716,73 @@ def test_exemplars_are_evaluated_in_batches_and_not_cached(registry, view, monke
         assert len(m._panel_cache) == 0, "an exemplar panel is needed once"
         stored.append(list(m._rank_ban.exemplars))
     assert stored[0] == stored[1] and len(stored[0]) >= 3, stored
+
+
+# --- 内存:随代数增长的三样东西 ---------------------------------------------
+# gpu14 死在第 15/20 代的块边界上,没有 traceback。事后算账:面板 LRU 按"条数"
+# 封顶(1024 条 x 40 MB = 41 GB),ban 索引按 float64 全symbol 存(748 条 x 31 MB
+# = 23 GB),两样都只增不减,容器上限 90 GiB。下面三个测试钉住这三件事。
+
+def test_panel_cache_honours_the_byte_cap(registry, view):
+    """条数封顶不知道一条面板多大 —— 真正该封的是字节。"""
+    from alphacube.label import Label
+    from alphacube.mining.pool import MsePool
+
+    target = Label("close", 1).compute(view)
+    loose = GPMiner(registry, view, target, MsePool(4, target), population_size=6, max_depth=3,
+                    panel_cache_items=500, panel_cache_bytes=0, seed=1)   # 0 = 不按字节封
+    loose.mine(24)
+    one = next(iter(loose._panel_cache.values())).nbytes      # 引擎给的面板有多大
+
+    miner = GPMiner(registry, view, target, MsePool(4, target), population_size=6, max_depth=3,
+                    panel_cache_items=500, panel_cache_bytes=3 * one, seed=1)
+    miner.mine(24)
+    assert 0 < len(miner._panel_cache) <= 3
+    assert miner._cache_bytes <= 3 * one
+    assert miner._cache_bytes == sum(p.nbytes for p in miner._panel_cache.values())
+    assert len(loose._panel_cache) > len(miner._panel_cache)
+    assert loose.pool.size == miner.pool.size        # 缓存只影响速度,不影响结果
+
+
+def test_memory_report_counts_what_grows(registry, view):
+    from alphacube.label import Label
+    from alphacube.mining.pool import MsePool
+
+    target = Label("close", 1).compute(view)
+    miner = GPMiner(registry, view, target, MsePool(4, target), population_size=6, max_depth=3,
+                    ban_rank_corr=0.95, archive_dedup=0.99, seed=1)
+    miner.mine(24)
+    r = miner.memory_report()
+    assert r["cache_bytes"] == sum(p.nbytes for p in miner._panel_cache.values())
+    assert r["exemplar_bytes"] >= 0 and r["family_bytes"] > 0
+    assert r["families"] == len(miner._families)
+    assert "rss" in miner.memory_line() and "cache" in miner.memory_line()
+
+
+def test_ban_index_is_compact_and_decides_the_same(view):
+    """紧凑索引每条 3 MB 而不是 31 MB,但封禁判定必须和全精度一致。"""
+    import numpy as np
+    from alphacube.metrics import rank_rows, zscore_rows
+    from alphacube.mining.rankban import RankSimilarityBan
+
+    rng = np.random.default_rng(0)
+    D, S = 260, 1400
+    base = rng.normal(size=(D, S))
+    panels = [base, base * 3.0 - 1.0, np.exp(base), rng.normal(size=(D, S)),
+              base + 0.35 * rng.normal(size=(D, S)), base + 1.6 * rng.normal(size=(D, S))]
+
+    def full_abs_corr(a, b):                       # 旧口径:全 symbol、float64
+        x = zscore_rows(rank_rows(a)).reshape(-1)
+        y = zscore_rows(rank_rows(b)).reshape(-1)
+        ok = np.isfinite(x) & np.isfinite(y)
+        return abs(float(np.corrcoef(x[ok], y[ok])[0, 1]))
+
+    ban = RankSimilarityBan((D, S), threshold=0.95)
+    ban.add("first", panels[0])
+    row_mb = 3 * ban.index.width * 4 / 1024 ** 2   # 每条 exemplar 占的字节,和 S 无关
+    assert row_mb < 3.2, "旧口径是 3 x 250 x S x 8 B:S=5220 时 31 MB"
+    assert ban.index.nbytes >= row_mb * 1024 ** 2   # nbytes 报的是已分配容量,含预留
+    for panel in panels[1:]:
+        compact = float(ban.index.abs_corr(panel)[0])
+        assert abs(compact - full_abs_corr(panels[0], panel)) < 0.01
+        assert (compact >= 0.95) == (full_abs_corr(panels[0], panel) >= 0.95)
