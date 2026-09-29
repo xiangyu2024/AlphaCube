@@ -19,6 +19,8 @@ LOG = """\
   封禁 1 个一层结构,累计生效 40 个: O:day_mean(F:Ret)
 === 第 3 块结束(至第 15 代)===
   封禁 2 个一层结构,累计生效 42 个: O:cross_delta(F:Amt)|w30, O:day_mean(F:Ret)
+=== 第 4 块结束(至第 20 代)===
+  封禁 3 个一层结构,累计生效 45 个: O:day_cov(F:Low,F:Ret), O:nt_ts_cov(F:Open,F:Vwap)|w5, O:day_std(F:Low)
 """
 
 SCRIPT = """\
@@ -32,13 +34,16 @@ SCRIPT = """\
 def test_every_block_contributes_and_duplicates_collapse():
     keys = new_bans(LOG)
     assert keys == ["O:day_autocorr_n1(F:Volume)", "O:day_durbin_watson(F:High)",
-                    "O:day_durbin_watson(F:Ret)", "O:day_mean(F:Ret)", "O:cross_delta(F:Amt)|w30"]
+                    "O:day_durbin_watson(F:Ret)", "O:day_mean(F:Ret)", "O:cross_delta(F:Amt)|w30",
+                    # 双参数算子的键自己带逗号,不能按逗号切:gpu17 就死在这
+                    "O:day_cov(F:Low,F:Ret)", "O:nt_ts_cov(F:Open,F:Vwap)|w5", "O:day_std(F:Low)"]
 
 
 def test_patch_adds_bans_and_archive_without_touching_the_rest():
     out, added, added_archive = patch_script(SCRIPT, new_bans(LOG), "mining_runs/gpu15/checkpoints/archive_gen020.csv")
-    assert len(added) == 5 and added_archive
-    assert out.count('--ban "') == 7                      # 原有 2 + 新增 5
+    assert len(added) == 8 and added_archive
+    assert out.count('--ban "') == 10                     # 原有 2 + 新增 8
+    assert '--ban "O:day_cov(F:Low,F:Ret)"' in out        # 整条,不是两半
     assert '--ban "O:log(F:Amt)"' in out                  # 只加不删
     assert out.count("--ban-archive") == 2
     assert out.index("--ban \"O:day_mean(F:Ret)\"") < out.index("--ban-rank-corr")   # 插在 rank ban 之前

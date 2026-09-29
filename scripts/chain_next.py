@@ -17,13 +17,18 @@ from pathlib import Path
 from typing import List
 
 BAN_LINE = re.compile(r"封禁\s+\d+\s+个一层结构[,,]\s*累计生效\s+\d+\s+个[::]\s*(.+?)\s*$", re.M)
+# 键之间用 ", " 分隔,而键**自己也带逗号** —— 双参数算子写成 O:day_cov(F:Low,F:Ret)。
+# 按纯逗号切会把它劈成两半,gpu17 就是这么起来 90 秒就 exit 1 的
+# (ValueError: ban key 'O:nt_ts_cov(F:Open' is not a depth-1 structure)。
+# 键一律以 O: 开头,所以只在"逗号 + 后面跟着 O:"的地方切。
+KEY_SEP = re.compile(r",\s*(?=O:)")
 
 
 def new_bans(log_text: str) -> List[str]:
     """日志里所有块尾封禁行上的结构键,按出现顺序去重。"""
     keys: List[str] = []
     for match in BAN_LINE.finditer(log_text):
-        for key in match.group(1).split(","):
+        for key in KEY_SEP.split(match.group(1)):
             key = key.strip()
             if key and key not in keys:
                 keys.append(key)
