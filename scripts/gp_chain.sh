@@ -28,6 +28,9 @@ fold() {                      # 一轮的收尾检查 + 并入下一轮
   [ "$n" -ge 100 ] || halt "$rid 的 archive 只有 $n 条,不正常"
   PYTHONPATH=src "$PY" scripts/chain_next.py "${rid}_run.log" scripts/gp_full_market.sh "$arc" >> _bench/chain.log 2>&1 \
     || halt "$rid 并入下一轮失败"
+  # 合并完立刻验一遍键:gpu17 是在 GPMiner 构造时才发现坏键的,那时已经白起了一次
+  PYTHONPATH=src "$PY" scripts/check_ban_keys.py scripts/gp_full_market.sh >> _bench/chain.log 2>&1 \
+    || halt "$rid 合并之后封禁键不合法,见 _bench/chain.log"
   note "$rid 正常结束,archive $n 条,已并入下一轮"
 }
 

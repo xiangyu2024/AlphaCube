@@ -60,3 +60,15 @@ def test_second_pass_is_a_no_op():
 def test_a_log_with_no_bans_changes_nothing():
     out, added, added_archive = patch_script(SCRIPT, new_bans("     5/20 best +0.01\n"), "")
     assert out == SCRIPT and added == [] and not added_archive
+
+
+def test_bad_ban_keys_are_caught_before_a_launch():
+    """gpu17 是在 GPMiner 构造时才发现坏键的 —— 那时已经白起了一次。"""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    from check_ban_keys import check
+
+    good = '--ban "O:log(F:Amt)" --ban "O:day_cov(F:Low,F:Ret)" --ban "O:nt_ts_argmax(F:High)|w3"'
+    assert check(good) == []
+    broken = '--ban "O:nt_ts_cov(F:Open" --ban "F:Vwap)|w5" --ban "O:day_max(F:Nonexistent)"'
+    bad = [k for k, _why in check(broken)]
+    assert bad == ["O:nt_ts_cov(F:Open", "F:Vwap)|w5", "O:day_max(F:Nonexistent)"]
