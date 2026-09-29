@@ -310,7 +310,29 @@ def run_mining(
             raise ValueError(f"unknown miner {miner!r}; choose from {MINERS}")
         vocab = Vocabulary(reg, n_minutes=view.n_minutes, allow_boolean_ops=allow_boolean_ops,
                            allow_resource_risk=allow_resource_risk)
-        rew = BatchRewarder(engine, pool_obj)
+        # RL 和 GP 用同一个目标函数和同一套封禁 —— CLI 上的 --fitness /
+        # --turnover-penalty / --ban / --ban-rank-corr / --ban-archive 走的是同一个
+        # gp_params。以前 RL 的奖励是 Pearson 池 IC,和 gpu10 起 GP 用的
+        # |rank IC| - 0.14 x 换手 不是一个东西,两条线挖出来的没法比。
+        cfg = dict(gp_params or {})
+        kind = str(cfg.get("fitness_kind", "ic"))
+        penalty = float(cfg.get("turnover_penalty", 0.0))
+        scorer = None
+        if kind != "ic" or penalty > 0:
+            from .mining.scoring import PanelScorer
+            scorer = PanelScorer(target, kind=kind, turnover_penalty=penalty,
+                                 min_coverage=min_coverage, min_scored_days=min_scored_days)
+        rank_ban = None
+        if cfg.get("ban_rank_corr"):
+            from .mining.rankban import RankSimilarityBan
+            rank_ban = RankSimilarityBan(target.shape, float(cfg["ban_rank_corr"]))
+        rew = BatchRewarder(engine, pool_obj, scorer=scorer, rank_ban=rank_ban,
+                            banned_substructures=tuple(cfg.get("banned_substructures", ())),
+                            panel_cache_items=int(cfg.get("panel_cache_items", 256)),
+                            panel_cache_bytes=cfg.get("panel_cache_bytes", 8 * 1024 ** 3))
+        if rank_ban is not None and cfg.get("ban_exemplars"):
+            n = rew.add_exemplars(list(cfg["ban_exemplars"]))
+            say(f"rank-ban exemplars: {n} 个(来自 {len(cfg['ban_exemplars'])} 条表达式)")
         cls = {"alphagen": AlphaGenMiner, "alphaqcm": AlphaQCMMiner, "alphaforge": AlphaForgeMiner,
                "alphasage": AlphaSAGEMiner, "warmstart": PPOWarmStartQCMMiner}[miner]
         m = cls(vocab, rew, max_expr_len=max_expr_len, seed=seed, **(rl_params or {}))

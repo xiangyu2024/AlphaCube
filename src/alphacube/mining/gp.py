@@ -44,6 +44,7 @@ from ..store import CubeView
 from .clustering import cluster_population, cull_clusters
 from .generator import TypedTreeGenerator, one_layer_keys
 from .rankban import CompactRankIndex, RankSimilarityBan
+from .scoring import BOOK_TOP_FRAC as _SHARED_TOP_FRAC, PanelScorer
 from .pool import LinearPool
 
 ProgressFn = Callable[[int, int, dict], None]
@@ -51,7 +52,7 @@ ProgressFn = Callable[[int, int, dict], None]
 FITNESS_KINDS = ("ic", "rank_ic")
 # The book every report trades -- top/bottom decile, equal weight, gross 1
 # (backtest_metrics' default) -- and so the one whose turnover the fitness charges.
-BOOK_TOP_FRAC = 0.1
+BOOK_TOP_FRAC = _SHARED_TOP_FRAC
 # Rank-ban exemplars per engine call (see GPMiner._add_exemplars).
 EXEMPLAR_BATCH = 150
 
@@ -278,9 +279,16 @@ class GPMiner:
         self._rich = fitness_kind != "ic" or self.turnover_penalty > 0
         self._scores: Dict[str, Dict[str, float]] = {}     # key -> ic, rank_ic, turnover, fit
         self._score_threads = cpu_quota()
+        self._scorer: Optional[PanelScorer] = None
         if self._rich:
-            self._target_t64 = torch.from_numpy(np.ascontiguousarray(self.target))
-            self._target_ranks_t = torch_rank_rows(self.target)
+            # GP 和 RL 用同一个打分器(mining/scoring.py),免得两条搜索线各算各的目标
+            self._scorer = PanelScorer(self.target, kind=fitness_kind,
+                                       turnover_penalty=self.turnover_penalty,
+                                       signed=self.fitness_signed, top_frac=BOOK_TOP_FRAC,
+                                       min_coverage=self.min_coverage,
+                                       min_scored_days=self.min_scored_days)
+            self._target_t64 = self._scorer.target_t64
+            self._target_ranks_t = self._scorer.target_ranks_t
         # Only for the checkpoint's after-cost column; the fitness charges costs
         # through turnover_penalty.
         self.cost_per_side = float(cost_per_side)
@@ -387,18 +395,8 @@ class GPMiner:
         s = self._scores.get(key)
         if s is not None:
             return s
-        ric_days, turnover = rank_ic_turnover(panel, self._target_ranks_t, BOOK_TOP_FRAC)
-        x = torch.from_numpy(np.ascontiguousarray(panel)).to(torch.float64)
-        ic_days = _cs_corr_days_t(x, self._target_t64).numpy()
-        ic, ric = nanmean_quiet(ic_days), nanmean_quiet(ric_days)
-        base = ric if self.fitness_kind == "rank_ic" else ic
-        cov = float((np.isfinite(panel) & self._target_finite).sum() / self._target_cells)
-        scored = np.isfinite(ic_days).sum() / self._usable_days
-        fit = -np.inf
-        if (np.isfinite(base) and cov >= self.min_coverage
-                and (self.min_scored_days <= 0 or scored >= self.min_scored_days)):
-            fit = (base if self.fitness_signed else abs(base)) - self.turnover_penalty * turnover
-        s = self._scores[key] = {"ic": ic, "rank_ic": ric, "turnover": float(turnover), "fit": float(fit)}
+        assert self._scorer is not None, "_score 只在带换手惩罚/rank IC 的路径上调用"
+        s = self._scores[key] = self._scorer.score(panel)
         return s
 
     def fitness(self, population: Sequence[Expression]) -> np.ndarray:
