@@ -56,6 +56,26 @@ def collect(runs_dir: Path):
     return out, dropped
 
 
+def drop_from_cache(path: Path) -> None:
+    """刚写完的面板这一轮不会再读,却占着 cgroup 的 page cache。
+
+    实测:写到第 1050 个面板时,容器 87/90 GiB 里有 66.9 GiB 是 page cache,
+    立方体自己的页被挤出去,每批评估都要回 RAID 重读 —— 批次耗时从 134 秒
+    一路涨到 1700 秒(13 倍)。手工对已写文件做一次 DONTNEED,cgroup 立刻回到
+    27/90 GiB。POSIX_FADV_DONTNEED 只丢干净页,不动数据。
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    except (OSError, AttributeError):
+        pass
+    finally:
+        os.close(fd)
+
+
 def remap_existing(out: Path, items) -> int:
     """老 manifest 里已经算过的面板,按**表达式**搬到新序号上;返回搬了几个。
 
@@ -148,7 +168,9 @@ def main() -> int:
             tmp = out / "panels" / f"{i:05d}.npy.tmp"
             with open(tmp, "wb") as fh:
                 np.save(fh, np.asarray(p, dtype=np.float32))
-            os.replace(tmp, out / "panels" / f"{i:05d}.npy")
+            final = out / "panels" / f"{i:05d}.npy"
+            os.replace(tmp, final)
+            drop_from_cache(final)
         done = b0 + len(idx)
         el = time.time() - t_all
         print(f"batch {b0 // a.batch + 1}: {len(idx)} in {time.time() - t0:.0f}s, failed so far {failed}; "
