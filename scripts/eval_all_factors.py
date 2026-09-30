@@ -56,6 +56,45 @@ def collect(runs_dir: Path):
     return out, dropped
 
 
+def remap_existing(out: Path, items) -> int:
+    """老 manifest 里已经算过的面板,按**表达式**搬到新序号上;返回搬了几个。
+
+    面板文件名就是序号,而"哪个序号"会随着新 run 的加入整体错位:目录按字母序
+    遍历,gpu2 排在 gpu17 后面,所以加三个新 run 会把 gpu2~gpu9 的序号全推后。
+    不搬就会"这个序号的面板已经在盘上"张冠李戴 —— 而重算 106 GB 的面板是十个
+    小时的 GPU,搬一次是几秒钟的元数据操作。
+
+    整目录改名之后再逐个搬回去,避免新旧序号互相踩。搬完还剩下的,是这一轮不再
+    需要的表达式(archive 被改过);留着不删,让人自己看一眼。
+    """
+    man = out / "manifest.csv"
+    panels = out / "panels"
+    if not man.exists() or not panels.exists():
+        return 0
+    old = {r["expression"]: int(r["i"]) for r in csv.DictReader(open(man, encoding="utf-8"))}
+    new = {text: i for i, (_run, text, _e) in enumerate(items)}
+    if all(old.get(t) == i for t, i in new.items() if t in old):
+        return 0                                     # 序号没变,什么都不用做
+    stash = out / "panels_previous"
+    if stash.exists():
+        raise SystemExit(f"{stash} 还在,先处理掉它再跑")
+    panels.rename(stash)
+    panels.mkdir()
+    moved = 0
+    for text, oi in old.items():
+        ni = new.get(text)
+        src = stash / f"{oi:05d}.npy"
+        if ni is not None and src.exists():
+            src.rename(panels / f"{ni:05d}.npy")
+            moved += 1
+    left = list(stash.iterdir())
+    if left:
+        print(f"注意:{len(left)} 个面板在这一轮的表达式里找不到对应,留在 {stash}", flush=True)
+    else:
+        stash.rmdir()
+    return moved
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("runs_dir")
@@ -79,6 +118,9 @@ def main() -> int:
     items, dropped = collect(Path(a.runs_dir))
     if a.limit:
         items = items[: a.limit]
+    moved = remap_existing(out, items)
+    if moved:
+        print(f"{moved} 个已有面板按表达式搬到了新序号(目录按字母序,新 run 会让序号错位)", flush=True)
     with open(out / "manifest.csv", "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["i", "run", "expression"])

@@ -89,6 +89,10 @@ def score(i):
         "ic_train": ic_tr, "ic_test": nanmean_quiet(ic_days[split:]), "ic": nanmean_quiet(ic_days),
         "rank_ic_train": nanmean_quiet(ric_days[:split]), "rank_ic_test": nanmean_quiet(ric_days[split:]),
         "rank_ic": nanmean_quiet(ric_days), "turnover": float(turnover), "sign": sign,
+        # ICIR = 逐日 IC 的均值/标准差。单因子层面看稳定性比看强度值钱:同样 |IC|,
+        # ICIR 高的那个才是每天都在赚,而不是几天赚完剩下全在回吐。
+        "icir": _icir(ic_days), "icir_train": _icir(ic_days[:split]), "icir_test": _icir(ic_days[split:]),
+        "rank_icir": _icir(ric_days), "rank_icir_test": _icir(ric_days[split:]),
         "net_sharpe": sh(net), "net_sharpe_train": sh(net[:split]), "net_sharpe_test": sh(net[split:]),
         "gross_sharpe": sh(gross), "gross_sharpe_test": sh(gross[split:]),
         "ann_net": float(f.mean() * 252) if f.size else float("nan"),
