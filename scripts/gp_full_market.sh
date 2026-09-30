@@ -32,7 +32,7 @@ PYTHONFAULTHANDLER=1 /root/miniconda3/envs/quant/bin/python -u -m alphacube.cli 
   --mirror-root /root/autodl-tmp/AlphaCube/mirror \
   --start 20180102 --end 20251231 \
   --label open_vwap15 --horizon 1 \
-  --miner gp --budget 1280 --population 64 --min-depth 2 --max-depth 5 \
+  --miner gp --budget 1280 --population 64 --min-depth 3 --max-depth 5 \
   --pool mse --pool-capacity 30 --dedup 0.95 \
   --min-coverage 0.5 --min-scored-days 0.5 \
   --cost-per-side 0.0015 --turnover-cap 0.30 \
