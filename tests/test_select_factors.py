@@ -100,3 +100,23 @@ def test_champion_protects_against_a_worse_challenger():
     kept2, why2 = champion_challenger(obj, good, bad)
     assert kept2 == good and "挑战者胜" in why2
     assert champion_challenger(obj, bad, None)[0] == bad      # 没有擂主时照收
+
+
+def test_shortlist_spans_the_cost_tradeoff_not_the_extremes():
+    """每族三个候选来自同一个式子的三个成本假设,不是"|rank IC| 最大 + 换手最低"
+    那种端点解 —— 端点上一个是靠高换手撑起来的强度,一个可能几乎不动、没信息。"""
+    from select_factors import shortlist
+
+    rows = [  # 同一族:慢而弱 / 中庸 / 快而强
+        {"rank_ic_train": "0.020", "turnover": "0.01"},
+        {"rank_ic_train": "0.035", "turnover": "0.10"},
+        {"rank_ic_train": "0.070", "turnover": "0.30"},
+        {"rank_ic_train": "0.005", "turnover": "0.001"},   # 几乎不动、没信息:不该被选
+    ]
+    labels = np.zeros(len(rows), dtype=int)
+    picked = shortlist(labels, rows, per_family=3, lambdas=(0.07, 0.14, 0.20))
+    assert picked == [0, 1, 2], picked        # 三个成本假设各挑一个,顺延不重复
+    assert 3 not in picked, "换手最低但没信息的那个不该进来"
+    # λ 越大越偏向慢的:极端成本假设下选的是最慢的那个
+    assert shortlist(labels, rows, 1, (1.0,)) == [0]
+    assert shortlist(labels, rows, 1, (0.0,)) == [2]       # 不计成本时选最强的

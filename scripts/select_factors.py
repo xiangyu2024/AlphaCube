@@ -194,8 +194,8 @@ def champion_challenger(obj: SetObjective, challenger: List[int],
     return (challenger, f"挑战者胜 {a:+.4f} > {b:+.4f}") if a > b else (champion, f"擂主守擂 {b:+.4f} >= {a:+.4f}")
 
 
-__all__ = ["cluster_by_correlation", "SetObjective", "forward_select",
-           "replace_within_clusters", "global_swap", "champion_challenger", "LAMBDA"]
+__all__ = ["cluster_by_correlation", "SetObjective", "forward_select", "replace_within_clusters",
+           "global_swap", "champion_challenger", "shortlist", "LAMBDA", "SHORTLIST_LAMBDAS"]
 
 
 # --- 生产入口 -----------------------------------------------------------------
@@ -238,11 +238,20 @@ def pairwise_abs_corr(fp: np.ndarray, block: int = 512) -> np.ndarray:
     return out
 
 
-def shortlist(labels: np.ndarray, rows: List[dict], per_family: int = 3) -> List[int]:
-    """每族按三个不同口径各取一个:适应度最好、|rank IC| 最大、换手最低。
+SHORTLIST_LAMBDAS = (0.07, 0.14, 0.20)
 
-    三个口径而不是一个,是因为今天量到"单因子分数和边际贡献几乎无关",
-    单一口径会系统性地漏掉某一类(按适应度筛会把高换手的全毙掉,包括 RL 挖的)。
+
+def shortlist(labels: np.ndarray, rows: List[dict], per_family: int = 3,
+              lambdas: Sequence[float] = SHORTLIST_LAMBDAS) -> List[int]:
+    """每族按**几个不同成本假设下的适应度**各取一个,重复就顺延到下一名。
+
+    三个口径而不是一个,是因为单因子分数和边际贡献几乎无关,单一口径会系统性地
+    漏掉一类(λ=0.14 的适应度会把高换手因子全毙掉,RL 挖的 23 个全在其中)。
+
+    但口径必须在**同一个尺度**上。用"|rank IC| 最大"和"换手最低"去凑另外两个,
+    挑的是两端的退化解:前者是靠高换手撑起来的强度,后者可能几乎不动、没信息。
+    改成同一个式子的三个成本假设 —— λ=0.07(成本乐观)/0.14(现用)/0.20(悲观),
+    横跨的是同一条权衡曲线上的三点,不是三个不同的东西。
     """
     num = lambda r, k: float(r[k]) if r[k] not in ("", "nan", "None") else np.nan   # noqa: E731
     keep: List[int] = []
@@ -250,16 +259,12 @@ def shortlist(labels: np.ndarray, rows: List[dict], per_family: int = 3) -> List
         idx = np.flatnonzero(labels == fam)
         if idx.size == 0:
             continue
-        order = {
-            "fit": sorted(idx, key=lambda j: -(abs(num(rows[j], "rank_ic_train"))
-                                               - LAMBDA * num(rows[j], "turnover"))),
-            "ric": sorted(idx, key=lambda j: -abs(num(rows[j], "rank_ic_train"))),
-            "turn": sorted(idx, key=lambda j: num(rows[j], "turnover")),
-        }
-        picked = []
-        for key in ("fit", "ric", "turn"):
-            for j in order[key]:
-                if j not in picked:
+        picked: List[int] = []
+        for lam in lambdas:
+            order = sorted(idx, key=lambda j: -(abs(num(rows[j], "rank_ic_train"))
+                                                - lam * num(rows[j], "turnover")))
+            for j in order:
+                if int(j) not in picked:
                     picked.append(int(j))
                     break
         keep.extend(picked[:per_family])
@@ -279,6 +284,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--symbols", type=int, default=512)
     ap.add_argument("--cluster", type=float, default=0.7, help="聚类阈值:|rank corr| 高于它算同一族")
     ap.add_argument("--per-family", type=int, default=3)
+    ap.add_argument("--shortlist-lambdas", default=",".join(str(x) for x in SHORTLIST_LAMBDAS),
+                    help="每族按这几个成本假设下的适应度各取一个(重复顺延)")
     ap.add_argument("--k", type=int, default=50)
     ap.add_argument("--penalty", type=float, default=LAMBDA)
     ap.add_argument("--champion", default="", help="上一轮的选择(json);新解打不过它就留它")
@@ -318,8 +325,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"聚类:{sizes.size} 族(最大 {sizes.max()},中位 {int(np.median(sizes))},"
           f"单点族 {int((sizes == 1).sum())}) ({time.time()-t0:.0f}s)", flush=True)
 
-    pool = shortlist(labels, rows, a.per_family)
-    print(f"候选 {len(pool)} 个(每族最多 {a.per_family} 个) ({time.time()-t0:.0f}s)", flush=True)
+    lams = tuple(float(x) for x in a.shortlist_lambdas.split(",") if x)
+    pool = shortlist(labels, rows, a.per_family, lams)
+    print(f"候选 {len(pool)} 个(每族最多 {a.per_family} 个,成本假设 {lams}) ({time.time()-t0:.0f}s)",
+          flush=True)
 
     signs = np.array([1.0 if nanmean_quiet(cs_pearson(
         np.load(d / "panels" / f"{int(rows[j]['i']):05d}.npy", mmap_mode="r")[days][:, cols].astype(np.float64),
