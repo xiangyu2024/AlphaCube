@@ -51,6 +51,16 @@ def init(d, split, cost, threads):
         index=CompactRankIndex(target.shape), threads=threads)
 
 
+def _icir(series) -> float:
+    """逐日 IC 的 均值/标准差。同样的 |IC|,ICIR 高的那个才是每天都在赚,
+    而不是几天赚完、剩下全在回吐。"""
+    f = series[np.isfinite(series)]
+    if f.size < 2:
+        return float("nan")
+    sd = float(f.std())
+    return float(f.mean() / sd) if sd > 1e-12 else float("nan")
+
+
 def score(i):
     from alphacube.metrics import (cs_pearson, long_short_weights, nanmean_quiet, portfolio_returns,
                                    rank_ic_turnover)
