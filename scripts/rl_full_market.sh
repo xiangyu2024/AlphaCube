@@ -22,7 +22,9 @@ while IFS= read -r key; do ARGS+=(--ban "$key"); done \
   < <(grep -oE -- '--ban "[^"]+"' scripts/gp_full_market.sh | sed 's/^--ban "//; s/"$//')
 while IFS= read -r arc; do ARGS+=(--ban-archive "$arc"); done \
   < <(grep -oE -- '--ban-archive [^ \\]+' scripts/gp_full_market.sh | sed 's/^--ban-archive //')
-echo "从 gp_full_market.sh 继承:$(( $(grep -c -- '--ban "' <<< "$(printf '%s\n' "${ARGS[@]}")") )) 条结构封禁 + $(grep -c -- 'archive_gen' <<< "$(printf '%s\n' "${ARGS[@]}")") 组存档"
+nb=$(printf '%s\n' "${ARGS[@]}" | grep -cx -- '--ban')
+na=$(printf '%s\n' "${ARGS[@]}" | grep -cx -- '--ban-archive')
+echo "从 gp_full_market.sh 继承:$nb 条结构封禁 + $na 组存档"
 
 set +e
 # 不用 exec:要留下退出码(gpu14 死得无声无息就是因为没人记 $?)
