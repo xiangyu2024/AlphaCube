@@ -109,6 +109,7 @@ def cmd_mine(a) -> int:
 
     gp = dict(population_size=a.population, max_depth=a.max_depth, min_depth=a.min_depth, top_k=a.top_k,
               panel_cache_items=a.panel_cache,
+              exemplar_cache=(a.exemplar_cache or None), exemplar_cache_gb=a.exemplar_cache_gb,
               panel_cache_bytes=int(a.panel_cache_gb * 1024 ** 3),
               banned_substructures=tuple(a.ban),
               ban_rank_corr=a.ban_rank_corr, fitness_kind=a.fitness, turnover_penalty=a.turnover_penalty,
@@ -239,6 +240,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "every field the tree touches -- 9.1 GB each on the production cube -- so on a big "
                         "machine this is the cheapest speed knob there is. One panel is n_days x n_symbols x 4 "
                         "bytes (40 MB at 1942 x 5219), so 512 is ~21 GB and 2048 is ~83 GB")
+    m.add_argument("--exemplar-cache", default="tmp/exemplar_cache",
+                   help="ban exemplar 的秩指纹缓存目录(空字符串 = 关掉)。每轮开跑要把 ban-archive 里的"
+                        "表达式全评估一遍只为拿指纹:gpu17 的 1673 条花了 2 小时 04 分。一条指纹 3.07 MB,"
+                        "读回来几秒。视图(日期范围/股票数/采样)一变旧缓存自动作废并删除")
+    m.add_argument("--exemplar-cache-gb", type=float, default=12.0,
+                   help="缓存上限,超了按最近使用时间淘汰(0 = 不限)")
     m.add_argument("--panel-cache-gb", type=float, default=12.0,
                    help="hard cap on the same LRU in GiB -- whichever of the two binds first wins. "
                         "The item cap alone does not know how big a panel is, and it does not shrink "

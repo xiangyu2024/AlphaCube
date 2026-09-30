@@ -50,10 +50,12 @@ class RankSimilarityBan:
 
     def add(self, expr, panel: np.ndarray) -> bool:
         """Store ``panel`` as an exemplar unless one already ranks like it."""
-        rows = self.index.rows(panel)
-        if self.index.k:
-            if np.any(self.index.corr(rows[:, None, :])[0] >= self.exemplar_dedup):
-                return False
+        return self.add_rows(expr, self.index.rows(panel))
+
+    def add_rows(self, expr, rows: np.ndarray) -> bool:
+        """同上,但直接吃秩指纹 —— 缓存命中时面板根本没被算出来过。"""
+        if self.index.k and np.any(self.index.corr(rows[:, None, :])[0] >= self.exemplar_dedup):
+            return False
         self.index.add(rows)
         self.exemplars.append(repr(expr))
         self.version += 1
@@ -152,4 +154,99 @@ class CompactRankIndex:
         return cls._corr(X, X)
 
 
-__all__ = ["RankSimilarityBan", "CompactRankIndex"]
+class ExemplarCache:
+    """把 ban exemplar 的秩指纹落盘,下次直接读,不再重算面板。
+
+    每轮开跑前都要把 ban-archive 里的表达式全评估一遍,只为了拿它们的秩指纹:
+    gpu15 装 1049 条花了 1 小时,gpu17 装 1673 条花了 **2 小时 04 分** —— 一轮
+    四个多小时里三分之一在重算前几轮已经算过的东西,而且 ban 列表每轮都在长。
+    一条指纹是 3 x 250 x 1024 x 4 B = 3.07 MB,2500 条 7.7 GB,读回来是几秒。
+
+    文件按"视图键 + 表达式哈希"存:指纹取决于哪些天、哪些股票、采样几天几只,
+    视图一换,旧的全部作废 —— 所以**构造时就把其它视图键的目录删掉**,那些文件
+    再也不会被用到。当前视图的目录超过 ``max_bytes`` 时按最近使用时间淘汰。
+    """
+
+    def __init__(self, root, view_key: str, max_bytes: int = 12 * 1024 ** 3) -> None:
+        from pathlib import Path
+
+        self.root = Path(root)
+        self.view_key = str(view_key)
+        self.max_bytes = int(max_bytes)
+        self.dir = self.root / self.view_key
+        self.hits = 0
+        self.misses = 0
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.dropped_views = self._drop_other_views()
+
+    def _drop_other_views(self) -> int:
+        """别的视图键的目录:那些指纹和当前这批数据对不上,永远用不到了。"""
+        import shutil
+
+        dropped = 0
+        for child in self.root.iterdir():
+            if child.is_dir() and child.name != self.view_key:
+                shutil.rmtree(child, ignore_errors=True)
+                dropped += 1
+        return dropped
+
+    @staticmethod
+    def _name(expression: str) -> str:
+        import hashlib
+
+        return hashlib.sha1(expression.encode("utf-8")).hexdigest()[:24] + ".npy"
+
+    def get(self, expression: str) -> Optional[np.ndarray]:
+        path = self.dir / self._name(expression)
+        try:
+            rows = np.load(path)
+        except (OSError, ValueError):
+            self.misses += 1
+            return None
+        path.touch()                      # 最近使用时间,淘汰时看它
+        self.hits += 1
+        return np.ascontiguousarray(rows, dtype=np.float32)
+
+    def put(self, expression: str, rows: np.ndarray) -> None:
+        path = self.dir / self._name(expression)
+        # 临时名也必须以 .npy 结尾:np.save 会自作主张补后缀,写出 xxx.tmp.npy,
+        # 然后替换 xxx.tmp 找不到文件 —— 缓存会**静默地**一条都存不下来。
+        tmp = path.with_name(path.name + ".tmp.npy")
+        try:
+            np.save(tmp, np.ascontiguousarray(rows, dtype=np.float32))
+            tmp.replace(path)             # 原子替换:半个文件比没有文件更糟
+        except OSError:
+            tmp.unlink(missing_ok=True)
+
+    def prune(self) -> int:
+        """超过上限就按最近使用时间从旧到新删,返回删了几个。"""
+        if self.max_bytes <= 0:
+            return 0
+        files = sorted(self.dir.glob("*.npy"), key=lambda p: p.stat().st_mtime)
+        total = sum(p.stat().st_size for p in files)
+        removed = 0
+        for path in files:
+            if total <= self.max_bytes:
+                break
+            total -= path.stat().st_size
+            path.unlink(missing_ok=True)
+            removed += 1
+        return removed
+
+    def summary(self) -> str:
+        n = len(list(self.dir.glob("*.npy")))
+        gb = sum(p.stat().st_size for p in self.dir.glob("*.npy")) / 1024 ** 3
+        return f"exemplar 缓存 {n} 条 / {gb:.1f} GB(命中 {self.hits},未命中 {self.misses})"
+
+
+def view_cache_key(view, sample_days: int, sample_symbols: int) -> str:
+    """指纹取决于这些东西,任何一个变了,缓存就作废。"""
+    import hashlib
+
+    dates = [str(x) for x in view.dates]
+    raw = "|".join([dates[0], dates[-1], str(len(dates)), str(view.n_symbols),
+                    str(int(sample_days)), str(int(sample_symbols))])
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+__all__ = ["RankSimilarityBan", "CompactRankIndex", "ExemplarCache", "view_cache_key"]

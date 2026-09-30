@@ -43,7 +43,7 @@ from ..metrics import (MIN_PAIRS, _cs_corr_days_t, batched_ic, cs_pearson, nanme
 from ..store import CubeView
 from .clustering import cluster_population, cull_clusters
 from .generator import TypedTreeGenerator, one_layer_keys
-from .rankban import CompactRankIndex, RankSimilarityBan
+from .rankban import CompactRankIndex, ExemplarCache, RankSimilarityBan, view_cache_key
 from .scoring import BOOK_TOP_FRAC as _SHARED_TOP_FRAC, PanelScorer
 from .pool import LinearPool
 
@@ -156,6 +156,7 @@ class GPMiner:
                  top_k: Optional[int] = None, fitness_signed: bool = False, min_coverage: float = 0.5,
                  min_scored_days: float = 0.5,
                  cull_rel_threshold: float = 0.5, merge_threshold: float = 0.8, panel_cache_items: int = 512,
+                 exemplar_cache: Optional[str] = None, exemplar_cache_gb: float = 12.0,
                  panel_cache_bytes: Optional[int] = 12 * 1024 ** 3,
                  device: str = "cpu", chunk_symbols: Optional[int] = None, chunk_days: Optional[int] = None,
                  fields: Optional[Sequence[str]] = None, allow_boolean_ops: bool = False,
@@ -249,6 +250,12 @@ class GPMiner:
         # evaluated when mining starts; each rolling block adds its own.
         self._rank_ban = RankSimilarityBan(self.target.shape, ban_rank_corr) if ban_rank_corr else None
         self._pending_exemplars = list(ban_exemplars) if self._rank_ban is not None else []
+        self._exemplar_cache = None
+        if self._rank_ban is not None and exemplar_cache:
+            self._exemplar_cache = ExemplarCache(
+                exemplar_cache, view_cache_key(view, self._rank_ban.index.days.size,
+                                               self._rank_ban.index.cols.size),
+                max_bytes=int(exemplar_cache_gb * 1024 ** 3))
         self._rank_verdict: Dict[str, Tuple[int, bool]] = {}
         self._gen_similar = 0
         self.similar_refused = 0
@@ -449,11 +456,25 @@ class GPMiner:
             return 0
         added = 0
         exprs = list(exprs)
+        cache = self._exemplar_cache
         for lo in range(0, len(exprs), max(1, int(batch))):
             part = exprs[lo:lo + batch]
-            for e, p in zip(part, self._panels(part, cache=False)):
-                if p is not None and self._rank_ban.add(e, p):
+            # 先查缓存,只把没命中的送进引擎;插入仍按原顺序,所以去重留下的是同一批
+            rows = [cache.get(repr(e)) if cache is not None else None for e in part]
+            todo = [i for i, r in enumerate(rows) if r is None]
+            if todo:
+                panels = self._panels([part[i] for i in todo], cache=False)
+                for i, panel in zip(todo, panels):
+                    if panel is None:
+                        continue
+                    rows[i] = self._rank_ban.index.rows(panel)
+                    if cache is not None:
+                        cache.put(repr(part[i]), rows[i])
+            for e, r in zip(part, rows):
+                if r is not None and self._rank_ban.add_rows(e, r):
                     added += 1
+        if cache is not None:
+            cache.prune()
         return added
 
     def _roll(self, population, fit, generation: int) -> List[str]:

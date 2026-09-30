@@ -123,6 +123,7 @@ class BatchRewarder:
         self.rank_ban = rank_ban
         self.refused_structure = 0
         self.refused_similar = 0
+        self.exemplar_cache = None        # 由 pipeline 塞进来,见 rankban.ExemplarCache
         self.n_evaluated = 0
         self.engine_seconds = 0.0
 
@@ -169,11 +170,23 @@ class BatchRewarder:
             return 0
         added = 0
         exprs = list(exprs)
+        cache = self.exemplar_cache
         for lo in range(0, len(exprs), max(1, int(batch))):
             part = exprs[lo:lo + batch]
-            for e, panel in zip(part, self.panels(part, cache=False)):
-                if panel is not None and self.rank_ban.add(e, panel.astype(np.float64)):
+            rows = [cache.get(repr(e)) if cache is not None else None for e in part]
+            todo = [i for i, r in enumerate(rows) if r is None]
+            if todo:
+                for i, panel in zip(todo, self.panels([part[i] for i in todo], cache=False)):
+                    if panel is None:
+                        continue
+                    rows[i] = self.rank_ban.index.rows(panel.astype(np.float64))
+                    if cache is not None:
+                        cache.put(repr(part[i]), rows[i])
+            for e, r in zip(part, rows):
+                if r is not None and self.rank_ban.add_rows(e, r):
                     added += 1
+        if cache is not None:
+            cache.prune()
         return added
 
     def memory_line(self) -> str:
