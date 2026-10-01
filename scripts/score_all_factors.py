@@ -32,7 +32,7 @@ import numpy as np
 G = {}          # each worker's own copy (spawned, not forked)
 
 
-def init(d, split, cost, threads):
+def init(d, split, cost, threads, want_rows=True):
     """Worker set-up. The pool is SPAWNED, not forked: the parent has already run
     torch (the label's ranks), and forking a process whose OpenMP pool is up
     deadlocks every child at its first torch call -- this scorer sat there for 36
@@ -48,7 +48,7 @@ def init(d, split, cost, threads):
     G.update(dir=d, target=np.asarray(target), target_ranks=torch.from_numpy(np.asarray(
         np.load(d / "_target_ranks.npy", mmap_mode="r"))), split=split, cost=cost,
         years=np.asarray([x[:4] for x in dates]), years_list=sorted({x[:4] for x in dates}),
-        index=CompactRankIndex(target.shape), threads=threads)
+        index=CompactRankIndex(target.shape), threads=threads, want_rows=want_rows)
 
 
 def _icir(series) -> float:
@@ -110,7 +110,7 @@ def score(i):
         "by_year_net": json.dumps(by_year),
     }
     row["healthy"] = bool(np.isfinite(row["ic"]) and cov >= 0.5 and cov_test >= 0.5 and scored >= 0.5)
-    rows = G["index"].rows(pan)
+    rows = G["index"].rows(pan) if G["want_rows"] else None
     return i, row, rows
 
 
@@ -125,6 +125,10 @@ def main() -> int:
     ap.add_argument("--train-frac", type=float, default=0.7)
     ap.add_argument("--cost-per-side", type=float, default=0.0015)
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--buyable", action="store_true",
+                    help="标签剔除次日开盘封涨停、买不进的那部分收益(Label(buyable=True))")
+    ap.add_argument("--no-rows", action="store_true",
+                    help="不写 rows.npy(全样本抽样的秩指纹,6 GB;选因子不该用它,有测试段泄漏)")
     a = ap.parse_args()
 
     import multiprocessing as mp
@@ -143,26 +147,31 @@ def main() -> int:
     saved = [str(x) for x in np.load(d / "dates.npy")]
     if dates != saved:
         raise SystemExit("the view differs from the one the panels were evaluated on")
-    target = Label(a.label, 1).compute(view).astype(np.float64)
+    label = Label(a.label, 1, buyable=a.buyable)
+    target = label.compute(view).astype(np.float64)
+    print(f"label: {label.describe()}; finite {np.isfinite(target).mean():.2%} of cells", flush=True)
     D = len(dates)
     split = max(1, min(D - 1, int(D * a.train_frac)))
     np.save(d / "_target.npy", target)
     np.save(d / "_target_ranks.npy", torch_rank_rows(target).numpy())
     threads = max(1, (cpu_quota() or os.cpu_count() or 8) // max(1, a.workers))
     width = CompactRankIndex(target.shape).width
-    rows_all = np.lib.format.open_memmap(d / "rows.npy", mode="w+", dtype=np.float32,
-                                         shape=(len(manifest), 3, width))
+    rows_all = None if a.no_rows else np.lib.format.open_memmap(
+        d / "rows.npy", mode="w+", dtype=np.float32, shape=(len(manifest), 3, width))
     out, t0 = [], time.time()
     ctx = mp.get_context("spawn")
-    with ctx.Pool(a.workers, initializer=init, initargs=(d, split, a.cost_per_side, threads)) as pool:
+    with ctx.Pool(a.workers, initializer=init,
+                  initargs=(d, split, a.cost_per_side, threads, not a.no_rows)) as pool:
         for n, (i, row, rows) in enumerate(pool.imap_unordered(score, range(len(manifest)), chunksize=4), 1):
             if row is not None:
                 row.update(run=manifest[i]["run"], expression=manifest[i]["expression"])
                 out.append(row)
-                rows_all[i] = rows
+                if rows_all is not None:
+                    rows_all[i] = rows
             if n % 50 == 0:
                 print(f"  {n}/{len(manifest)} scored, {time.time() - t0:.0f}s", flush=True)
-    rows_all.flush()
+    if rows_all is not None:
+        rows_all.flush()
     out.sort(key=lambda r: r["i"])
     cols = list(out[0].keys())
     with open(d / "metrics.csv", "w", newline="", encoding="utf-8") as fh:

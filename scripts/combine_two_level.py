@@ -119,6 +119,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          "241 族 x 5 方法 x 40 MB(float32) 已经是 48 GB")
     ap.add_argument("--within", default="all", help="族内合成方法:all 或逗号分隔")
     ap.add_argument("--out", default="_bench/two_level.json")
+    ap.add_argument("--buyable", action="store_true",
+                    help="标签剔除次日开盘封涨停、买不进的那部分收益(Label(buyable=True))")
     a = ap.parse_args(argv)
 
     from alphacube.label import Label
@@ -130,7 +132,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     d = Path(a.dir)
     t0 = time.time()
     view, _ = warmed_view(open_cube_store(a.store), "20180102", "20251231", warmup=60)
-    target = Label(a.label, 1).compute(view).astype(np.float64)
+    target = Label(a.label, 1, buyable=a.buyable).compute(view).astype(np.float64)
     D, S = target.shape
     split = max(1, min(D - 1, int(D * a.train_frac)))
     train, test = slice(0, split), slice(split, D)

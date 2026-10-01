@@ -12,6 +12,12 @@ excluded on the 241 grid; on a shorter synthetic grid the window is clipped.
 
 ``close``: Close[t+h] / Close[t] - 1 on the last finite minute close of
 each stock-day (the paper convention; not executable at the close itself).
+
+``buyable=True`` (open_vwap15 only): a stock that is locked at limit-up through
+the whole entry window of day t+1 cannot be bought, so the long trade the label
+describes does not exist -- its target is set to NaN instead of the limit-up
+return it would otherwise record (see ``alphacube.tradability``). Fitting on
+the plain label taught the combination to chase exactly these stocks.
 """
 
 from __future__ import annotations
@@ -130,6 +136,7 @@ def forward_return(price: np.ndarray, horizon: int, entry_lag: int) -> np.ndarra
 class Label:
     kind: str = "open_vwap15"        # "open_vwap15" | "close"
     horizon: int = 1
+    buyable: bool = False            # 剔除"次日开盘封涨停、买不进"的那部分收益
 
     def price(self, view: CubeView) -> np.ndarray:
         if self.kind == "open_vwap15":
@@ -141,11 +148,20 @@ class Label:
     def compute(self, view: CubeView, price: Optional[np.ndarray] = None) -> np.ndarray:
         p = self.price(view) if price is None else price
         lag = 1 if self.kind == "open_vwap15" else 0
-        return forward_return(p, self.horizon, lag)
+        out = forward_return(p, self.horizon, lag)
+        if self.buyable:
+            if self.kind != "open_vwap15":
+                raise ValueError("buyable is defined for open_vwap15 only (an opening-window lock test)")
+            from .tradability import entry_locks
+
+            up, _ = entry_locks(view)
+            out[:-lag][up[lag:]] = np.nan              # decided on day t, bought on day t+lag
+        return out
 
     def describe(self) -> str:
         if self.kind == "open_vwap15":
-            return f"OpenVwap15[t+1+{self.horizon}] / OpenVwap15[t+1] - 1"
+            tail = ", entries locked at limit-up dropped" if self.buyable else ""
+            return f"OpenVwap15[t+1+{self.horizon}] / OpenVwap15[t+1] - 1{tail}"
         return f"Close[t+{self.horizon}] / Close[t] - 1"
 
 
