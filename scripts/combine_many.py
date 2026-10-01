@@ -37,6 +37,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--cost", type=float, default=0.0015)
     ap.add_argument("--ridge", type=float, default=1e-3, help="ridge 的 lambda = 它 x trace(G)/k")
     ap.add_argument("--tag", default="")
+    ap.add_argument("--save", default="", help="把某个方法的合成信号存成 npy(如 ridge=路径),可多个")
     a = ap.parse_args(argv)
 
     from alphacube.label import Label
@@ -132,6 +133,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"  第二遍 {n+1}/{k} ({time.time()-t0:.0f}s)", flush=True)
     for name in combos:
         combos[name][~seen] = np.nan
+
+    for spec in (x for x in a.save.split(",") if x):
+        meth, path = spec.split("=", 1)
+        np.save(path, combos[meth].astype(np.float32))
+        print(f"  存下 {meth} 的信号 -> {path}", flush=True)
 
     tr = rank_rows(target)
     print(f"{'方法':>9} {'净夏普':>7} {'毛夏普':>7} {'最大回撤':>8} {'日换手':>7} {'rankIC':>8} "
