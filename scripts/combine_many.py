@@ -101,8 +101,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     del X
 
     def solve(lam_scale: float) -> np.ndarray:
+        """lam=0 时正规方程必然奇异:552 个高度共线的列,有效秩只有个位数。
+        退回最小范数解(pinv),而不是让整个流程崩掉。"""
         lam = lam_scale * float(np.trace(G)) / max(k, 1)
-        return np.linalg.solve(G + lam * np.eye(k), Xty)
+        A = G + lam * np.eye(k)
+        try:
+            return np.linalg.solve(A, Xty)
+        except np.linalg.LinAlgError:
+            return np.linalg.pinv(A, rcond=1e-10) @ Xty
 
     weights = {
         "equal": np.full(k, 1.0 / k),
