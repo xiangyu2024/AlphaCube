@@ -726,6 +726,11 @@ def sweep(a: argparse.Namespace) -> int:
     sig = np.load(a.signal).astype(np.float64)
     D, S = sig.shape
     lab = forward_return(mkt.adj, 1, 1)
+    universe = None
+    if a.universe:
+        from universe import load_universe
+        universe = load_universe(a.universe, (D, S))
+        lab = np.where(universe, lab, np.nan)            # 基准 = 池子里等权
     with np.errstate(all="ignore"):
         fin = np.isfinite(lab)
         bench = np.where(fin.any(1), np.nansum(lab, 1) / np.maximum(fin.sum(1), 1), np.nan)
@@ -734,10 +739,14 @@ def sweep(a: argparse.Namespace) -> int:
     hls = [float(h) for h in a.halflives.split(",")]
     base = dict(capital=a.capital, lot=LOT, pool_frac=a.pool, costs=cost, participation=a.participation,
                 tradability=True, reserve=a.reserve, min_age=a.min_age)
-    _G.update(mkt=mkt, bench=bench, split=split, D=D, base=base,
-              smoothed={hl: ema_rows(sig, hl) for hl in hls})
+    smoothed = {hl: ema_rows(sig, hl) for hl in hls}
+    if universe is not None:
+        for hl in hls:                                   # 先平滑再圈池子:平滑可以用池外那段历史
+            smoothed[hl][~universe] = np.nan
+    _G.update(mkt=mkt, bench=bench, split=split, D=D, base=base, smoothed=smoothed)
     print(f"测试段从 {mkt.dates[split]} 起;初始资金 {a.capital:,.0f} 元;费用 {cost.name};"
-          f"上市不足 {a.min_age} 天不买", flush=True)
+          f"上市不足 {a.min_age} 天不买;候选池 = 信号前 {a.pool:.0%}"
+          f"{';股票池 ' + a.universe + '(基准 = 池内等权)' if universe is not None else ''}", flush=True)
 
     # ---- 第 1 轮:省手续费
     floats = lambda txt: [float(x) for x in txt.split(",")]
@@ -769,6 +778,19 @@ def sweep(a: argparse.Namespace) -> int:
             line += f"   {r[3]['ex_sharpe']:+5.2f} / {r[4]['ex_sharpe']:+5.2f} {r[4]['fees_yr']:5.1%}"
         print(line)
 
+    def pack(res):
+        return [{"name": n, "halflife": hl, "kw": {k: (list(v) if isinstance(v, tuple) else v) for k, v in kw.items()},
+                 "train": tr, "test": te} for n, hl, kw, tr, te in res]
+
+    if a.stage1_only:
+        if a.out:
+            Path(a.out).write_text(json.dumps({"cost": cost.name, "capital": a.capital, "universe": a.universe,
+                                               "stage1": pack(r1), "best1": b1[0], "best1_hl": b1[1],
+                                               "best1_kw": b1[2]}, ensure_ascii=False, indent=1, default=float))
+            print(f"\n写出 {a.out}")
+        print(f"({time.time() - t_start:.0f}s)")
+        return 0
+
     # ---- 第 2 轮:仓位怎么分
     fee = dict(band=b1[2]["band"], keep=b1[2]["keep"])
     cells = []
@@ -788,9 +810,6 @@ def sweep(a: argparse.Namespace) -> int:
           f"保留区 {fee['keep']:.0%},hl{hl1:g})", flush=True)
     _print_cells("第 2 轮:仓位怎么分", r2, b2)
 
-    def pack(res):
-        return [{"name": n, "halflife": hl, "kw": {k: (list(v) if isinstance(v, tuple) else v) for k, v in kw.items()},
-                 "train": tr, "test": te} for n, hl, kw, tr, te in res]
     if a.out:
         Path(a.out).write_text(json.dumps({"cost": cost.name, "capital": a.capital, "stage1": pack(r1),
                                            "stage2": pack(r2), "best1": b1[0], "best2": b2[0]},
@@ -834,6 +853,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     w.add_argument("--bands", default="0,0.1,0.25,0.5", help="第 1 轮的不调区间")
     w.add_argument("--keeps", default="0,0.1,0.2,0.3", help="第 1 轮的老持仓保留区(0 = 不保留)")
     w.add_argument("--skips", default="0.001,0.002,0.005,0.01", help="第 2 轮剔除头部的比例")
+    w.add_argument("--universe", default="", help="股票池掩码 (D, S) bool(scripts/universe.py),基准换成池内等权")
+    w.add_argument("--stage1-only", action="store_true", help="只跑第 1 轮(单票上限 x 不调区间 x 保留区 x 半衰期)")
     w.add_argument("--pool", type=float, default=0.2)
     w.add_argument("--participation", type=float, default=0.1)
     w.add_argument("--reserve", type=float, default=0.002)

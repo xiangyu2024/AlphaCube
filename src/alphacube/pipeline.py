@@ -15,7 +15,7 @@ import numpy as np
 
 MINERS = ("gp", "alphagen", "alphaqcm", "alphaforge", "alphasage", "warmstart")
 POOLS = ("mse", "meanstd", "dynamic")
-LABELS = ("open_vwap15", "close", "volatility", "downside_volatility", "rank", "class", "spike", "crash")
+LABELS = ("open_vwap15", "open_vwap15_buyable", "close", "volatility", "downside_volatility", "rank", "class", "spike", "crash")
 # Columns of the combination tables (block reports and the final one), when present.
 # *_smooth: the same combination traded through an EMA whose half-life was picked on
 # the training days (post_combine.smoothed_metrics).
@@ -57,6 +57,9 @@ def make_label(kind: str, horizon: int, params: Optional[Dict[str, float]] = Non
 
     if kind in ("open_vwap15", "close"):
         lab = Label(kind, horizon)
+        return _Lab(lab.describe(), lab.compute, lab.compute)
+    if kind == "open_vwap15_buyable":                  # 剔除次日开盘封涨停、买不进的那部分收益
+        lab = Label("open_vwap15", horizon, buyable=True)
         return _Lab(lab.describe(), lab.compute, lab.compute)
     from .daily import daily_from_view
     from .metrics import daily_returns_from_close
@@ -123,6 +126,48 @@ def build_pool(kind: str, capacity: int, target, realized, dedup: Optional[float
     raise ValueError(f"unknown pool {kind!r}; choose from {POOLS}")
 
 
+def align_universe(mask: np.ndarray, dates: Sequence[str], symbols: Sequence[str],
+                   view_dates: Sequence[str], view_symbols: Sequence[str]) -> np.ndarray:
+    """把 (D, S) 股票池掩码按名字对齐到一个视图上;视图里掩码没覆盖的日子/股票一律算池外。"""
+    di = {d: i for i, d in enumerate(dates)}
+    si = {s: i for i, s in enumerate(symbols)}
+    out = np.zeros((len(view_dates), len(view_symbols)), dtype=bool)
+    rows = [(r, di[d]) for r, d in enumerate(view_dates) if d in di]
+    cols = [(c, si[s]) for c, s in enumerate(view_symbols) if s in si]
+    if rows and cols:
+        r_v, r_m = map(list, zip(*rows))
+        c_v, c_m = map(list, zip(*cols))
+        out[np.ix_(r_v, c_v)] = mask[np.ix_(r_m, c_m)]
+    return out
+
+
+class UniverseEngine:
+    """引擎外面套一层:每个面板在池外的格子上置 NaN。奖励里的 IC、十分位书的换手、池子的合成
+    就都只看池子里的票(只把标签置空不够:换手是按因子值本身排名建书的)。其余属性原样转给引擎。"""
+
+    def __init__(self, engine: Any, member: np.ndarray) -> None:
+        self._engine, self._member = engine, member
+
+    def evaluate(self, exprs, *args, **kw):
+        res = self._engine.evaluate(exprs, *args, **kw)
+        res.panels = [None if p is None else np.where(self._member, p, np.nan).astype(p.dtype)
+                      for p in res.panels]
+        return res
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._engine, name)
+
+
+def load_universe_file(path: Union[str, Path]):
+    """(掩码, 日期, 股票):scripts/universe.py 写的 .npy 和旁边的 .json(日期、股票顺序)。"""
+    p = Path(path)
+    meta = json.loads(p.with_suffix(".json").read_text(encoding="utf-8"))
+    mask = np.load(p)
+    if mask.shape != (len(meta["dates"]), len(meta["symbols"])):
+        raise ValueError(f"{p}: mask {mask.shape} vs meta {len(meta['dates'])} x {len(meta['symbols'])}")
+    return mask, meta["dates"], meta["symbols"]
+
+
 def run_mining(
     store: Union[str, Path, Any],
     *,
@@ -169,6 +214,7 @@ def run_mining(
     combine_train_frac: float = 0.7,
     smooth_halflives: Sequence[float] = (),
     mirror_root: Optional[Union[str, Path]] = None,
+    universe: Optional[Union[str, Path]] = None,
     out_root: Optional[Union[str, Path]] = None,
     run_id: Optional[str] = None,
     save_values: bool = True,
@@ -186,9 +232,23 @@ def run_mining(
     t0 = time.time()
     if not isinstance(store, (CubeStore, SegmentedCubeStore)):
         store = open_cube_store(store, mirror_root=mirror_root)
+    member = None
+    if universe is not None:
+        if symbols is not None or max_symbols is not None:
+            raise ValueError("universe 和 symbols / max_symbols 只能给一个")
+        u_mask, u_dates, u_syms = load_universe_file(universe)
+        # 引擎只在"这段日子里进过池子"的票上算,截面运算就只在这批票之间做;每天的池外格子另外置空。
+        # 只看 [start, end] 里的成分:挖训练段时不该知道之后才进池子的票
+        rows = [i for i, d in enumerate(u_dates) if (start is None or d >= start) and (end is None or d <= end)]
+        symbols = [s for s, keep in zip(u_syms, u_mask[rows].any(0)) if keep]
     view, trim = warmed_view(store, start, end, warmup=warmup, symbols=symbols, max_symbols=max_symbols)
     lab = make_label(label, horizon, label_params)
     target, realized = lab.compute(view), lab.realized(view)
+    if universe is not None:
+        member = align_universe(u_mask, u_dates, u_syms, view.dates, view.symbols)
+        target = np.where(member, target, np.nan)
+        realized = np.where(member, realized, np.nan)
+        say(f"universe {universe}: {view.n_symbols} symbols ever in, {member.sum(1).mean():.0f} a day on average")
     say(f"store {getattr(store, 'directory', store)}: {view.dates[0]}..{view.dates[-1]} {view.n_days} days x "
         f"{view.n_symbols} symbols (warm-up {trim}); label {lab.describe()}; tradable {view.tradable().mean():.1%}")
     reg = default_registry()
@@ -196,6 +256,8 @@ def run_mining(
                           dynamic_window, min_scored_days=min_scored_days)
     engine = CubeEngine(view, device=device, chunk_symbols=chunk_symbols, chunk_days=chunk_days,
                         workdir=workdir)
+    if member is not None:
+        engine = UniverseEngine(engine, member)
     if seed_library:
         from .legacy import load_seed_library, seed_pool
         exprs, errs = load_seed_library(seed_library, n_minutes=view.n_minutes)

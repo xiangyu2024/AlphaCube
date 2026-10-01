@@ -136,7 +136,7 @@ def cmd_mine(a) -> int:
         max_expr_len=a.max_expr_len, combine_methods=tuple(x for x in a.combine.split(",") if x),
         combine_train_frac=a.combine_train_frac, out_root=a.out, run_id=a.run_id,
         smooth_halflives=tuple(float(x) for x in a.smooth_halflives.split(",") if x),
-        mirror_root=a.mirror_root,
+        mirror_root=a.mirror_root, universe=(a.universe or None),
     )
     return 0 if res.pool_size else 1
 
@@ -194,6 +194,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     m = sub.add_parser("mine", parents=[common], help="mine a factor pool with any miner")
     m.add_argument("--miner", default="gp", choices=MINERS)
+    m.add_argument("--universe", default="",
+                   help="股票池掩码 .npy(旁边要有同名 .json 记日期和股票顺序,scripts/universe.py 写的):"
+                        "只在进过池子的票上算因子,标签和因子面板的池外格子都置空")
     m.add_argument("--pool", default="mse", choices=POOLS)
     m.add_argument("--budget", type=int, default=480)
     m.add_argument("--population", type=int, default=24, help="GP population")

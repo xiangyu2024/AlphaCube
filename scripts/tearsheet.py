@@ -177,19 +177,35 @@ def compute(a: argparse.Namespace) -> int:
     split = max(1, min(D - 1, int(D * a.train_frac)))
     sig = np.load(a.signal).astype(np.float64)
     ret = forward_return(mkt.adj, 1, 1)                 # 决策日 t:t+1 开盘 15 分钟 VWAP -> t+2
-    res = tb.simulate(mkt, ema_rows(sig, HALFLIFE), 0, D, capital=a.capital, costs=tb.RETAIL, compound=True,
-                      **STRATEGY)
+    cfg = dict(STRATEGY)
+    for k, v in (("cap", a.cap), ("keep", a.keep), ("band", a.band), ("pool_frac", a.pool)):
+        if v is not None:
+            cfg[k] = v
+    hl = a.halflife if a.halflife is not None else HALFLIFE
+    sm = ema_rows(sig, hl)
+    universe = None
+    if a.universe:
+        from universe import load_universe
+        universe = load_universe(a.universe, (D, S))
+        sm[~universe] = np.nan                           # 先平滑再圈池子
+    res = tb.simulate(mkt, sm, 0, D, capital=a.capital, costs=tb.RETAIL, compound=True, **cfg)
     t = res["t"].astype(int)
     end = [mkt.dates[i + 2] for i in t]                  # 每个日收益在 t+2 开盘后结算
 
     cmv, tmv = load_caps(a.capital_dir, mkt.dates, mkt.symbols)
     amount = np.load(a.amount)
-    member = index_members(tmv, amount, mkt.list_day, mkt.dates)
+    member = universe if universe is not None else index_members(tmv, amount, mkt.list_day, mkt.dates)
     fin = np.isfinite(ret)
     r_ew = np.where(fin.any(1), np.nansum(ret, 1) / np.maximum(fin.sum(1), 1), np.nan)
     r_cw = weighted_returns(ret, cmv)
     r_300 = weighted_returns(ret, np.where(member, cmv, np.nan))
-    series = {"策略": res["ret"], "等权全市场": r_ew[t], "流通市值加权全市场": r_cw[t], "沪深300(近似)": r_300[t]}
+    if universe is None:
+        series = {"策略": res["ret"], "等权全市场": r_ew[t], "流通市值加权全市场": r_cw[t], "沪深300(近似)": r_300[t]}
+        base, lines = "等权全市场", list(SERIES)
+    else:
+        r_u = weighted_returns(ret, np.where(universe, 1.0, np.nan))
+        series = {"策略": res["ret"], "沪深300成分等权(近似)": r_u[t], "沪深300(近似)": r_300[t], "等权全市场": r_ew[t]}
+        base, lines = "沪深300成分等权(近似)", ["策略", "沪深300成分等权(近似)", "沪深300(近似)"]
     for k, v in series.items():
         if not np.isfinite(v).all():
             raise SystemExit(f"{k} 有 {int((~np.isfinite(v)).sum())} 个缺失日")
@@ -198,12 +214,13 @@ def compute(a: argparse.Namespace) -> int:
     metrics = {}
     for seg, m in segs.items():
         e = [d for d, k in zip(end, m) if k]
-        metrics[seg] = {k: perf(v[m], e, None if k == "等权全市场" else series["等权全市场"][m]) for k, v in series.items()}
+        metrics[seg] = {k: perf(v[m], e, None if k == base else series[base][m]) for k, v in series.items()}
         metrics[seg]["策略_vs_沪深300"] = perf(series["策略"][m], e, series["沪深300(近似)"][m])
         metrics[seg]["运作"] = {"turnover": float(res["turnover"][m].mean()), "fees_yr": float(res["fees"][m].mean() * 252),
                               "n_hold": float(res["n_hold"][m].mean()), "cash": float(res["cash"][m].mean())}
-    out = {"capital": a.capital, "split_date": mkt.dates[split + 1], "config": {**STRATEGY, "halflife": HALFLIFE,
-           "costs": tb.RETAIL.name, "signal": a.signal},
+    out = {"capital": a.capital, "split_date": mkt.dates[split + 1], "config": {**cfg, "halflife": hl,
+           "costs": tb.RETAIL.name, "signal": a.signal, "universe": a.universe},
+           "order": list(series), "base": base, "plot": lines, "title": a.title,
            "dates": end, "series": {k: v.tolist() for k, v in series.items()},
            "n_hold": res["n_hold"].tolist(), "cash": res["cash"].tolist(), "turnover": res["turnover"].tolist(),
            "metrics": metrics, "yearly": yearly(series, end),
@@ -216,12 +233,13 @@ def compute(a: argparse.Namespace) -> int:
 
 def report(out: dict) -> None:
     pct = lambda x: f"{x:+.1%}" if x is not None and np.isfinite(x) else "—"   # noqa: E731
+    order, base = out.get("order", list(SERIES)), out.get("base", "等权全市场")
     for seg, ms in out["metrics"].items():
         s = ms["策略"]
-        print(f"\n=== {seg}:{s['start']} ~ {s['end']}({s['days']} 天)===")
+        print(f"\n=== {seg}:{s['start']} ~ {s['end']}({s['days']} 天);超额相对 {base} ===")
         print(f"{'':<14} {'累计':>8} {'年化':>7} {'波动':>6} {'夏普':>6} {'最大回撤':>8} {'卡玛':>5} | "
               f"{'超额年化':>8} {'信息比率':>8} {'超额回撤':>8} {'beta':>5}")
-        for k in SERIES:
+        for k in order:
             m = ms[k]
             print(f"{k:<14} {m['total']:+8.1%} {m['cagr']:+7.1%} {m['vol']:6.1%} {m['sharpe']:+6.2f} {m['mdd']:+8.1%} "
                   f"{m['calmar']:5.2f} | {pct(m.get('ex_cagr'))} {m.get('ir', float('nan')):+8.2f} "
@@ -233,10 +251,10 @@ def report(out: dict) -> None:
               f"平均现金 {o['cash']:.1%};策略最大回撤 {s['mdd_peak']} -> {s['mdd_trough']},"
               f"{'修复于 ' + s['mdd_recover'] if s['mdd_recover'] else '尚未修复'}")
     print("\n=== 分年 ===")
-    print(f"{'年':<6} " + " ".join(f"{k:>14}" for k in SERIES) + f" {'超额(对等权)':>12}")
+    print(f"{'年':<6} " + " ".join(f"{k:>14}" for k in order) + f" {'超额(对' + base + ')':>12}")
     for row in out["yearly"]:
-        ex = (1 + row["策略"]) / (1 + row["等权全市场"]) - 1
-        print(f"{row['year']:<6} " + " ".join(f"{row[k]:+14.1%}" for k in SERIES) + f" {ex:+12.1%}")
+        ex = (1 + row["策略"]) / (1 + row[base]) - 1
+        print(f"{row['year']:<6} " + " ".join(f"{row[k]:+14.1%}" for k in order) + f" {ex:+12.1%}")
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +262,8 @@ def report(out: dict) -> None:
 # ---------------------------------------------------------------------------
 
 INK, INK2, MUTED, GRID, AXIS, SURFACE = "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#c3c2b7", "#fcfcfb"
-COLORS = {"策略": "#2a78d6", "等权全市场": "#eb6834", "流通市值加权全市场": "#1baf7a", "沪深300(近似)": "#eda100"}
+COLORS = {"策略": "#2a78d6", "等权全市场": "#eb6834", "流通市值加权全市场": "#1baf7a", "沪深300(近似)": "#eda100",
+          "沪深300成分等权(近似)": "#e87ba4"}
 
 
 def _cjk_font() -> Optional[str]:
@@ -291,8 +310,10 @@ def plot(a: argparse.Namespace) -> int:
         ax.axvline(split, color=MUTED, linewidth=1.0)
 
     # (1) 累计净值,对数轴,单位万元
+    lines = out.get("plot", list(SERIES))
+    base = out.get("base", "等权全市场")
     ax = axes[0]
-    for k in SERIES:
+    for k in lines:
         y = np.concatenate([[cap], nav[k]]) / 1e4
         ax.plot(xs, y, color=COLORS[k], linewidth=2.2 if k == "策略" else 1.6, label=k, zorder=3 if k == "策略" else 2)
     ax.set_yscale("log")
@@ -300,7 +321,7 @@ def plot(a: argparse.Namespace) -> int:
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
     ax.yaxis.set_minor_formatter(NullFormatter())
     ax.set_ylabel("账户净值(万元,对数轴)")
-    ends = sorted(SERIES, key=lambda k: -nav[k][-1])
+    ends = sorted(lines, key=lambda k: -nav[k][-1])
     last_y = None
     for k in ends:                                        # 线尾直接标名称和期末值,挤在一起时往下错开
         y = nav[k][-1] / 1e4
@@ -313,10 +334,10 @@ def plot(a: argparse.Namespace) -> int:
         last_y = y
     ms_all, ms_oos = out["metrics"]["全样本"], out["metrics"]["样本外(测试段)"]
     s_all, s_oos = ms_all["策略"], ms_oos["策略"]
-    ax.set_title(f"100 万纯多头:{out['dates'][0][:4]}-{out['dates'][-1][:4]} 全样本(竖线右边是样本外)",
-                 loc="left", fontsize=13, color=INK, pad=24)
+    title = out.get("title") or f"100 万纯多头:{out['dates'][0][:4]}-{out['dates'][-1][:4]} 全样本(竖线右边是样本外)"
+    ax.set_title(title, loc="left", fontsize=13, color=INK, pad=24)
     ax.text(0, 1.015, f"全样本 年化 {s_all['cagr']:+.1%} · 夏普 {s_all['sharpe']:.2f} · 最大回撤 {s_all['mdd']:.1%} · "
-            f"相对等权全市场 超额年化 {s_all['ex_cagr']:+.1%} 信息比率 {s_all['ir']:.2f}    |    "
+            f"相对{base} 超额年化 {s_all['ex_cagr']:+.1%} 信息比率 {s_all['ir']:.2f}    |    "
             f"样本外 年化 {s_oos['cagr']:+.1%} · 信息比率 {s_oos['ir']:.2f}",
             transform=ax.transAxes, fontsize=9.5, color=INK2)
     ax.legend(loc="upper left", frameon=False, fontsize=9.5, labelcolor=INK)
@@ -326,7 +347,7 @@ def plot(a: argparse.Namespace) -> int:
 
     # (2) 相对强弱:策略 / 基准
     ax = axes[1]
-    for k in ("等权全市场", "沪深300(近似)"):
+    for k in dict.fromkeys((base, "沪深300(近似)")):
         rel = np.concatenate([[1.0], nav["策略"] / nav[k]])
         ax.plot(xs, rel, color=COLORS[k], linewidth=1.6, label=f"策略 ÷ {k}")
         ax.annotate(f"{rel[-1]:.2f}", xy=(xs[-1], rel[-1]), xytext=(4, 0), textcoords="offset points",
@@ -337,7 +358,7 @@ def plot(a: argparse.Namespace) -> int:
 
     # (3) 回撤
     ax = axes[2]
-    for k in ("策略", "等权全市场", "沪深300(近似)"):
+    for k in dict.fromkeys(("策略", base, "沪深300(近似)")):
         v = np.concatenate([[cap], nav[k]])
         dd = v / np.maximum.accumulate(v) - 1
         ax.plot(xs, dd * 100, color=COLORS[k], linewidth=1.9 if k == "策略" else 1.3, label=k)
@@ -348,8 +369,10 @@ def plot(a: argparse.Namespace) -> int:
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
     ax.set_xlim(xs[0], xs[-1])
 
+    c = out["config"]
     fig.text(0.01, 0.005, "基准与策略同一套成交价(次日开盘 15 分钟 VWAP)、含分红;沪深300 是用市值数据搭的近似(半年调样、流通市值加权)。"
-             f"策略:等权单票 0.5%、保留前 50%、A 股实际费率(佣金最低 5 元)、整手。",
+             f"策略:等权单票 {c['cap']:.1%}、保留前 {c['keep']:.0%}、半衰期 {c['halflife']:g}、A 股实际费率(佣金最低 5 元)、整手"
+             f"{'、只在沪深300 近似成分里选' if c.get('universe') else ''}。",
              fontsize=8, color=MUTED)
     fig.tight_layout(rect=(0, 0.015, 0.9, 1))
     fig.savefig(a.out, dpi=170)
@@ -368,6 +391,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     c.add_argument("--capital", type=float, default=1e6)
     c.add_argument("--train-frac", type=float, default=0.7)
     c.add_argument("--out", default="_bench/tradable/fullsample_1m.json")
+    c.add_argument("--universe", default="", help="股票池掩码(scripts/universe.py);给了就只在池子里选股,基准换成池内")
+    c.add_argument("--cap", type=float, default=None)
+    c.add_argument("--keep", type=float, default=None)
+    c.add_argument("--band", type=float, default=None)
+    c.add_argument("--pool", type=float, default=None)
+    c.add_argument("--halflife", type=float, default=None)
+    c.add_argument("--title", default="")
     p = sub.add_parser("plot")
     p.add_argument("--json", required=True)
     p.add_argument("--out", required=True)

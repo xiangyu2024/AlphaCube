@@ -63,6 +63,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--halflife", type=float, default=10.0)
     ap.add_argument("--min-age", type=int, default=60)
     ap.add_argument("--train-frac", type=float, default=0.7)
+    ap.add_argument("--universe", default="", help="股票池掩码(scripts/universe.py):只在池子里排分位")
+    ap.add_argument("--edges", default="", help="分位边界,逗号分隔;默认 0,.002,.005,.01,.02,.05,.1,.2,.5,1")
     a = ap.parse_args(argv)
 
     import tradable_backtest as tb
@@ -76,12 +78,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     eligible = np.zeros((D, S), dtype=bool)
     e = np.arange(1, D)
     eligible[:-1] = np.isfinite(m.adj[e]) & ~m.up_lock[e] & ((e[:, None] - m.list_day[None, :]) >= a.min_age)
-    head = "  ".join(f"{lo * 100:g}-{hi * 100:g}%" for lo, hi in zip(EDGES[:-1], EDGES[1:]))
+    if a.universe:
+        from universe import load_universe
+        eligible &= load_universe(a.universe, (D, S))
+    edges = tuple(float(x) for x in a.edges.split(",")) if a.edges else EDGES
+    head = "  ".join(f"{lo * 100:g}-{hi * 100:g}%" for lo, hi in zip(edges[:-1], edges[1:]))
     for spec in a.signal:
         name, path = spec.split("=", 1)
         sig = np.load(path).astype(np.float64)
         sm = ema_rows(sig, a.halflife) if a.halflife else sig
-        curve = bucket_curve(sm, ret, eligible)
+        curve = bucket_curve(sm, ret, eligible, edges)
         print(f"\n=== {name}(hl{a.halflife:g})按信号分位的日均超额 bp(t 值)===\n分位: {head}")
         for seg, sl in (("训练", slice(0, split)), ("测试", slice(split, D))):
             print(f"{seg}: " + "  ".join(f"{m_:+5.1f}({t_:+4.1f})" for m_, t_ in summarize(curve[sl])), flush=True)

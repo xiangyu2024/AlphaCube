@@ -32,7 +32,7 @@ import numpy as np
 G = {}          # each worker's own copy (spawned, not forked)
 
 
-def init(d, split, cost, threads, want_rows=True):
+def init(d, split, cost, threads, want_rows=True, universe=None):
     """Worker set-up. The pool is SPAWNED, not forked: the parent has already run
     torch (the label's ranks), and forking a process whose OpenMP pool is up
     deadlocks every child at its first torch call -- this scorer sat there for 36
@@ -48,7 +48,8 @@ def init(d, split, cost, threads, want_rows=True):
     G.update(dir=d, target=np.asarray(target), target_ranks=torch.from_numpy(np.asarray(
         np.load(d / "_target_ranks.npy", mmap_mode="r"))), split=split, cost=cost,
         years=np.asarray([x[:4] for x in dates]), years_list=sorted({x[:4] for x in dates}),
-        index=CompactRankIndex(target.shape), threads=threads, want_rows=want_rows)
+        index=CompactRankIndex(target.shape), threads=threads, want_rows=want_rows,
+        universe=np.load(universe, mmap_mode="r") if universe else None)
 
 
 def _icir(series) -> float:
@@ -69,6 +70,8 @@ def score(i):
     if not path.exists():
         return i, None, None
     pan = np.load(path).astype(np.float64)
+    if G["universe"] is not None:
+        pan[~np.asarray(G["universe"])] = np.nan          # 股票池外的格子不参与任何统计
     tgt, split, cost = G["target"], G["split"], G["cost"]
     tf = np.isfinite(tgt)
     both = np.isfinite(pan) & tf
@@ -127,6 +130,8 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--buyable", action="store_true",
                     help="标签剔除次日开盘封涨停、买不进的那部分收益(Label(buyable=True))")
+    ap.add_argument("--universe", default="",
+                    help="股票池掩码 (D, S) bool 的 .npy(scripts/universe.py):池外的因子值和标签都当缺失")
     ap.add_argument("--no-rows", action="store_true",
                     help="不写 rows.npy(全样本抽样的秩指纹,6 GB;选因子不该用它,有测试段泄漏)")
     a = ap.parse_args()
@@ -149,7 +154,13 @@ def main() -> int:
         raise SystemExit("the view differs from the one the panels were evaluated on")
     label = Label(a.label, 1, buyable=a.buyable)
     target = label.compute(view).astype(np.float64)
-    print(f"label: {label.describe()}; finite {np.isfinite(target).mean():.2%} of cells", flush=True)
+    if a.universe:
+        u = np.load(a.universe)
+        if u.shape != target.shape:
+            raise SystemExit(f"universe {u.shape} != target {target.shape}")
+        target[~u] = np.nan
+    print(f"label: {label.describe()}{'; universe ' + a.universe if a.universe else ''}; "
+          f"finite {np.isfinite(target).mean():.2%} of cells", flush=True)
     D = len(dates)
     split = max(1, min(D - 1, int(D * a.train_frac)))
     np.save(d / "_target.npy", target)
@@ -161,7 +172,7 @@ def main() -> int:
     out, t0 = [], time.time()
     ctx = mp.get_context("spawn")
     with ctx.Pool(a.workers, initializer=init,
-                  initargs=(d, split, a.cost_per_side, threads, not a.no_rows)) as pool:
+                  initargs=(d, split, a.cost_per_side, threads, not a.no_rows, a.universe or None)) as pool:
         for n, (i, row, rows) in enumerate(pool.imap_unordered(score, range(len(manifest)), chunksize=4), 1):
             if row is not None:
                 row.update(run=manifest[i]["run"], expression=manifest[i]["expression"])

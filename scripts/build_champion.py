@@ -64,8 +64,30 @@ def pick_families(rows: List[dict], fp: np.ndarray, cluster: float, max_families
     return [f[0] for f in fams[:max_families]]
 
 
+def universe_fingerprints(panels: Path, indices: Sequence[int], days: slice, universe: np.ndarray,
+                          out: Path) -> np.ndarray:
+    """只看股票池的训练段指纹:列 = 指纹窗口里进过池子的票,池外的格子当缺失,逐日秩的 z 分数。"""
+    from alphacube.metrics import rank_rows, zscore_rows
+
+    if out.exists():
+        return np.load(out, mmap_mode="r")
+    u = universe[days]
+    cols = np.flatnonzero(u.any(0))
+    um = u[:, cols]
+    fp = np.empty((len(indices), um.size), dtype=np.float32)
+    t0 = time.time()
+    for j, i in enumerate(indices):
+        sub = np.asarray(np.load(panels / f"{int(i):05d}.npy", mmap_mode="r")[days][:, cols], dtype=np.float64)
+        sub[~um] = np.nan
+        fp[j] = np.nan_to_num(zscore_rows(rank_rows(sub)), nan=0.0).reshape(-1)
+        if (j + 1) % 1000 == 0:
+            print(f"  指纹 {j + 1}/{len(indices)} ({time.time() - t0:.0f}s)", flush=True)
+    np.save(out, fp)
+    return fp
+
+
 def build(d: Path, rows: List[dict], fams: List[List[int]], target: np.ndarray, train: slice,
-          save: Optional[Path] = None) -> np.ndarray:
+          save: Optional[Path] = None, universe: Optional[np.ndarray] = None) -> np.ndarray:
     """族内 ridge -> 族间 lstsq。save 给了就把 100 个族因子存成 (n_fam, D, S) float32 的 .npy
     (约 4 GB),之后换族间权重的实验不用再花 20 分钟重建。"""
     from combine_two_level import blend, fit_weights
@@ -78,7 +100,10 @@ def build(d: Path, rows: List[dict], fams: List[List[int]], target: np.ndarray, 
     for n, idx in enumerate(fams):
         cols = []
         for j in idx:
-            z = zscore_rows(np.load(d / "panels" / f"{int(rows[j]['i']):05d}.npy").astype(np.float64))
+            pan = np.load(d / "panels" / f"{int(rows[j]['i']):05d}.npy").astype(np.float64)
+            if universe is not None:
+                pan[~universe] = np.nan                 # 截面标准化只在池子里做
+            z = zscore_rows(pan)
             if nanmean_quiet(cs_pearson(z[train], target[train])) < 0:
                 z = -z
             cols.append(z)
@@ -152,6 +177,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--train-frac", type=float, default=0.7)
     ap.add_argument("--out", required=True, help="新信号写到这里(.npy)")
     ap.add_argument("--compare", action="append", default=[], help="name=path.npy,和新信号一起报告")
+    ap.add_argument("--universe", default="", help="股票池掩码 (D, S) bool(scripts/universe.py):打分、"
+                    "截面标准化、拟合、评估都只用池子里的票,输出信号池外为 NaN")
     a = ap.parse_args(argv)
 
     from alphacube.label import Label, open_vwap15
@@ -168,6 +195,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     D, S = plain.shape
     split = max(1, min(D - 1, int(D * a.train_frac)))
     train = slice(0, split)
+    universe = None
+    if a.universe:
+        universe = np.load(a.universe)
+        if universe.shape != plain.shape:
+            raise SystemExit(f"universe {universe.shape} != label {plain.shape}")
+        plain[~universe] = np.nan
+        clean[~universe] = np.nan
+        print(f"股票池 {a.universe}:每天平均 {universe.sum(1).mean():.0f} 只", flush=True)
     dropped = np.isfinite(plain) & ~np.isfinite(clean)
     for name, sl in (("训练段", train), ("测试段", slice(split, D))):
         print(f"{name}:剔除的标签 {dropped[sl].sum()} 格,占有标签的 "
@@ -179,13 +214,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     fp_path = d / f"fp_train_{FP_DAYS}x{FP_SYMBOLS}.npy"
     days = slice(max(0, split - FP_DAYS), split)
     cols = np.linspace(0, S - 1, num=min(FP_SYMBOLS, S)).astype(int)
-    fp = np.asarray(build_train_fingerprints(d / "panels", [int(r["i"]) for r in rows], days, cols, fp_path))
+    if universe is None:
+        fp = np.asarray(build_train_fingerprints(d / "panels", [int(r["i"]) for r in rows], days, cols, fp_path))
+    else:
+        fp = np.asarray(universe_fingerprints(d / "panels", [int(r["i"]) for r in rows], days, universe,
+                                              d / f"fp_train_{FP_DAYS}x_universe.npy"))
     if fp.shape[0] != len(rows):
         raise SystemExit(f"{fp_path} 有 {fp.shape[0]} 行,健康因子 {len(rows)} 个 —— 指纹和因子清单对不上")
     fams = pick_families(rows, fp, a.cluster, a.max_families, a.max_members)
     del fp
     fam_path = Path(a.out).with_suffix(".families.npy")
-    sig = build(d, rows, fams, fit_target, train, save=fam_path)
+    sig = build(d, rows, fams, fit_target, train, save=fam_path, universe=universe)
+    if universe is not None:
+        sig[~universe] = np.nan
     np.save(a.out, sig.astype(np.float32))
     import json
     Path(a.out).with_suffix(".families.json").write_text(json.dumps(
@@ -197,7 +238,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     signals = [("新信号", sig, fit_target)]
     for spec in a.compare:
         name, path = spec.split("=", 1)
-        signals.append((name, np.load(path).astype(np.float64), plain))   # 旧冠军是在原标签上拟合的
+        other = np.load(path).astype(np.float64)
+        if universe is not None:
+            other[~universe] = np.nan                   # 对照的信号也只在池子里比
+        signals.append((name, other, plain if "buyable" not in path else clean))
     print(f"\n=== 测试段(半衰期在训练段选)===")
     print(f"{'信号':<10} {'评估标签':<10} | {'多空净夏普':>8} {'毛夏普':>7} {'换手':>6} {'平滑后':>7} {'hl':>3} "
           f"{'rankIC':>8} {'ICIR':>6} | {'纯多头超额夏普':>12} {'超额年化':>7} {'超额回撤':>7} {'hl':>3}")
