@@ -349,6 +349,13 @@ def run_mining(
     ckpt_dir = None
     if out_root and checkpoint_every:
         ckpt_dir = Path(out_root) / (run_id or datetime.now().strftime("%Y%m%d_%H%M%S")) / "checkpoints"
+    if member is not None and gp_params and gp_params.get("exemplar_cache"):
+        # ExemplarCache 一建就删掉同一根目录下别的视图:股票池的指纹放到自己的根目录,不然一开
+        # 股票池挖掘(GP 或 RL)就把全市场那份缓存清掉了。根目录名带上掩码内容的哈希 —— 视图键
+        # 只看日期和只数,同名名单换了成分会读到旧掩码下的指纹
+        import hashlib
+        tag = hashlib.sha1(np.packbits(member).tobytes() + "\n".join(view.symbols).encode()).hexdigest()[:12]
+        gp_params = {**gp_params, "exemplar_cache": f"{gp_params['exemplar_cache']}_universe_{tag}"}
     if miner == "gp":
         gp = dict(population_size=24, max_depth=4, min_depth=2, top_k=None)
         gp.update(gp_params or {})
@@ -361,6 +368,9 @@ def run_mining(
                     checkpoint_dir=ckpt_dir,
                     on_engine_progress=(engine_progress if engine_progress_every > 0 else None),
                     checkpoint_every=checkpoint_every, workdir=workdir, **gp)
+        if member is not None:
+            # GPMiner 自己建引擎:不在这里套上股票池那层,GP 的面板就全是池外也有值的
+            m.engine = UniverseEngine(m.engine, member)
         miner_ref.append(m)
         rep = m.mine(budget, on_generation=lambda g, n, s: progress(g, n, s))
         added, evaluated, engine_s = rep.added, rep.evaluated, rep.engine_seconds

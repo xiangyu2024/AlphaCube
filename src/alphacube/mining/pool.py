@@ -84,10 +84,15 @@ class PoolBase(ABC):
         return [m.z for m in self.members]
 
     def combined(self) -> np.ndarray:
+        """成员加权和;某个成员缺值按 0(中性)算,但一个成员都没值的格子是 NaN —— 填 0 的话,
+        这些格子会被当成"中性的股票"算进十分位书的只数和排名(股票池挖掘时那是每天上百只池外票)。"""
         out = np.zeros_like(self.target)
+        seen = np.zeros(self.target.shape, dtype=bool)
         for m, w in zip(self.members, self.weights):
-            out = out + w * np.nan_to_num(m.z, nan=0.0)
-        return out
+            fin = np.isfinite(m.z)
+            out = out + w * np.where(fin, m.z, 0.0)
+            seen |= fin
+        return np.where(seen, out, np.nan) if self.members else out
 
     def pool_ic(self) -> float:
         if not self.members:
@@ -322,14 +327,15 @@ class _GramCache:
         self._ok = np.isfinite(y)
         self._y = y[self._ok]
         self.n_ok = int(self._ok.sum())
-        self._vec: Dict[int, tuple] = {}            # id(member) -> (member, masked z, z.y)
+        self._vec: Dict[int, tuple] = {}            # id(member) -> (member, masked z, z.y, finite mask)
         self._dot: Dict[tuple, float] = {}          # (id_a, id_b), id_a <= id_b -> z_a.z_b
 
     def _entry(self, m: Member) -> tuple:
         e = self._vec.get(id(m))
         if e is None:
-            v = np.nan_to_num(np.asarray(m.z, dtype=np.float64).reshape(-1)[self._ok], nan=0.0)
-            e = self._vec[id(m)] = (m, v, float(v @ self._y))
+            raw = np.asarray(m.z, dtype=np.float64).reshape(-1)[self._ok]
+            v = np.nan_to_num(raw, nan=0.0)
+            e = self._vec[id(m)] = (m, v, float(v @ self._y), np.isfinite(raw))
         return e
 
     def weights(self, members: Sequence[Member]) -> np.ndarray:
@@ -375,13 +381,17 @@ class _GramCache:
         where the target is finite (``cs_pearson`` drops the rest), and there the
         per-cell arithmetic -- ``0 + w1*z1 + w2*z2 + ...`` in member order -- is the
         one ``combined()`` does, without its three fresh full-size arrays per member
-        (~5 s at k = 30 on the production cube)."""
+        (~5 s at k = 30 on the production cube). Cells no member has a value for are
+        missing, as in ``combined()``."""
         acc, tmp = np.zeros(self.n_ok), np.empty(self.n_ok)
+        seen = np.zeros(self.n_ok, dtype=bool)
         for m, w in zip(members, weights):
-            np.multiply(self._entry(m)[1], w, out=tmp)
+            e = self._entry(m)
+            np.multiply(e[1], w, out=tmp)
             acc += tmp
+            seen |= e[3]
         panel = np.full(self._target.shape, np.nan)
-        panel.reshape(-1)[self._ok] = acc
+        panel.reshape(-1)[self._ok] = np.where(seen, acc, np.nan)
         return nanmean_quiet(cs_pearson(panel, self._target))
 
 

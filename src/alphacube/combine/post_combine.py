@@ -373,6 +373,13 @@ def combine(
     elif method in MODEL_METHODS:
         combined = _model_prediction(method, columns, target, train_days, max_fit_rows, seed)
         weights = None
+    if method == "factorgcl" or method in ROLLING_METHODS or method in MODEL_METHODS:
+        # 模型对一个成员都没值的格子也会吐出一个数(特征全按缺失喂进去);加权法在那里是 NaN,
+        # 这里对齐 —— 否则股票池挖掘的样本外书里会混进池外的票
+        any_seen = np.zeros(np.shape(target), dtype=bool)
+        for column in columns:
+            any_seen |= np.isfinite(column)
+        combined = np.where(any_seen, combined, np.nan)
     else:
         weights = _weights_for(method, columns, target, train_days)
         # A member's missing value counts as neutral 0 (the pool's convention); a

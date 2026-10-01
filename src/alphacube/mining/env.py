@@ -251,7 +251,11 @@ class BatchRewarder:
             elif self.scorer is not None:
                 # 池的奖励也换成同一种货币:合成信号自己的 |rank IC| - λ x 换手。
                 # 只有真的进了池才算这一次(一次排序约 0.5 s),被拒的走惩罚。
-                reward = float(self.scorer.score(self.pool.combined())["fit"])
+                reward = float(self.scorer.score(self.pool.combined(), gated=False)["fit"])
+                if not np.isfinite(reward):
+                    # 合成信号一个能算的日子都没有(极端情形):退回候选自己的分数,
+                    # 绝不能把 -inf 喂进 PPO / QCM 的更新 —— 一个就把优势函数整批变 NaN
+                    reward = float(solo)
             else:
                 reward = float(pool_ic)
             results[i] = RewardResult(reward, ic=ic, added=True, novelty=novelty, reason="added")

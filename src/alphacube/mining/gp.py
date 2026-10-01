@@ -62,14 +62,20 @@ def cpu_quota(path: str = "/sys/fs/cgroup/cpu.max") -> Optional[int]:
     else None. torch sizes its CPU pool from the host -- 104 threads on the
     208-core server -- while the container is granted 25 CPUs, and oversubscribed
     the fitness sort ran 4x slower (measured there: 1.75 s a panel at 104
-    threads, 0.43 s at 24)."""
+    threads, 0.43 s at 24).
+
+    ``ALPHACUBE_CPU_THREADS`` caps the answer further: two mining runs sharing the
+    container each sized themselves to the full quota and fought over it."""
+    cap = os.environ.get("ALPHACUBE_CPU_THREADS")
+    cap_n = int(cap) if cap and cap.strip().isdigit() and int(cap) > 0 else None
     try:
         quota, period = open(path).read().split()[:2]
         if quota == "max":
-            return None
-        return max(1, min(os.cpu_count() or 1, int(quota) // int(period)))
+            return cap_n
+        n = max(1, min(os.cpu_count() or 1, int(quota) // int(period)))
+        return min(n, cap_n) if cap_n else n
     except (OSError, ValueError):
-        return None
+        return cap_n
 
 
 def rss_anon(path: str = "/proc/self/status") -> float:

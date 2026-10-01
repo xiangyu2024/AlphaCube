@@ -20,7 +20,11 @@ cd /root/autodl-tmp/AlphaCube || exit 1
 [ -e "mining_runs/$RUN_ID" ] && { echo "mining_runs/$RUN_ID 已存在,换个 run-id"; exit 2; }
 [ -e "$UNIVERSE" ] && [ -e "${UNIVERSE%.npy}.json" ] || { echo "股票池 $UNIVERSE 或它的 .json 不存在"; exit 3; }
 export PYTHONPATH=src
-echo "股票池 $UNIVERSE,挖到 $END,miner $MINER,budget $BUDGET,不继承封禁"
+# 和同容器里的其他挖掘分着用:CPU 线程、显存都封顶(可用环境变量覆盖)
+THREADS="${THREADS:-10}"
+export ALPHACUBE_CPU_THREADS="$THREADS" OMP_NUM_THREADS="$THREADS" MKL_NUM_THREADS="$THREADS"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True ALPHACUBE_GPU_FRACTION="${GPU_FRACTION:-0.3}"
+echo "股票池 $UNIVERSE,挖到 $END,miner $MINER,budget $BUDGET,不继承封禁,线程 $THREADS"
 
 set +e
 PYTHONFAULTHANDLER=1 /root/miniconda3/envs/quant/bin/python -u -m alphacube.cli mine \

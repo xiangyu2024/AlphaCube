@@ -53,7 +53,10 @@ class PanelScorer:
         self.target_t64 = torch.from_numpy(self.target)
         self.target_ranks_t = torch_rank_rows(self.target)
 
-    def score(self, panel: np.ndarray) -> Dict[str, float]:
+    def score(self, panel: np.ndarray, gated: bool = True) -> Dict[str, float]:
+        """``gated=False``:不套覆盖率 / 可算天数这两道拒绝门槛 —— 那是给单个候选的。
+        池子的合成信号已经由成员各自过了门槛,它的覆盖率按 z 分数算(逐日标准化后,
+        截面没有离散度的天是 NaN),会比成员的原始覆盖率低,不该因此拿 -inf。"""
         ric_days, turnover = rank_ic_turnover(panel, self.target_ranks_t, self.top_frac)
         x = torch.from_numpy(np.ascontiguousarray(panel)).to(torch.float64)
         ic_days = _cs_corr_days_t(x, self.target_t64).numpy()
@@ -62,8 +65,8 @@ class PanelScorer:
         cov = float((np.isfinite(panel) & self.finite).sum() / self.cells)
         scored = np.isfinite(ic_days).sum() / self.usable_days
         fit = -np.inf
-        if (np.isfinite(base) and cov >= self.min_coverage
-                and (self.min_scored_days <= 0 or scored >= self.min_scored_days)):
+        if np.isfinite(base) and (not gated or (cov >= self.min_coverage
+                                                and (self.min_scored_days <= 0 or scored >= self.min_scored_days))):
             fit = (base if self.signed else abs(base)) - self.turnover_penalty * turnover
         return {"ic": ic, "rank_ic": ric, "turnover": float(turnover), "fit": float(fit)}
 

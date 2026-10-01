@@ -8,6 +8,7 @@ leaderboard -> everything on disk.
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import sys
 import time
@@ -106,6 +107,14 @@ def cmd_calculate(a) -> int:
 
 def cmd_mine(a) -> int:
     from .pipeline import run_mining
+
+    frac = os.environ.get("ALPHACUBE_GPU_FRACTION")
+    if frac and str(a.device).startswith("cuda"):
+        # 同一张卡上同时跑几个挖掘时给每个进程的显存封顶;引擎的 OOM 在 tolerant 模式下
+        # 只会让节点静悄悄地失败,不会报错
+        import torch
+        torch.cuda.set_per_process_memory_fraction(float(frac))
+        print(f"GPU memory capped at {float(frac):.0%} of the card")
 
     gp = dict(population_size=a.population, max_depth=a.max_depth, min_depth=a.min_depth, top_k=a.top_k,
               panel_cache_items=a.panel_cache,
