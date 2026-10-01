@@ -120,3 +120,26 @@ def test_shortlist_spans_the_cost_tradeoff_not_the_extremes():
     # λ 越大越偏向慢的:极端成本假设下选的是最慢的那个
     assert shortlist(labels, rows, 1, (1.0,)) == [0]
     assert shortlist(labels, rows, 1, (0.0,)) == [2]       # 不计成本时选最强的
+
+
+def test_weak_small_families_are_dropped_strong_ones_kept():
+    """单点族里绝大多数是噪声(4157 个因子切出 1597 族,1256 个是单点)。
+    小族必须过质量门槛;大族不受这条约束(它的成员互相印证)。"""
+    from select_factors import shortlist
+
+    rows = [
+        {"rank_ic_train": "0.004", "turnover": "0.05"},   # 0 单点、弱 -> 丢
+        {"rank_ic_train": "0.050", "turnover": "0.05"},   # 1 单点、强 -> 留
+        {"rank_ic_train": "0.020", "turnover": "0.01"},   # 2 单点、适应度 0.0186 过线 -> 留
+        {"rank_ic_train": "0.003", "turnover": "0.60"},   # 3 \
+        {"rank_ic_train": "0.004", "turnover": "0.55"},   # 4  > 五个成员的大族,个个很弱
+        {"rank_ic_train": "0.005", "turnover": "0.50"},   # 5  |  但不是小族,照样进
+        {"rank_ic_train": "0.006", "turnover": "0.45"},   # 6 /
+        {"rank_ic_train": "0.007", "turnover": "0.40"},   # 7
+    ]
+    labels = np.array([0, 1, 2, 3, 3, 3, 3, 3])
+    picked = shortlist(labels, rows, per_family=3, lambdas=(0.07, 0.14, 0.20),
+                       small_family=3, min_fit=0.018, min_ric=0.033)
+    assert 0 not in picked, "弱的单点族该被丢掉"
+    assert 1 in picked and 2 in picked, "强的单点族要保留"
+    assert any(j in picked for j in (3, 4, 5, 6, 7)), "大族不受小族门槛约束"
