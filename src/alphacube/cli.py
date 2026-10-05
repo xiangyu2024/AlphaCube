@@ -116,6 +116,8 @@ def cmd_mine(a) -> int:
         torch.cuda.set_per_process_memory_fraction(float(frac))
         print(f"GPU memory capped at {float(frac):.0%} of the card")
 
+    if a.fitness in ("long", "long_hit") and a.cost_per_side <= 0:
+        raise SystemExit("--fitness long / long_hit 把换手按 --cost-per-side 从多头书里直接扣;不给它(或给 0)就是在奖励高换手")
     gp = dict(population_size=a.population, max_depth=a.max_depth, min_depth=a.min_depth, top_k=a.top_k,
               panel_cache_items=a.panel_cache,
               exemplar_cache=(a.exemplar_cache or None), exemplar_cache_gb=a.exemplar_cache_gb,
@@ -123,6 +125,11 @@ def cmd_mine(a) -> int:
               banned_substructures=tuple(a.ban),
               ban_rank_corr=a.ban_rank_corr, fitness_kind=a.fitness, turnover_penalty=a.turnover_penalty,
               archive_dedup=a.archive_dedup)
+    if a.rl_min_solo is not None:
+        gp["rl_min_solo"] = a.rl_min_solo
+    if a.seed_population:
+        gp.update(seed_population=a.seed_population, seed_keep=a.seed_keep, seed_max_depth=a.seed_max_depth,
+                  seed_per_block=a.seed_per_block)
     if a.ban_archive:
         from .pipeline import ban_exemplars_from
         if not a.ban_rank_corr or not a.ban:
@@ -289,6 +296,13 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--warmup", type=int, default=60, help="day-axis warm-up rows read before --start")
     m.add_argument("--seed", type=int, default=0)
     m.add_argument("--seed-library", default=None, help="seed the pool from a seed_alpha_library yaml first")
+    m.add_argument("--seed-population", default=None,
+                   help="GP only: start each population partly from seed trees -- 'legacy' (the hand-written "
+                        "corpus) or a csv with an expression column; ranked by train fitness inside the run")
+    m.add_argument("--seed-keep", type=int, default=0, help="seeds per population (0 = half the population)")
+    m.add_argument("--seed-max-depth", type=int, default=0, help="drop seeds deeper than this (0 = no cap)")
+    m.add_argument("--seed-per-block", action="store_true",
+                   help="each rolling block starts from the next-best seeds instead of a random population")
     m.add_argument("--presqueeze", type=int, default=0, help="feature-boosting pre-squeeze iterations before mining (0 = off)")
     m.add_argument("--allow-resource-risk", action="store_true",
                    help="let the search use the NT-face pair kernels (nt_ts_pearson, nt_ts_spearman) and "
@@ -308,8 +322,18 @@ def build_parser() -> argparse.ArgumentParser:
                         "best after-cost Sharpe on the TRAINING days is traded on the test days "
                         "(halflife / sharpe_smooth / turnover_smooth); 0 = no smoothing is always a candidate. "
                         "Empty = off")
-    m.add_argument("--fitness", default="ic", choices=("ic", "rank_ic"),
-                   help="GP fitness base: |mean daily Pearson IC| (ic) or |mean daily rank IC| (rank_ic)")
+    m.add_argument("--rl-min-solo", type=float, default=None,
+                   help="RL only: a candidate whose own fitness (already net of turnover under the long kinds, or "
+                        "after --turnover-penalty) is below this does not enter the pool; it is paid that fitness "
+                        "(floored at half the invalid-expression penalty) the first time and the penalty on repeats. "
+                        "Unset = the pool admits on combination IC alone")
+    m.add_argument("--fitness", default="ic", choices=("ic", "rank_ic", "long", "long_hit"),
+                   help="GP fitness base: |mean daily Pearson IC| (ic) or |mean daily rank IC| (rank_ic); "
+                        "long = the factor traded on its own as a long-only top-decile book (net excess Sharpe "
+                        "and return after --cost-per-side, plus IC / rank IC on the long half; "
+                        "mining/scoring.LongScorer); long_hit = long-side hit rates plus several long-only "
+                        "books built from the factor's cross-sectional rank (mining/scoring.LongHitScorer). "
+                        "--turnover-penalty is not used with the long kinds")
     m.add_argument("--turnover-penalty", type=float, default=0.0,
                    help="GP fitness = |IC or rank IC| - this x daily turnover of the top/bottom decile book "
                         "(0 = off). 0.14 is 15 bp a side in rank-IC units on the gpu4-gpu8 leaders")

@@ -347,3 +347,90 @@ def test_stats_matches_grid_convention():
     assert s["mdd"] == pytest.approx(-0.02)
     nav = np.cumprod(1 + r)
     assert s["mdd_c"] == pytest.approx((nav / np.maximum.accumulate(nav) - 1).min())
+
+
+# --------------------------------------------------------------------- sweep 的训练段起点
+
+def test_sweep_train_start_skips_the_empty_head_of_a_rolling_signal(tmp_path):
+    import json
+    rng = np.random.default_rng(0)
+    D, S = 60, 12
+    dates = [f"2023{(d // 28) + 1:02d}{(d % 28) + 1:02d}" for d in range(D)]
+    syms = [f"60{i:04d}.SH" for i in range(S)]
+    px = 10 * np.cumprod(1 + rng.normal(0, 0.01, (D, S)), axis=0)
+    np.savez(tmp_path / "m.npz", dates=np.array(dates), symbols=np.array(syms), adj=px, raw=px.astype(np.float32),
+             vol15=np.full((D, S), 1e7, np.float32), hi15=(px * 1.001).astype(np.float32),
+             lo15=(px * 0.999).astype(np.float32), close=px.astype(np.float32), fac=np.ones((D, S)),
+             list_day=np.full(S, -10_000))
+    sig = rng.normal(size=(D, S))
+    sig[:20] = np.nan                                       # 滚动信号的空头
+    np.save(tmp_path / "s.npy", sig)
+    out = tmp_path / "o.json"
+    args = ["sweep", "--inputs", str(tmp_path / "m.npz"), "--signal", str(tmp_path / "s.npy"), "--cost", "flat15",
+            "--caps1", "0.2", "--bands", "0", "--keeps", "0", "--halflives", "1", "--stage1-only", "--workers", "1",
+            "--min-age", "0", "--out", str(out)]
+    assert tb.main(args + ["--train-start", dates[20]]) == 0
+    cell = json.loads(out.read_text(encoding="utf-8"))["stage1"][0]
+    split = int(D * 0.7)
+    assert cell["train"]["days"] == split - 20                  # 不给 --train-start 是 split 天
+    assert cell["test"]["days"] == D - split - 2                # 最后两天的收益还没实现
+    with pytest.raises(SystemExit):
+        tb.main(args + ["--train-start", dates[split]])    # 起点不在训练段里
+
+
+# --------------------------------------------------------------------- 最多持 N 只
+
+def test_max_names_caps_the_holdings_and_takes_the_top_ranked():
+    m = market(np.full((4, 6), 10.0))
+    score = np.tile([6.0, 5, 4, 3, 2, 1], (4, 1))
+    kw = dict(capital=12_000, cap=0.2, pool_frac=1.0, costs=ZERO, reserve=0.0, keep_units=True)
+    free = tb.simulate(m, score, 0, 3, **kw)
+    capped = tb.simulate(m, score, 0, 3, max_names=2, **kw)
+    assert free["n_hold"][0] == 6 and capped["n_hold"].max() == 2          # 整手:每只 200 股、2000 元,6 只都买得下
+    np.testing.assert_allclose(shares(m, capped, 0), [200, 200, 0, 0, 0, 0])   # 前两名各 20%,其余拿现金
+    assert capped["cash"][0] > 0.5
+
+
+def test_max_names_counts_holdings_that_cannot_be_sold():
+    down = np.zeros((4, 4), bool)
+    down[2, 1] = True                                           # 第 1 天(成交日 2)第 2 只封跌停,卖不掉
+    m = market(np.full((4, 4), 10.0), down=down)
+    score = np.array([[4.0, 3, 2, 1], [1.0, 2, 4, 3], [1.0, 2, 4, 3], [1.0, 2, 4, 3]])
+    kw = dict(capital=10_000, cap=0.5, pool_frac=1.0, costs=ZERO, reserve=0.0, keep_units=True, max_names=2)
+    res = tb.simulate(m, score, 0, 3, **kw)
+    np.testing.assert_allclose(shares(m, res, 0), [500, 500, 0, 0])
+    # 第 1 天:第 2 只卖不掉,先占一个名额;剩下一个名额给排名第一的第 3 只,第 1 只清掉
+    np.testing.assert_allclose(shares(m, res, 1), [0, 500, 500, 0])
+    assert res["n_hold"][1] == 2
+
+
+def test_max_names_tops_up_drifted_holdings_instead_of_sitting_on_cash(monkeypatch):
+    # 第 0 天买满 A、B;第 1 天 A 翻倍(保留区里被减回上限,放出现金)、B 腰斩(保留区原样不动)。
+    # 名额满了,不补仓的话 A 放出来的钱就一直闲着
+    adj = np.array([[10.0, 10, 10], [10.0, 10, 10], [20.0, 5, 10], [20.0, 5, 10], [20.0, 5, 10]])
+    m = market(adj)
+    score = np.tile([3.0, 2, 1], (5, 1))
+    kw = dict(capital=10_000, cap=0.5, pool_frac=1.0, costs=ZERO, reserve=0.0, keep_units=True, max_names=2,
+              band=0.0, keep=1.0)
+    res = tb.simulate(m, score, 0, 3, **kw)
+    assert res["n_hold"].max() == 2 and res["cash"][1] < 0.02
+    monkeypatch.setattr(tb, "TOPUP_IDLE", 1.0)                 # 关掉补仓:同一个场景会闲着一成多现金
+    idle = tb.simulate(m, score, 0, 3, **kw)
+    assert idle["cash"][1] > 0.1
+
+
+def test_top_up_increments_are_legal_lots_on_the_star_board(monkeypatch):
+    # 科创板 200 股起、之后 1 股一档。A(科创板)跌到上限以下、B(主板)涨过上限被减一手,放出 1200 元现金;
+    # 名额满了,补仓想给 A 加 26 股 —— 不合法(增量要 >= 200 股),这一单不能下
+    adj = np.array([[50.0, 10], [50.0, 10], [45.0, 12], [45.0, 12]])
+    m = market(adj)
+    m.lot_min = np.array([200.0, 100.0])
+    m.lot_step = np.array([1.0, 100.0])
+    score = np.tile([2.0, 1], (4, 1))
+    kw = dict(capital=20_000, cap=0.5, pool_frac=1.0, costs=ZERO, reserve=0.0, keep_units=True, max_names=2,
+              band=0.0, keep=1.0)
+    monkeypatch.setattr(tb, "TOPUP_MIN", 0.0)                  # 只看合法股数,不看最小补仓额
+    res = tb.simulate(m, score, 0, 2, **kw)
+    np.testing.assert_allclose(shares(m, res, 0), [200, 1000])
+    np.testing.assert_allclose(shares(m, res, 1), [200, 900])  # A 不动(26 股不合法),B 减一手
+    assert res["cash"][1] > 0.05

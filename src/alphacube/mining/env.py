@@ -103,6 +103,7 @@ class BatchRewarder:
                  with_novelty: bool = False, panel_cache_items: int = 256,
                  panel_cache_bytes: Optional[int] = 8 * 1024 ** 3,
                  scorer: Optional["PanelScorer"] = None, reward_kind: str = "pool",
+                 min_solo: Optional[float] = None,
                  banned_substructures: Sequence[str] = (),
                  rank_ban: Optional["RankSimilarityBan"] = None) -> None:
         self.engine = engine
@@ -119,11 +120,20 @@ class BatchRewarder:
             raise ValueError("reward_kind 只能是 pool 或 solo")
         self.scorer = scorer
         self.reward_kind = reward_kind
+        # 进池的门槛:候选自己的适应度(已经扣了换手)低于这个数就不进池,奖励就是它自己的适应度。
+        # 不设的话池子只按合成信号的 IC 收人 —— rl_long_1 的 30 个成员全是高换手因子,单独做多头都是亏的。
+        self.min_solo = None if min_solo is None else float(min_solo)
+        self.refused_solo = 0
+        # 没进池的候选只在第一次出现时拿到自己的适应度,再出现就是惩罚。不这样的话"刚好不够格"的表达式是个
+        # 可以反复领的稳定奖励(约 -0.02),而重复提交池内成员是 -1:rl_hit_1 的策略 800 局后就塌到一条表达式上,
+        # 池子停在 17 个不动了。
+        self._paid_outside: set = set()
         self.banned_substructures = frozenset(banned_substructures)
         self.rank_ban = rank_ban
         self.refused_structure = 0
         self.refused_similar = 0
         self.exemplar_cache = None        # 由 pipeline 塞进来,见 rankban.ExemplarCache
+        self._solo_scores: Dict[str, dict] = {}       # 表达式 key -> 打分器的结果(收敛的策略会反复吐同一条)
         self.n_evaluated = 0
         self.engine_seconds = 0.0
 
@@ -189,6 +199,14 @@ class BatchRewarder:
             cache.prune()
         return added
 
+    def _outside(self, expr: Expression, solo: float, ic: float, reason: str) -> RewardResult:
+        """没进池的候选:第一次给它自己的适应度(不低于半个惩罚),同一条再来就是惩罚。"""
+        key = expr.key()
+        if key in self._paid_outside:
+            return RewardResult(self.penalty, ic=ic, reason=reason + " (repeat)")
+        self._paid_outside.add(key)
+        return RewardResult(max(float(solo), 0.5 * self.penalty), ic=ic, reason=reason)
+
     def memory_line(self) -> str:
         g = 1024.0 ** 3
         return (f"cache {self._cache_bytes / g:.1f}G/{len(self._cache)} "
@@ -216,9 +234,12 @@ class BatchRewarder:
                 continue
             p64 = panel.astype(np.float64)
             if self.scorer is not None:
-                # GP 用的同一个目标:|rank IC| - λ x 十分位多空书日换手。
-                # 老口径(纯 Pearson IC)留给没传 scorer 的调用方。
-                s = self.scorer.score(p64)
+                # GP 用的同一个目标(mining/scoring.py):|rank IC| - λ x 十分位多空书日换手,或纯多头口径。
+                # 老口径(纯 Pearson IC)留给没传 scorer 的调用方。面板是表达式 key 的纯函数,分数按 key 缓存。
+                key = expr.key()
+                s = self._solo_scores.get(key)
+                if s is None:
+                    s = self._solo_scores[key] = self.scorer.score(p64)
                 ic, solo = s["ic"], s["fit"]
                 if not np.isfinite(solo):
                     results[i] = RewardResult(self.penalty, ic=ic, reason="solo fitness rejected")
@@ -233,6 +254,10 @@ class BatchRewarder:
                 self.refused_similar += 1
                 results[i] = RewardResult(self.penalty, ic=ic, reason="ranks like a banned family")
                 continue
+            if self.scorer is not None and self.min_solo is not None and solo < self.min_solo:
+                self.refused_solo += 1
+                results[i] = self._outside(expr, solo, ic, "solo fitness below the pool's bar")
+                continue
             novelty = float("nan")
             if self.with_novelty:
                 from ..metrics import zscore_rows
@@ -246,12 +271,17 @@ class BatchRewarder:
                 results[i] = RewardResult(self.penalty, ic=ic, novelty=novelty,
                                           reason=f"{type(exc).__name__}: {str(exc)[:60]}")
                 continue
+            if self.scorer is not None and self.min_solo is not None \
+                    and not any(m.expr.key() == expr.key() for m in self.pool.members):
+                # 池子满了、被挤掉的正是它自己:池子没变,不能当成"进了池"去领池子的奖励
+                results[i] = self._outside(expr, solo, ic, "pruned on entry: pool unchanged")
+                continue
             if self.reward_kind == "solo":
                 reward = float(solo)
             elif self.scorer is not None:
-                # 池的奖励也换成同一种货币:合成信号自己的 |rank IC| - λ x 换手。
+                # 池的奖励也换成同一种货币:合成信号自己的适应度(老口径 |rank IC| - λ x 换手,或纯多头口径)。
                 # 只有真的进了池才算这一次(一次排序约 0.5 s),被拒的走惩罚。
-                reward = float(self.scorer.score(self.pool.combined(), gated=False)["fit"])
+                reward = float(self.scorer.score_combined(self.pool.combined())["fit"])
                 if not np.isfinite(reward):
                     # 合成信号一个能算的日子都没有(极端情形):退回候选自己的分数,
                     # 绝不能把 -inf 喂进 PPO / QCM 的更新 —— 一个就把优势函数整批变 NaN

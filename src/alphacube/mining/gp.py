@@ -35,21 +35,21 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from ..catalog import Registry
+from ..catalog import RESOURCE_RISK_KERNELS, Registry
 from ..engine.engine import CubeEngine
-from ..expression import Expression, is_valid_root
+from ..expression import Expression, GeneralCall, contains_lookahead, is_valid_root
 from ..metrics import (MIN_PAIRS, _cs_corr_days_t, batched_ic, cs_pearson, nanmean_quiet, rank_ic_turnover,
                        torch_rank_rows)
 from ..store import CubeView
-from .clustering import cluster_population, cull_clusters
+from .clustering import cluster_population, cull_clusters, skeleton_key
 from .generator import TypedTreeGenerator, one_layer_keys
 from .rankban import CompactRankIndex, ExemplarCache, RankSimilarityBan, view_cache_key
-from .scoring import BOOK_TOP_FRAC as _SHARED_TOP_FRAC, PanelScorer
+from .scoring import BOOK_TOP_FRAC as _SHARED_TOP_FRAC, PanelScorer, make_scorer
 from .pool import LinearPool
 
 ProgressFn = Callable[[int, int, dict], None]
 
-FITNESS_KINDS = ("ic", "rank_ic")
+FITNESS_KINDS = ("ic", "rank_ic", "long", "long_hit")
 # The book every report trades -- top/bottom decile, equal weight, gross 1
 # (backtest_metrics' default) -- and so the one whose turnover the fitness charges.
 BOOK_TOP_FRAC = _SHARED_TOP_FRAC
@@ -175,6 +175,8 @@ class GPMiner:
                  on_engine_progress: Optional[Callable[[dict], None]] = None,
                  checkpoint_dir: Optional[os.PathLike] = None,
                  checkpoint_every: int = 0,
+                 initial_population: Sequence[Expression] = (), seed_keep: int = 0,
+                 seed_max_depth: int = 0, seed_per_block: bool = False,
                  workdir: Optional[os.PathLike] = None, seed: int = 0) -> None:
         self.registry = registry
         self.view = view
@@ -249,6 +251,25 @@ class GPMiner:
             self.generator.ban(banned_substructures)
         self.engine = CubeEngine(view, device=device, chunk_symbols=chunk_symbols, chunk_days=chunk_days,
                                  workdir=workdir)
+        # 种子(比如原始手写因子库):第一代的一部分不随机生成,而是从种子里按训练段适应度挑。
+        # 只收搜索自己也能繁殖的树 —— 合法根、没被封、不看未来、用到的登记算子都在搜索词表里
+        # (eq / pow / 布尔算子这些搜索不再繁殖,种子也不放);全库调用(GeneralCall)照收,它们只能
+        # 靠子树变异 / 交叉 / 提升改动。打分放在 mine() 里:股票池挖掘在构造之后才把引擎换成
+        # 只看成分股的那个(pipeline.run_mining)。
+        allowed = {sp.name for sp in self.generator.specs}
+        uniq = dict((e.key(), e) for e in initial_population)
+        self._seeds = [e for e in uniq.values()
+                       if self.generator.acceptable(e) and not contains_lookahead(e) and not self._refused(e)
+                       and (not seed_max_depth or e.depth() <= seed_max_depth)
+                       and all(isinstance(n, GeneralCall) or n.spec is None or n.spec.name in allowed
+                               for n in e.nodes())
+                       and not any(isinstance(n, GeneralCall) and n.spec.name.endswith("_legacy")
+                                   and n.spec.name[:-7] in RESOURCE_RISK_KERNELS for n in e.nodes())]
+        self.seeds_offered, self.seeds_eligible = len(uniq), len(self._seeds)
+        self.seed_keep = max(0, int(seed_keep))
+        self.seed_per_block = bool(seed_per_block)
+        self._seed_order: Optional[List[Tuple[Expression, float]]] = None
+        self.seeds_used: List[Tuple[int, Expression, float]] = []      # (块号, 种子, 训练段适应度)
         self.target = np.asarray(target, dtype=np.float64)
         # Rank-similarity bans (0 = off): panels of banned families; a candidate
         # whose daily ranks correlate with one to ban_rank_corr is refused, however
@@ -295,10 +316,11 @@ class GPMiner:
         self._scorer: Optional[PanelScorer] = None
         if self._rich:
             # GP 和 RL 用同一个打分器(mining/scoring.py),免得两条搜索线各算各的目标
-            self._scorer = PanelScorer(self.target, kind=fitness_kind,
+            # "long" / "long_hit" 是纯多头口径(scoring.LongScorer / LongHitScorer):换手按 cost_per_side 直接扣
+            self._scorer = make_scorer(self.target, fitness_kind,
                                        turnover_penalty=self.turnover_penalty,
-                                       signed=self.fitness_signed, top_frac=BOOK_TOP_FRAC,
-                                       min_coverage=self.min_coverage,
+                                       signed=self.fitness_signed, cost_per_side=float(cost_per_side),
+                                       top_frac=BOOK_TOP_FRAC, min_coverage=self.min_coverage,
                                        min_scored_days=self.min_scored_days)
             self._target_t64 = self._scorer.target_t64
             self._target_ranks_t = self._scorer.target_ranks_t
@@ -412,8 +434,8 @@ class GPMiner:
         s = self._scores[key] = self._scorer.score(panel)
         return s
 
-    def fitness(self, population: Sequence[Expression]) -> np.ndarray:
-        panels = self._panels(population)
+    def fitness(self, population: Sequence[Expression], cache: bool = True) -> np.ndarray:
+        panels = self._panels(population, cache)
         fit = np.full(len(population), -np.inf)
         live = [i for i, p in enumerate(panels) if p is not None]
         if live and self._rich:
@@ -669,6 +691,44 @@ class GPMiner:
             nxt.append(child)
         return nxt
 
+    def _seeded_population(self, block: int) -> List[Expression]:
+        """一代的起点:种子里按适应度挑 seed_keep 个(默认半个种群),同一骨架只要一个,其余随机。
+
+        种子第一次用到时整批打分(分批、不进面板缓存,和 _add_exemplars 一样:全市场一个面板
+        30-40 MB,一千多个种子一次算完要 40 GB)。seed_per_block 时每个滚动块换下一批种子;
+        否则每块都从最好的那批重新开始。挑的时候再查一遍 acceptable:滚动会加封禁。"""
+        if not self._seeds:
+            return self.generator.generate_population(self.population_size)
+        if self._seed_order is None:
+            fit = np.concatenate([self.fitness(self._seeds[lo:lo + EXEMPLAR_BATCH], cache=False)
+                                  for lo in range(0, len(self._seeds), EXEMPLAR_BATCH)])
+            order = np.argsort(-np.where(np.isfinite(fit), fit, -np.inf), kind="stable")
+            self._seed_order = [(self._seeds[i], float(fit[i])) for i in order if np.isfinite(fit[i])]
+        k = min(self.seed_keep or self.population_size // 2, self.population_size)
+        pick, skel = [], set()
+        for e, f in self._seed_order:
+            if len(pick) == k:
+                break
+            if self.generator.acceptable(e) and skeleton_key(e) not in skel:
+                pick.append((e, f))
+                skel.add(skeleton_key(e))
+        if self.seed_per_block:
+            used = {e.key() for e, _ in pick}
+            self._seed_order = [(e, f) for e, f in self._seed_order if e.key() not in used]
+        self.seeds_used += [(block, e, f) for e, f in pick]
+        self._write_seeds()
+        return [e for e, _ in pick] + self.generator.generate_population(self.population_size - len(pick))
+
+    def _write_seeds(self) -> None:
+        if self.checkpoint_dir is None:
+            return
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        with (self.checkpoint_dir / "seeds_used.csv").open("w", encoding="utf-8") as fh:
+            fh.write("block,train_fitness,expression\n")
+            for b, e, f in self.seeds_used:
+                text = repr(e).replace('"', '""')
+                fh.write(f'{b},{f:.6f},"{text}"\n')
+
     # -- entry -----------------------------------------------------------------------
     def mine(self, budget: int, on_generation: Optional[ProgressFn] = None) -> MiningReport:
         t0 = time.perf_counter()
@@ -680,7 +740,7 @@ class GPMiner:
         # family's lesser members are -inf there). The block's ban counts use raw, as
         # they did before families existed -- they measure where the population's
         # mass went, rewrites included, which is exactly what a ban is for.
-        population = self.generator.generate_population(self.population_size)
+        population = self._seeded_population(1)
         raw = self.fitness(population)
         fit = self._archive_update(population, raw)
         best = float(np.max(fit)) if np.isfinite(fit).any() else float("-inf")
@@ -701,7 +761,8 @@ class GPMiner:
                 self.write_checkpoint(g + 1)
             if self.rolling_block and (g + 1) % self.rolling_block == 0 and g + 1 < n_gen:
                 banned = self._roll(population, raw, g + 1)
-                population = self.generator.generate_population(self.population_size)
+                population = (self._seeded_population(len(self.blocks) + 1) if self.seed_per_block
+                              else self.generator.generate_population(self.population_size))
                 self._gen_similar = self._gen_dup = 0
                 raw = self.fitness(population)
                 fit = self._archive_update(population, raw)
@@ -800,7 +861,9 @@ class GPMiner:
         ``sharpe`` / ``annualized_return`` / ``max_drawdown`` are no-cost and for
         the factor AS WRITTEN (IC -0.024 with sharpe -3.3 is a strong factor, traded
         the other way); ``sharpe_net`` is after ``cost_per_side`` and traded in its
-        IC's direction -- the number to read. Deeper rows, and any row whose panel
+        IC's direction -- the number to read (under the long-only fitness kinds read the
+        ``score_long_*`` / ``score_xs_*`` / ``score_hit_*`` columns instead: the long-only
+        books and hit rates the fitness is made of). Deeper rows, and any row whose panel
         has been evicted, carry no metrics; members.csv at the end is where
         everything gets measured properly."""
         if self.checkpoint_dir is None:
@@ -810,7 +873,8 @@ class GPMiner:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         path = self.checkpoint_dir / f"archive_gen{generation:03d}.csv"
         tmp = path.with_suffix(".csv.tmp")
-        scores = ["score_ic", "score_rank_ic", "score_turnover", "dups"]
+        parts = ("ic", "rank_ic", "turnover") + tuple(getattr(self._scorer, "columns", ()))    # 纯多头口径的分量
+        scores = [f"score_{n}" for n in parts] + ["dups"]
         cols = ["ic_mean", "icir", "rank_ic", "coverage", "n_days",
                 "annualized_return", "sharpe", "max_drawdown", "turnover", "sharpe_net"]
         with tmp.open("w", encoding="utf-8") as fh:
@@ -818,7 +882,7 @@ class GPMiner:
             for i, (expr, fit) in enumerate(self.archive()):
                 k = expr.key()
                 sc = self._scores.get(k, {})
-                vals = {f"score_{n}": sc[n] for n in ("ic", "rank_ic", "turnover") if n in sc}
+                vals = {f"score_{n}": sc[n] for n in parts if n in sc}
                 if self._families is not None:
                     vals["dups"] = len(self._absorbed.get(k, ()))
                 if i < metrics_top_n:

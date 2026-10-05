@@ -48,3 +48,15 @@ def test_index_members_rebalance_only_in_january_and_july():
     assert m[0].tolist() == [True, True, False, False]       # 第一天调样
     assert m[2].tolist() == m[1].tolist() == [True, True, False, False]   # 1 月 2 日调过,之后不动
     assert m[4].tolist() == [True, False, False, True]       # 7 月第一个交易日才换进来
+
+
+def test_universe_name_comes_from_the_rule_in_the_sidecar(tmp_path):
+    import json
+    import tearsheet as ts
+    np.save(tmp_path / "a.npy", np.ones((2, 2), bool))
+    (tmp_path / "a.json").write_text(json.dumps({"rule": "沪深300 近似,前 300 只"}), encoding="utf-8")
+    np.save(tmp_path / "b.npy", np.ones((2, 2), bool))
+    (tmp_path / "b.json").write_text(json.dumps({"rule": "a.npy 的补集(每天不在名单里的票)"}), encoding="utf-8")
+    assert ts.universe_name(str(tmp_path / "a.npy")) == "沪深300"
+    assert ts.universe_name(str(tmp_path / "b.npy")) == "非沪深300"
+    assert ts._color("非沪深300等权") == ts.COLORS["沪深300成分等权(近似)"]

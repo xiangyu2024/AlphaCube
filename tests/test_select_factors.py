@@ -108,10 +108,10 @@ def test_shortlist_spans_the_cost_tradeoff_not_the_extremes():
     from select_factors import shortlist
 
     rows = [  # 同一族:慢而弱 / 中庸 / 快而强
-        {"rank_ic_train": "0.020", "turnover": "0.01"},
-        {"rank_ic_train": "0.035", "turnover": "0.10"},
-        {"rank_ic_train": "0.070", "turnover": "0.30"},
-        {"rank_ic_train": "0.005", "turnover": "0.001"},   # 几乎不动、没信息:不该被选
+        {"rank_ic_train": "0.020", "turnover_train": "0.01"},
+        {"rank_ic_train": "0.035", "turnover_train": "0.10"},
+        {"rank_ic_train": "0.070", "turnover_train": "0.30"},
+        {"rank_ic_train": "0.005", "turnover_train": "0.001"},   # 几乎不动、没信息:不该被选
     ]
     labels = np.zeros(len(rows), dtype=int)
     picked = shortlist(labels, rows, per_family=3, lambdas=(0.07, 0.14, 0.20))
@@ -128,14 +128,14 @@ def test_weak_small_families_are_dropped_strong_ones_kept():
     from select_factors import shortlist
 
     rows = [
-        {"rank_ic_train": "0.004", "turnover": "0.05"},   # 0 单点、弱 -> 丢
-        {"rank_ic_train": "0.050", "turnover": "0.05"},   # 1 单点、强 -> 留
-        {"rank_ic_train": "0.020", "turnover": "0.01"},   # 2 单点、适应度 0.0186 过线 -> 留
-        {"rank_ic_train": "0.003", "turnover": "0.60"},   # 3 \
-        {"rank_ic_train": "0.004", "turnover": "0.55"},   # 4  > 五个成员的大族,个个很弱
-        {"rank_ic_train": "0.005", "turnover": "0.50"},   # 5  |  但不是小族,照样进
-        {"rank_ic_train": "0.006", "turnover": "0.45"},   # 6 /
-        {"rank_ic_train": "0.007", "turnover": "0.40"},   # 7
+        {"rank_ic_train": "0.004", "turnover_train": "0.05"},   # 0 单点、弱 -> 丢
+        {"rank_ic_train": "0.050", "turnover_train": "0.05"},   # 1 单点、强 -> 留
+        {"rank_ic_train": "0.020", "turnover_train": "0.01"},   # 2 单点、适应度 0.0186 过线 -> 留
+        {"rank_ic_train": "0.003", "turnover_train": "0.60"},   # 3 \
+        {"rank_ic_train": "0.004", "turnover_train": "0.55"},   # 4  > 五个成员的大族,个个很弱
+        {"rank_ic_train": "0.005", "turnover_train": "0.50"},   # 5  |  但不是小族,照样进
+        {"rank_ic_train": "0.006", "turnover_train": "0.45"},   # 6 /
+        {"rank_ic_train": "0.007", "turnover_train": "0.40"},   # 7
     ]
     labels = np.array([0, 1, 2, 3, 3, 3, 3, 3])
     picked = shortlist(labels, rows, per_family=3, lambdas=(0.07, 0.14, 0.20),

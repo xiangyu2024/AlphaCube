@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 from typing import List
 
-BAN_LINE = re.compile(r"封禁\s+\d+\s+个一层结构[,,]\s*累计生效\s+\d+\s+个[::]\s*(.+?)\s*$", re.M)
+BAN_LINE = re.compile(r"封禁\s+\d+\s+个一层结构[,,]\s*累计生效\s+\d+\s+个[::][ \t]*(.*?)[ \t]*$", re.M)
 # 键之间用 ", " 分隔,而键**自己也带逗号** —— 双参数算子写成 O:day_cov(F:Low,F:Ret)。
 # 按纯逗号切会把它劈成两半,gpu17 就是这么起来 90 秒就 exit 1 的
 # (ValueError: ban key 'O:nt_ts_cov(F:Open' is not a depth-1 structure)。
@@ -30,7 +30,7 @@ def new_bans(log_text: str) -> List[str]:
     for match in BAN_LINE.finditer(log_text):
         for key in KEY_SEP.split(match.group(1)):
             key = key.strip()
-            if key and key not in keys:
+            if key.startswith("O:") and key not in keys:
                 keys.append(key)
     return keys
 

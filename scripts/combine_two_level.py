@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import sys
 import time
@@ -127,7 +126,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     from alphacube.metrics import cs_pearson, nanmean_quiet, zscore_rows
     from alphacube.research import warmed_view
     from alphacube.store import open_cube_store
-    from select_factors import cluster_by_correlation, pairwise_abs_corr, LAMBDA, MIN_FIT, MIN_RIC
+    from select_factors import cluster_by_correlation, fitness, pairwise_abs_corr, selectable_rows, MIN_FIT, MIN_RIC
 
     d = Path(a.dir)
     t0 = time.time()
@@ -137,9 +136,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     split = max(1, min(D - 1, int(D * a.train_frac)))
     train, test = slice(0, split), slice(split, D)
 
-    rows = [r for r in csv.DictReader(open(d / "metrics.csv", encoding="utf-8")) if r["healthy"] == "True"]
+    rows = selectable_rows(d / "metrics.csv")
     num = lambda r, k: float(r[k]) if r[k] not in ("", "nan", "None") else np.nan   # noqa: E731
-    rows = [r for r in rows if np.isfinite(num(r, "rank_ic_train")) and np.isfinite(num(r, "turnover"))]
     fp = np.load(d / "fp_train_250x512.npy", mmap_mode="r")
     labels = cluster_by_correlation(pairwise_abs_corr(np.asarray(fp)), a.cluster)
     print(f"{len(rows)} 个健康因子 -> {labels.max()+1} 族 ({time.time()-t0:.0f}s)", flush=True)
@@ -147,11 +145,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     fams = []
     for fam in np.unique(labels):
         idx = list(np.flatnonzero(labels == fam))
-        best_fit = max(abs(num(rows[j], "rank_ic_train")) - LAMBDA * num(rows[j], "turnover") for j in idx)
+        best_fit = max(fitness(rows[j]) for j in idx)
         best_ric = max(abs(num(rows[j], "rank_ic_train")) for j in idx)
         if len(idx) <= 3 and not (best_fit >= MIN_FIT or best_ric >= MIN_RIC):
             continue
-        idx.sort(key=lambda j: -(abs(num(rows[j], "rank_ic_train")) - LAMBDA * num(rows[j], "turnover")))
+        idx.sort(key=lambda j: -fitness(rows[j]))
         fams.append((int(fam), idx[: a.max_members], best_fit))
     fams.sort(key=lambda t: -t[2])
     fams = fams[: a.max_families]

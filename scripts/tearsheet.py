@@ -178,23 +178,31 @@ def compute(a: argparse.Namespace) -> int:
     sig = np.load(a.signal).astype(np.float64)
     ret = forward_return(mkt.adj, 1, 1)                 # 决策日 t:t+1 开盘 15 分钟 VWAP -> t+2
     cfg = dict(STRATEGY)
-    for k, v in (("cap", a.cap), ("keep", a.keep), ("band", a.band), ("pool_frac", a.pool)):
+    for k, v in (("cap", a.cap), ("keep", a.keep), ("band", a.band), ("pool_frac", a.pool), ("max_names", a.max_names)):
         if v is not None:
             cfg[k] = v
     hl = a.halflife if a.halflife is not None else HALFLIFE
     sm = ema_rows(sig, hl)
     universe = None
+    uname = ""
     if a.universe:
         from universe import load_universe
         universe = load_universe(a.universe, (D, S))
         sm[~universe] = np.nan                           # 先平滑再圈池子
-    res = tb.simulate(mkt, sm, 0, D, capital=a.capital, costs=tb.RETAIL, compound=True, **cfg)
+        uname = a.universe_name or universe_name(a.universe)
+    t0 = 0
+    if a.start:                                          # 滚动拟合的信号前面是空的:从有信号的那天开始投钱
+        t0 = next((i for i, x in enumerate(mkt.dates) if str(x) >= a.start), D)
+        if t0 >= split:
+            raise SystemExit(f"--start {a.start} 不在训练段里")
+    res = tb.simulate(mkt, sm, t0, D, capital=a.capital, costs=tb.RETAIL, compound=True, **cfg)
     t = res["t"].astype(int)
     end = [mkt.dates[i + 2] for i in t]                  # 每个日收益在 t+2 开盘后结算
 
     cmv, tmv = load_caps(a.capital_dir, mkt.dates, mkt.symbols)
     amount = np.load(a.amount)
-    member = universe if universe is not None else index_members(tmv, amount, mkt.list_day, mkt.dates)
+    # 股票池就是沪深300 近似名单时,沪深300 基准直接用这份名单;别的池子(比如它的补集)另外搭真正的沪深300 近似
+    member = universe if uname == "沪深300" else index_members(tmv, amount, mkt.list_day, mkt.dates)
     fin = np.isfinite(ret)
     r_ew = np.where(fin.any(1), np.nansum(ret, 1) / np.maximum(fin.sum(1), 1), np.nan)
     r_cw = weighted_returns(ret, cmv)
@@ -204,8 +212,9 @@ def compute(a: argparse.Namespace) -> int:
         base, lines = "等权全市场", list(SERIES)
     else:
         r_u = weighted_returns(ret, np.where(universe, 1.0, np.nan))
-        series = {"策略": res["ret"], "沪深300成分等权(近似)": r_u[t], "沪深300(近似)": r_300[t], "等权全市场": r_ew[t]}
-        base, lines = "沪深300成分等权(近似)", ["策略", "沪深300成分等权(近似)", "沪深300(近似)"]
+        base = "沪深300成分等权(近似)" if uname == "沪深300" else f"{uname}等权"
+        series = {"策略": res["ret"], base: r_u[t], "沪深300(近似)": r_300[t], "等权全市场": r_ew[t]}
+        lines = ["策略", base, "沪深300(近似)"]
     for k, v in series.items():
         if not np.isfinite(v).all():
             raise SystemExit(f"{k} 有 {int((~np.isfinite(v)).sum())} 个缺失日")
@@ -219,8 +228,8 @@ def compute(a: argparse.Namespace) -> int:
         metrics[seg]["运作"] = {"turnover": float(res["turnover"][m].mean()), "fees_yr": float(res["fees"][m].mean() * 252),
                               "n_hold": float(res["n_hold"][m].mean()), "cash": float(res["cash"][m].mean())}
     out = {"capital": a.capital, "split_date": mkt.dates[split + 1], "config": {**cfg, "halflife": hl,
-           "costs": tb.RETAIL.name, "signal": a.signal, "universe": a.universe},
-           "order": list(series), "base": base, "plot": lines, "title": a.title,
+           "costs": tb.RETAIL.name, "signal": a.signal, "universe": a.universe, "universe_name": uname},
+           "order": list(series), "base": base, "plot": lines, "title": a.title, "insample_note": a.insample_note,
            "dates": end, "series": {k: v.tolist() for k, v in series.items()},
            "n_hold": res["n_hold"].tolist(), "cash": res["cash"].tolist(), "turnover": res["turnover"].tolist(),
            "metrics": metrics, "yearly": yearly(series, end),
@@ -264,6 +273,18 @@ def report(out: dict) -> None:
 INK, INK2, MUTED, GRID, AXIS, SURFACE = "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#c3c2b7", "#fcfcfb"
 COLORS = {"策略": "#2a78d6", "等权全市场": "#eb6834", "流通市值加权全市场": "#1baf7a", "沪深300(近似)": "#eda100",
           "沪深300成分等权(近似)": "#e87ba4"}
+
+
+def _color(k: str) -> str:
+    """别的股票池的"池内等权"基准(比如"非沪深300等权")和沪深300 成分等权同一个颜色。"""
+    return COLORS.get(k, COLORS["沪深300成分等权(近似)"])
+
+
+def universe_name(path: str) -> str:
+    """从名单旁边的 .json 读 rule:补集(universe.py --complement-of)叫"非沪深300",否则当作沪深300 近似名单。"""
+    meta = Path(path).with_suffix(".json")
+    rule = json.loads(meta.read_text(encoding="utf-8")).get("rule", "") if meta.exists() else ""
+    return "非沪深300" if "补集" in rule else "沪深300"
 
 
 def _cjk_font() -> Optional[str]:
@@ -315,7 +336,7 @@ def plot(a: argparse.Namespace) -> int:
     ax = axes[0]
     for k in lines:
         y = np.concatenate([[cap], nav[k]]) / 1e4
-        ax.plot(xs, y, color=COLORS[k], linewidth=2.2 if k == "策略" else 1.6, label=k, zorder=3 if k == "策略" else 2)
+        ax.plot(xs, y, color=_color(k), linewidth=2.2 if k == "策略" else 1.6, label=k, zorder=3 if k == "策略" else 2)
     ax.set_yscale("log")
     ax.yaxis.set_major_locator(LogLocator(base=10, subs=(1.0, 1.5, 2.0, 3.0, 5.0, 7.0)))
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
@@ -330,7 +351,7 @@ def plot(a: argparse.Namespace) -> int:
         ax.annotate(f"{k} {nav[k][-1] / 1e4:,.0f} 万", xy=(xs[-1], nav[k][-1] / 1e4), xytext=(xs[-1], y),
                     textcoords="data", xycoords="data", fontsize=9.5, color=INK, va="center",
                     ha="left", annotation_clip=False)
-        ax.plot([xs[-1]], [nav[k][-1] / 1e4], marker="o", markersize=4.5, color=COLORS[k], zorder=4)
+        ax.plot([xs[-1]], [nav[k][-1] / 1e4], marker="o", markersize=4.5, color=_color(k), zorder=4)
         last_y = y
     ms_all, ms_oos = out["metrics"]["全样本"], out["metrics"]["样本外(测试段)"]
     s_all, s_oos = ms_all["策略"], ms_oos["策略"]
@@ -342,14 +363,15 @@ def plot(a: argparse.Namespace) -> int:
             transform=ax.transAxes, fontsize=9.5, color=INK2)
     ax.legend(loc="upper left", frameon=False, fontsize=9.5, labelcolor=INK)
     ax.text(split, ax.get_ylim()[0] * 1.04, "  样本外 →", color=INK2, fontsize=9, va="bottom")
-    ax.text(split, ax.get_ylim()[0] * 1.04, "样本内:信号权重和参数在这一段拟合、挑选  ", color=INK2, fontsize=9,
+    note = out.get("insample_note") or "样本内:信号权重和参数在这一段拟合、挑选"
+    ax.text(split, ax.get_ylim()[0] * 1.04, note + "  ", color=INK2, fontsize=9,
             va="bottom", ha="right")
 
     # (2) 相对强弱:策略 / 基准
     ax = axes[1]
     for k in dict.fromkeys((base, "沪深300(近似)")):
         rel = np.concatenate([[1.0], nav["策略"] / nav[k]])
-        ax.plot(xs, rel, color=COLORS[k], linewidth=1.6, label=f"策略 ÷ {k}")
+        ax.plot(xs, rel, color=_color(k), linewidth=1.6, label=f"策略 ÷ {k}")
         ax.annotate(f"{rel[-1]:.2f}", xy=(xs[-1], rel[-1]), xytext=(4, 0), textcoords="offset points",
                     fontsize=9, color=INK, va="center")
     ax.axhline(1.0, color=AXIS, linewidth=1.0)
@@ -361,18 +383,24 @@ def plot(a: argparse.Namespace) -> int:
     for k in dict.fromkeys(("策略", base, "沪深300(近似)")):
         v = np.concatenate([[cap], nav[k]])
         dd = v / np.maximum.accumulate(v) - 1
-        ax.plot(xs, dd * 100, color=COLORS[k], linewidth=1.9 if k == "策略" else 1.3, label=k)
+        ax.plot(xs, dd * 100, color=_color(k), linewidth=1.9 if k == "策略" else 1.3, label=k)
     ax.set_ylabel("回撤(%)")
     # 左下角压着 2018 年的回撤、右下角挨着 2024 年初的回撤,放在 2019 下半年到 2022 之间那块空白
-    ax.legend(loc="lower left", bbox_to_anchor=(0.19, 0.0), frameon=False, fontsize=9, labelcolor=INK, ncol=3)
+    if out["dates"][0][:4] == "2018":
+        ax.legend(loc="lower left", bbox_to_anchor=(0.19, 0.0), frameon=False, fontsize=9, labelcolor=INK, ncol=3)
+    else:                                                 # 不是从 2018 年起(--start):那块空白不在原处,让它自己找
+        ax.legend(loc="best", frameon=False, fontsize=9, labelcolor=INK, ncol=3)
     ax.xaxis.set_major_locator(mdates.YearLocator())
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
     ax.set_xlim(xs[0], xs[-1])
 
     c = out["config"]
+    uname = c.get("universe_name") or "沪深300"
+    where = "" if not c.get("universe") else ("、只在沪深300 近似成分里选" if uname == "沪深300" else f"、只在{uname}的票里选")
     fig.text(0.01, 0.005, "基准与策略同一套成交价(次日开盘 15 分钟 VWAP)、含分红;沪深300 是用市值数据搭的近似(半年调样、流通市值加权)。"
-             f"策略:等权单票 {c['cap']:.1%}、保留前 {c['keep']:.0%}、半衰期 {c['halflife']:g}、A 股实际费率(佣金最低 5 元)、整手"
-             f"{'、只在沪深300 近似成分里选' if c.get('universe') else ''}。",
+             f"策略:等权单票 {c['cap']:.1%}{'、最多 ' + str(c['max_names']) + ' 只' if c.get('max_names') else ''}、"
+             f"保留前 {c['keep']:.0%}、半衰期 {c['halflife']:g}、A 股实际费率(佣金最低 5 元)、整手"
+             f"{where}。",
              fontsize=8, color=MUTED)
     fig.tight_layout(rect=(0, 0.015, 0.9, 1))
     fig.savefig(a.out, dpi=170)
@@ -398,6 +426,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     c.add_argument("--pool", type=float, default=None)
     c.add_argument("--halflife", type=float, default=None)
     c.add_argument("--title", default="")
+    c.add_argument("--start", default="", help="从这天(YYYYMMDD)开始投入资金;默认第一天")
+    c.add_argument("--max-names", type=int, default=None, help="最多持有几只(默认不限)")
+    c.add_argument("--universe-name", default="", help="股票池叫什么(默认从名单 .json 的 rule 判断:沪深300 / 非沪深300)")
+    c.add_argument("--insample-note", default="", help="净值图上样本内那段的说明文字(默认:信号权重和参数在这一段拟合、挑选)")
     p = sub.add_parser("plot")
     p.add_argument("--json", required=True)
     p.add_argument("--out", required=True)

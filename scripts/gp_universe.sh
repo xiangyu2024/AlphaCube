@@ -11,6 +11,9 @@
 #   - threads:CPU 线程数封顶(默认 10)。容器配额 25 核,同时还有别的挖掘在跑时不封顶会互相抢;
 #   - 显存封顶到整卡的 GPU_FRACTION(默认 0.5),和同卡的 RL 分着用;
 #   - 不用指纹磁盘缓存(--exemplar-cache ""):这一轮没有 ban-archive,块内封禁的样本本来就在内存里。
+# 环境变量 RNG_SEED:搜索的随机种子(默认 0)。
+# 环境变量 SEED_POPULATION=legacy(或一个带 expression 列的 csv):每个滚动块的种群一半从种子里按训练段
+# 适应度挑(同骨架只要一个,下一块换下一批),一半随机;不设就和以前一样全随机。
 set -e
 RUN_ID="${1:?用法: gp_universe.sh <run-id> [universe.npy] [budget] [end] [threads]}"
 UNIVERSE="${2:-_bench/universe/hs300_proxy_v1.npy}"
@@ -18,13 +21,15 @@ BUDGET="${3:-1280}"
 END="${4:-20230807}"
 THREADS="${5:-10}"
 GPU_FRACTION="${GPU_FRACTION:-0.5}"
+SEED_ARGS=()
+[ -n "${SEED_POPULATION:-}" ] && SEED_ARGS=(--seed-population "$SEED_POPULATION" --seed-per-block)
 cd /root/autodl-tmp/AlphaCube || exit 1
 [ -e "mining_runs/$RUN_ID" ] && { echo "mining_runs/$RUN_ID 已存在,换个 run-id"; exit 2; }
 [ -e "$UNIVERSE" ] && [ -e "${UNIVERSE%.npy}.json" ] || { echo "股票池 $UNIVERSE 或它的 .json 不存在"; exit 3; }
 export PYTHONPATH=src
 export ALPHACUBE_CPU_THREADS="$THREADS" OMP_NUM_THREADS="$THREADS" MKL_NUM_THREADS="$THREADS"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True ALPHACUBE_GPU_FRACTION="$GPU_FRACTION"
-echo "股票池 $UNIVERSE,挖到 $END,GP budget $BUDGET,线程 $THREADS,不继承封禁"
+echo "股票池 $UNIVERSE,挖到 $END,GP budget $BUDGET,线程 $THREADS,不继承封禁,种子 ${SEED_POPULATION:-无}"
 
 set +e
 PYTHONFAULTHANDLER=1 /root/miniconda3/envs/quant/bin/python -u -m alphacube.cli mine \
@@ -39,7 +44,7 @@ PYTHONFAULTHANDLER=1 /root/miniconda3/envs/quant/bin/python -u -m alphacube.cli 
   --fitness rank_ic --turnover-penalty 0.14 --archive-dedup 0.99 \
   --smooth-halflives 1,2,3,5,10,20 \
   --rolling-block 5 --ban-top-n 3 --ban-rank-corr 0.95 --exemplar-cache "" \
-  --device cuda --seed 0 --warmup 60 \
+  --device cuda --seed "${RNG_SEED:-0}" --warmup 60 "${SEED_ARGS[@]}" \
   --checkpoint-every 1 --progress-every 60 --panel-cache 1024 --panel-cache-gb 16 \
   --combine equal,ic,icir,lstsq,ridge,gbdt,lightgbm,xgboost --combine-train-frac 0.7 \
   --run-id "$RUN_ID" --out /root/autodl-tmp/AlphaCube/mining_runs

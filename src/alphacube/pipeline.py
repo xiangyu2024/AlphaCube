@@ -359,6 +359,12 @@ def run_mining(
     if miner == "gp":
         gp = dict(population_size=24, max_depth=4, min_depth=2, top_k=None)
         gp.update(gp_params or {})
+        gp.pop("rl_min_solo", None)                         # 只有 RL 的池子用
+        seed_src = gp.pop("seed_population", None)
+        if seed_src:
+            from .legacy import load_seed_population
+            gp["initial_population"] = load_seed_population(seed_src, n_minutes=view.n_minutes)
+            say(f"GP seeds from {seed_src}: {len(gp['initial_population'])} parsed (strict grammar)")
         m = GPMiner(reg, view, target, pool_obj, seed=seed, device=device, min_coverage=min_coverage,
                     min_scored_days=min_scored_days,
                     chunk_symbols=chunk_symbols, chunk_days=chunk_days,
@@ -391,14 +397,14 @@ def run_mining(
         penalty = float(cfg.get("turnover_penalty", 0.0))
         scorer = None
         if kind != "ic" or penalty > 0:
-            from .mining.scoring import PanelScorer
-            scorer = PanelScorer(target, kind=kind, turnover_penalty=penalty,
+            from .mining.scoring import make_scorer
+            scorer = make_scorer(target, kind, turnover_penalty=penalty, cost_per_side=cost_per_side,
                                  min_coverage=min_coverage, min_scored_days=min_scored_days)
         rank_ban = None
         if cfg.get("ban_rank_corr"):
             from .mining.rankban import RankSimilarityBan
             rank_ban = RankSimilarityBan(target.shape, float(cfg["ban_rank_corr"]))
-        rew = BatchRewarder(engine, pool_obj, scorer=scorer, rank_ban=rank_ban,
+        rew = BatchRewarder(engine, pool_obj, scorer=scorer, rank_ban=rank_ban, min_solo=cfg.get("rl_min_solo"),
                             banned_substructures=tuple(cfg.get("banned_substructures", ())),
                             panel_cache_items=int(cfg.get("panel_cache_items", 256)),
                             panel_cache_bytes=cfg.get("panel_cache_bytes", 8 * 1024 ** 3))

@@ -34,6 +34,29 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 LAMBDA = 0.14          # 换手在 rank IC 单位下的价格(15bp/边),见 mining/scoring.py
+# 选因子用的换手列:只在训练段算的十分位书日换手。metrics.csv 的 "turnover" 是全样本的,
+# 平均进了测试段的因子值 —— 拿它排序,入选哪些因子就取决于测试段(对抗审查查出,2026-10-03)。
+TURNOVER = "turnover_train"
+
+
+def _num(r: dict, k: str) -> float:
+    return float(r[k]) if r[k] not in ("", "nan", "None") else np.nan
+
+
+def fitness(r: dict, lam: float = LAMBDA) -> float:
+    """单因子训练段适应度:|训练段 rank IC| - lam x 训练段日换手。"""
+    return abs(_num(r, "rank_ic_train")) - lam * _num(r, TURNOVER)
+
+
+def selectable_rows(metrics_csv: Path) -> List[dict]:
+    """metrics.csv 里可以拿来选的因子:健康,训练段 rank IC 和训练段换手都有限。
+    旧版 metrics.csv 没有训练段换手 -> 直接退出、要求重新打分,不悄悄退回全样本换手。"""
+    rows = list(csv.DictReader(open(metrics_csv, encoding="utf-8")))
+    if rows and TURNOVER not in rows[0]:
+        raise SystemExit(f"{metrics_csv} 没有 {TURNOVER} 列(旧版打分,只有含测试段的全样本换手);"
+                         f"先用 scripts/score_all_factors.py 重新打分")
+    rows = [r for r in rows if r["healthy"] == "True"]
+    return [r for r in rows if np.isfinite(_num(r, "rank_ic_train")) and np.isfinite(_num(r, TURNOVER))]
 
 
 def cluster_by_correlation(corr: np.ndarray, threshold: float) -> np.ndarray:
@@ -195,7 +218,8 @@ def champion_challenger(obj: SetObjective, challenger: List[int],
 
 
 __all__ = ["cluster_by_correlation", "SetObjective", "forward_select", "replace_within_clusters",
-           "global_swap", "champion_challenger", "shortlist", "LAMBDA", "SHORTLIST_LAMBDAS"]
+           "global_swap", "champion_challenger", "shortlist", "fitness", "selectable_rows",
+           "LAMBDA", "SHORTLIST_LAMBDAS", "TURNOVER"]
 
 
 # --- 生产入口 -----------------------------------------------------------------
@@ -258,7 +282,7 @@ def shortlist(labels: np.ndarray, rows: List[dict], per_family: int = 3,
     改成同一个式子的三个成本假设 —— λ=0.07(成本乐观)/0.14(现用)/0.20(悲观),
     横跨的是同一条权衡曲线上的三点,不是三个不同的东西。
     """
-    num = lambda r, k: float(r[k]) if r[k] not in ("", "nan", "None") else np.nan   # noqa: E731
+    num = _num
     keep: List[int] = []
     dropped = 0
     for fam in np.unique(labels):
@@ -272,15 +296,13 @@ def shortlist(labels: np.ndarray, rows: List[dict], per_family: int = 3,
         # 测试段净夏普中位 +1.11 -> 90 分位 +1.22 -> 99 分位 +1.21)。
         if idx.size <= small_family:
             best_ric = max(abs(num(rows[j], "rank_ic_train")) for j in idx)
-            best_fit = max(abs(num(rows[j], "rank_ic_train")) - LAMBDA * num(rows[j], "turnover")
-                           for j in idx)
+            best_fit = max(fitness(rows[j]) for j in idx)
             if not (best_fit >= min_fit or best_ric >= min_ric):
                 dropped += 1
                 continue
         picked: List[int] = []
         for lam in lambdas:
-            order = sorted(idx, key=lambda j: -(abs(num(rows[j], "rank_ic_train"))
-                                                - lam * num(rows[j], "turnover")))
+            order = sorted(idx, key=lambda j: -fitness(rows[j], lam))
             for j in order:
                 if int(j) not in picked:
                     picked.append(int(j))
@@ -333,9 +355,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     y_ranks = rank_rows(target[days][:, cols])
     print(f"选择窗口:训练段最后 {n_days} 个连续交易日 x {len(cols)} 只(切分点 {split}/{D})", flush=True)
 
-    rows = [r for r in csv.DictReader(open(d / "metrics.csv", encoding="utf-8")) if r["healthy"] == "True"]
-    num = lambda r, k: float(r[k]) if r[k] not in ("", "nan", "None") else np.nan   # noqa: E731
-    rows = [r for r in rows if np.isfinite(num(r, "rank_ic_train")) and np.isfinite(num(r, "turnover"))]
+    rows = selectable_rows(d / "metrics.csv")
+    num = _num
     idx = [int(r["i"]) for r in rows]
     print(f"健康因子 {len(rows)} 个", flush=True)
 
@@ -376,7 +397,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     out = {"members": [{"i": int(rows[j]["i"]), "run": rows[j]["run"], "cluster": int(labels[j]),
                         "sign": float(signs[j]), "raw_rank_ic_train": num(rows[j], "rank_ic_train"),
-                        "turnover": num(rows[j], "turnover"), "expression": rows[j]["expression"]}
+                        TURNOVER: num(rows[j], TURNOVER), "expression": rows[j]["expression"]}
                        for j in chosen],
            "objective": obj.score(chosen), "n_clusters": int(sizes.size), "pool": len(pool)}
     Path(a.out).write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")

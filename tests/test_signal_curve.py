@@ -31,3 +31,17 @@ def test_ineligible_names_are_left_out_before_ranking():
     ok[:, -1] = False
     curve = sc.bucket_curve(score, ret, ok, edges=(0, 0.01, 1.0))
     np.testing.assert_allclose(curve, 0.0, atol=1e-12)
+
+
+def test_topn_curve_is_the_equal_weight_excess_of_the_strongest_names():
+    import signal_curve as sc
+    rng = np.random.default_rng(0)
+    D, S = 5, 200
+    score = rng.normal(size=(D, S))
+    ret = 0.01 * score + rng.normal(0, 0.001, (D, S))
+    elig = np.ones((D, S), bool)
+    top = sc.topn_curve(score, ret, elig, [10, 50, 400])
+    t = 2
+    order = np.argsort(-score[t])
+    assert np.isclose(top[t, 0], (ret[t] - ret[t].mean())[order[:10]].mean())
+    assert top[t, 0] > top[t, 1] > 0 and np.isnan(top[t, 2])        # N 超过可选只数:留空

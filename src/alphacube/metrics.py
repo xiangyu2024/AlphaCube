@@ -174,9 +174,11 @@ def _cs_corr_days_t(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _book_turnover_t(order: torch.Tensor, n: torch.Tensor, top_frac: float) -> float:
-    """Mean daily turnover of ``long_short_weights`` built from a stable sort order,
-    as ``portfolio_returns`` counts it (0.5 * sum|w_t - w_t-1|, from an empty book)."""
+def _book_turnover_days_t(order: torch.Tensor, n: torch.Tensor, top_frac: float) -> torch.Tensor:
+    """Daily turnover of ``long_short_weights`` built from a stable sort order, as
+    ``portfolio_returns`` counts it (0.5 * sum|w_t - w_t-1|, from an empty book).
+    Day t depends only on days t-1 and t, so ``[:split]`` of the series is exactly
+    the series of ``panel[:split]``."""
     D, S = order.shape
     k = torch.clamp(torch.floor(n.to(torch.float64) * top_frac), min=1).to(torch.int64)
     pos = torch.arange(S).unsqueeze(0)
@@ -187,17 +189,27 @@ def _book_turnover_t(order: torch.Tensor, n: torch.Tensor, top_frac: float) -> f
     ws = torch.where(long_, 0.5 / kk, torch.where(short, -0.5 / kk, torch.zeros((), dtype=torch.float64)))
     w = torch.zeros((D, S), dtype=torch.float64).scatter_(1, order, ws)
     prev = torch.cat([torch.zeros((1, S), dtype=torch.float64), w[:-1]])
-    return float((0.5 * (w - prev).abs().sum(1)).mean())
+    return 0.5 * (w - prev).abs().sum(1)
 
 
-def rank_ic_turnover(panel, target_ranks: torch.Tensor, top_frac: float = 0.1):
+def _book_turnover_t(order: torch.Tensor, n: torch.Tensor, top_frac: float) -> float:
+    """Mean of ``_book_turnover_days_t``."""
+    return float(_book_turnover_days_t(order, n, top_frac).mean())
+
+
+def rank_ic_turnover(panel, target_ranks: torch.Tensor, top_frac: float = 0.1, daily: bool = False):
     """GP fitness ingredients from one sort of the panel: the daily rank-IC series
     (``cs_pearson(rank_rows(panel), rank_rows(target))`` -- ``ic_summary``'s
     ``rank_ic`` -- as a numpy array) and the mean daily turnover of the
     top/bottom ``top_frac`` book (``backtest_metrics``' ``turnover``; it does not
-    depend on the factor's sign). ``target_ranks`` is ``torch_rank_rows(target)``."""
+    depend on the factor's sign). ``target_ranks`` is ``torch_rank_rows(target)``.
+    ``daily=True`` returns the turnover as a per-day numpy series instead of its
+    mean, so a caller can average any span of days (e.g. the training period only)."""
     ranks, order, n = _avg_ranks_t(torch.as_tensor(np.asarray(panel)))
-    return _cs_corr_days_t(ranks, target_ranks).numpy(), _book_turnover_t(order, n, top_frac)
+    ric = _cs_corr_days_t(ranks, target_ranks).numpy()
+    if daily:
+        return ric, _book_turnover_days_t(order, n, top_frac).numpy()
+    return ric, _book_turnover_t(order, n, top_frac)
 
 
 def ema_rows(panel: np.ndarray, halflife: float) -> np.ndarray:

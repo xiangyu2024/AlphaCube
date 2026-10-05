@@ -9,7 +9,10 @@ first ``--train-frac`` of days, test = the rest:
 - health: coverage (finite factor & label over finite label, the pool's gate),
   the same on the test days, and the share of usable days with a finite IC --
   healthy = finite IC, coverage >= 0.5, test coverage >= 0.5, scored days >= 0.5;
-- IC and rank IC (train / test / full), daily turnover of the decile book;
+- IC and rank IC (train / test / full), daily turnover of the decile book
+  (``turnover`` full / ``turnover_train`` / ``turnover_test``; anything that
+  SELECTS factors must read ``turnover_train`` -- the full-period column averages
+  test-period factor values in);
 - the decile book traded in the direction of the TRAINING-period IC, 15 bp a
   side: net Sharpe on the full, training and test days, gross Sharpe, annual net
   return, max drawdown, net return by calendar year;
@@ -63,6 +66,8 @@ def _icir(series) -> float:
 
 
 def score(i):
+    import torch
+
     from alphacube.metrics import (cs_pearson, long_short_weights, nanmean_quiet, portfolio_returns,
                                    rank_ic_turnover)
 
@@ -80,7 +85,8 @@ def score(i):
     ic_days = cs_pearson(pan, tgt)
     usable = max(int((tf.sum(axis=1) >= 5).sum()), 1)
     scored = float(np.isfinite(ic_days).sum() / usable)
-    ric_days, turnover = rank_ic_turnover(pan, G["target_ranks"], 0.1)
+    ric_days, turn_days = rank_ic_turnover(pan, G["target_ranks"], 0.1, daily=True)
+    turn_days = torch.from_numpy(turn_days)       # torch 求均值:全样本列和改之前逐位一致
     ic_tr = nanmean_quiet(ic_days[:split])
     sign = -1.0 if ic_tr < 0 else 1.0
     w = long_short_weights(sign * pan, 0.1)
@@ -101,7 +107,9 @@ def score(i):
         "i": i, "coverage": cov, "coverage_test": cov_test, "scored": scored,
         "ic_train": ic_tr, "ic_test": nanmean_quiet(ic_days[split:]), "ic": nanmean_quiet(ic_days),
         "rank_ic_train": nanmean_quiet(ric_days[:split]), "rank_ic_test": nanmean_quiet(ric_days[split:]),
-        "rank_ic": nanmean_quiet(ric_days), "turnover": float(turnover), "sign": sign,
+        "rank_ic": nanmean_quiet(ric_days), "turnover": float(turn_days.mean()), "sign": sign,
+        # 选因子只能用训练段换手:全样本那列平均进了测试段的因子值(不含收益,但仍是未来信息)
+        "turnover_train": float(turn_days[:split].mean()), "turnover_test": float(turn_days[split:].mean()),
         # ICIR = 逐日 IC 的均值/标准差。单因子层面看稳定性比看强度值钱:同样 |IC|,
         # ICIR 高的那个才是每天都在赚,而不是几天赚完剩下全在回吐。
         "icir": _icir(ic_days), "icir_train": _icir(ic_days[:split]), "icir_test": _icir(ic_days[split:]),

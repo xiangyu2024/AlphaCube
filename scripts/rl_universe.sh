@@ -10,6 +10,9 @@
 #   - 标签剔除"次日开盘封涨停、买不进"的收益(open_vwap15_buyable);
 #   - --universe:引擎只在这段日子里进过池子的票上算,标签和每个因子面板的池外格子都置空,
 #     奖励里的 IC、十分位书换手、池子合成都只看当天的成分股。
+# 环境变量 RNG_SEED:搜索的随机种子(默认 0)。
+# 环境变量 SEED_LIBRARY=<yaml>(seed_factors: [{name, expression}]):开挖前先用这些因子把池子填上,
+# 按文件顺序逐个尝试加入(去重、容量照常);RL 之后挖的因子要和它们竞争池子的位置。
 set -e
 RUN_ID="${1:?用法: rl_universe.sh <run-id> [universe.npy] [miner] [budget] [end]}"
 UNIVERSE="${2:-_bench/universe/hs300_proxy_v1.npy}"
@@ -24,7 +27,9 @@ export PYTHONPATH=src
 THREADS="${THREADS:-10}"
 export ALPHACUBE_CPU_THREADS="$THREADS" OMP_NUM_THREADS="$THREADS" MKL_NUM_THREADS="$THREADS"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True ALPHACUBE_GPU_FRACTION="${GPU_FRACTION:-0.3}"
-echo "股票池 $UNIVERSE,挖到 $END,miner $MINER,budget $BUDGET,不继承封禁,线程 $THREADS"
+SEED_ARGS=()
+[ -n "${SEED_LIBRARY:-}" ] && SEED_ARGS=(--seed-library "$SEED_LIBRARY")
+echo "股票池 $UNIVERSE,挖到 $END,miner $MINER,budget $BUDGET,不继承封禁,线程 $THREADS,池子种子 ${SEED_LIBRARY:-无}"
 
 set +e
 PYTHONFAULTHANDLER=1 /root/miniconda3/envs/quant/bin/python -u -m alphacube.cli mine \
@@ -38,7 +43,7 @@ PYTHONFAULTHANDLER=1 /root/miniconda3/envs/quant/bin/python -u -m alphacube.cli 
   --cost-per-side 0.0015 --turnover-cap 0.30 \
   --fitness rank_ic --turnover-penalty 0.14 \
   --smooth-halflives 1,2,3,5,10,20 \
-  --device cuda --seed 0 --warmup 60 \
+  --device cuda --seed "${RNG_SEED:-0}" --warmup 60 "${SEED_ARGS[@]}" \
   --progress-every 60 --panel-cache 512 --panel-cache-gb 12 \
   --combine equal,ic,icir,lstsq,ridge,gbdt,lightgbm,xgboost --combine-train-frac 0.7 \
   --run-id "$RUN_ID" --out /root/autodl-tmp/AlphaCube/mining_runs

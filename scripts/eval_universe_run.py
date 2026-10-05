@@ -50,6 +50,30 @@ def run_expressions(run: Path, archive_top: int = 0) -> List[str]:
     return out
 
 
+def seed_keys(run: Path, extra: Sequence[str] = (), n_minutes: int = 241) -> set:
+    """种子的结构键:GP 的 checkpoints/seeds_used.csv(带种子的 GP 自己写)加上 --mark-seeds 给的文件
+    (RL 池子种子的 yaml,或带 expression 列的 csv)。用来区分池子里"挖出来的"和"原样留下的种子"。"""
+    from alphacube.parser import parse
+
+    texts = []
+    f = run / "checkpoints" / "seeds_used.csv"
+    if f.exists():
+        texts += [r["expression"] for r in csv.DictReader(open(f, encoding="utf-8"))]
+    for path in extra:
+        if str(path).endswith((".yaml", ".yml")):
+            import yaml
+            texts += [e["expression"] for e in (yaml.safe_load(open(path, encoding="utf-8")) or {}).get("seed_factors", [])]
+        else:
+            texts += [r["expression"] for r in csv.DictReader(open(path, encoding="utf-8"))]
+    keys = set()
+    for t in texts:
+        try:
+            keys.add(parse(t, strict=False, coerce_daily=True, n_minutes=n_minutes).key())
+        except Exception:                                     # noqa: BLE001
+            continue
+    return keys
+
+
 def combine_train(panels: List[np.ndarray], target: np.ndarray, split: int, method: str = "lstsq") -> np.ndarray:
     """逐日 z 分数 -> 按训练段 IC 对齐符号 -> 训练段拟合的权重(equal / ridge / lstsq) -> 合成。"""
     from combine_two_level import blend, fit_weights
@@ -76,6 +100,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--train-frac", type=float, default=0.7)
     ap.add_argument("--archive-top", type=int, default=0)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--mark-seeds", action="append", default=[],
+                    help="池子种子文件(yaml / csv),池子里原样留下的种子在表里标 *,另报一份去掉种子的合成")
     ap.add_argument("--out-dir", required=True)
     a = ap.parse_args(argv)
 
@@ -116,26 +142,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             except Exception as exc:                          # noqa: BLE001 - 报出来,不中断
                 print(f"  解析失败,跳过:{t[:80]} ({exc})")
         res = engine.evaluate(exprs, tolerant=True)
+        seeds = seed_keys(run, a.mark_seeds, view.n_minutes)
+        is_seed = [e.key() in seeds for e, p in zip(exprs, res.panels) if p is not None]
         panels = [(t, p) for t, p in zip(keep, res.panels) if p is not None]
-        print(f"\n=== {run.name}:{len(texts)} 条表达式,算出 {len(panels)} 个面板 ({time.time() - t0:.0f}s)", flush=True)
+        print(f"\n=== {run.name}:{len(texts)} 条表达式,算出 {len(panels)} 个面板"
+              + (f",其中 {sum(is_seed)} 个是原样留下的种子(标 *)" if seeds else "")
+              + f" ({time.time() - t0:.0f}s)", flush=True)
         tr, te = slice(0, split), slice(split, D)
         print(f"{'表达式':<70} {'训练 rankIC':>10} {'测试 rankIC':>10}")
-        for t, p in panels[:40]:
+        for (t, p), sd in list(zip(panels, is_seed))[:40]:
             ric = cs_pearson(rank_rows(p.astype(np.float64)), rank_rows(target))
-            print(f"{t[:70]:<70} {nanmean_quiet(ric[tr]):+10.4f} {nanmean_quiet(ric[te]):+10.4f}")
-        for method in ("equal", "ridge", "lstsq"):
-            sig = combine_train([p for _, p in panels], target, split, method)
+            print(f"{('*' if sd else ' ') + t[:69]:<70} {nanmean_quiet(ric[tr]):+10.4f} {nanmean_quiet(ric[te]):+10.4f}")
+        variants = [("", [p for _, p in panels])]
+        if seeds and 0 < sum(is_seed) < len(panels):
+            variants.append(("_noseed", [p for (_, p), sd in zip(panels, is_seed) if not sd]))
+        for method, (suffix, cols) in [(m, v) for v in variants for m in ("equal", "ridge", "lstsq")]:
+            method_label = method + suffix
+            sig = combine_train(cols, target, split, method)
             sig[~member] = np.nan
             r = evaluate(sig, target, split, target)
-            print(f"合成 {method:>5}(权重训练段定):测试段 rank IC {r['rank_ic']:+.4f} ICIR {r['icir']:+.3f} | "
+            print(f"合成 {method_label:>12}(权重训练段定):测试段 rank IC {r['rank_ic']:+.4f} ICIR {r['icir']:+.3f} | "
                   f"十分位多空 净夏普 {r['ls_net']:+.2f} 平滑后 {r['ls_sm_net']:+.2f}(hl{r['ls_hl']:g},"
                   f"换手 {r['ls_turn']:.1%}) | 纯多头前20%·exp1 超额夏普 {r['lo_ex_sharpe']:+.2f} "
                   f"年化 {r['lo_ex_ann']:+.1%}(hl{r['lo_hl']:g})", flush=True)
             full = np.full((D, len(store.symbols)), np.nan, dtype=np.float32)
             full[:, cols_full] = sig.astype(np.float32)
-            out = out_dir / f"signal_{run.name}_{method}.npy"
+            out = out_dir / f"signal_{run.name}_{method_label}.npy"
             np.save(out, full)
-        print(f"信号写到 {out_dir}/signal_{run.name}_<method>.npy(和 tradable_backtest 的行情面板对齐)")
+        print(f"信号写到 {out_dir}/signal_{run.name}_<method>[_noseed].npy(和 tradable_backtest 的行情面板对齐)")
     print(f"({time.time() - t0:.0f}s)")
     return 0
 

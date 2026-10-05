@@ -162,6 +162,10 @@ class TypedTreeGenerator:
         nodes = collect(expr)
         for _ in range(self.max_retries):
             node, _parent = self._rng.choice(nodes)
+            if node.shape.width not in (None, 1):
+                # 只有种子(手写因子的 in_slice 之类)才有这种窄于整天的节点;随机子树总是整天宽,
+                # 换进去和兄弟节点对不齐,引擎会报错。随机树永远走不到这里,轨迹不变。
+                continue
             new = self.subtree(shape_req(node), max(1, node.depth()))
             try:
                 child = replace(expr, node, new)
@@ -191,7 +195,7 @@ class TypedTreeGenerator:
             spec = self._pick(alts)
             w = node.window
             if spec.requires_window and (w is None or (spec.windows and w not in spec.windows)):
-                w = self._pick(list(spec.windows)) if spec.windows else w
+                w = self._rng.choice(list(spec.windows)) if spec.windows else w
             try:
                 swapped = make_node(spec, tuple(node.operands), w)
                 child = replace(expr, node, swapped)
@@ -250,6 +254,8 @@ class TypedTreeGenerator:
                 continue
             if shape_req(na) != shape_req(nb):
                 continue
+            if shape_req(na) == "full" and na.shape.width != nb.shape.width:
+                continue                        # 种子的窄分钟段(in_slice)只和同宽的换,同上
             try:
                 child = replace(a, na, nb)
             except ShapeError:

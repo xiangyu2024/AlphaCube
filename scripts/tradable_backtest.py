@@ -180,6 +180,11 @@ def load_market(path: str, fill: bool = True) -> Market:
 # 回测
 # ---------------------------------------------------------------------------
 
+TOPUP_IDLE = 0.01        # max_names:名额满了还闲着超过这一比例的现金就按排名补仓(见 simulate)
+TOPUP_SLACK = 0.1        # 补仓最多补到单票上限的 1.1 倍:吸收整手取整留下的零头(每只平均差半手)
+TOPUP_MIN = 0.2          # 补仓额不到单票上限的这一比例就不补:小单主要在付 5 元最低佣金
+
+
 def simulate(mkt: Market, score: Optional[np.ndarray], t0: int, t1: int, *,
              capital: float = 1e6, cap: Optional[float] = 0.02, lot: int = LOT,
              pool_frac: float = 0.2, weights: Optional[np.ndarray] = None,
@@ -187,7 +192,7 @@ def simulate(mkt: Market, score: Optional[np.ndarray], t0: int, t1: int, *,
              compound: bool = True, tradability: bool = True,
              reserve: float = 0.002, min_age: int = 0, floor: float = 0.0,
              conviction: Optional[Tuple[float, float]] = None, skip_top: float = 0.0,
-             keep: float = 0.0, keep_units: bool = False) -> Dict[str, np.ndarray]:
+             keep: float = 0.0, keep_units: bool = False, max_names: int = 0) -> Dict[str, np.ndarray]:
     """逐日模拟一个真账户。决策日 t ∈ [t0, t1):第 t 天收盘后用 score[t](或 weights[t])
     定目标,在 t+1 开盘 15 分钟按 VWAP 成交,到 t+2 同一时点结算当天收益。
 
@@ -214,6 +219,12 @@ def simulate(mkt: Market, score: Optional[np.ndarray], t0: int, t1: int, *,
     skip_top   排名最前的这一比例不新买(信号最极端的头部,见 docs/可交易回测.md);0 = 不剔。
     keep       老持仓保留区:排名还在前 keep 的持仓原样留着、先占预算(超出上限 band 以上才减),
                剩下的钱再按排名补新票;0 = 不保留,每天按排名从头分配。
+    max_names  最多持有几只(0 = 不限):卖不动的持仓和保留区里的老持仓先占名额,剩下的名额按排名补;
+               名额满了,排名再往后的不开新仓、已有的清掉。名额满了还闲着超过 TOPUP_IDLE 的现金时(保留区、
+               不调区间让持仓漂到上限以下,整手取整也留零头,钱又不能去买第 N+1 只),按排名把已选的票补到
+               单票上限的 1 + TOPUP_SLACK 倍,这一轮不看不调区间,但不到 TOPUP_MIN x 上限的小单不做;加仓量本身
+               要是合法股数(科创板 200 股起)。否则限只数的组合会长期拿着一成左右的现金,比的就成了仓位而不是只数。
+               这是软上限:成交量上限让该清的票当天没卖完时,持股数会暂时超过 N。
 
     返回逐日数组:t、ret(净值收益)、nav(开盘前净值)、turnover(成交金额/2/净值)、
     fees(费用/净值)、n_hold(收盘持股只数)、cash(成交后现金/净值)、
@@ -329,10 +340,13 @@ def simulate(mkt: Market, score: Optional[np.ndarray], t0: int, t1: int, *,
             want = np.minimum(w[order], cap_frac) * nav
         han_l = handled.tolist()
         floor_v = floor * nav
+        slots = math.inf
+        if max_names and weights is None:
+            slots = max_names - int(forced.sum()) - int((handled & (target > 0)).sum())
         for i, wv in zip(order.tolist(), want.tolist()):
             if fo_l[i] or not pr_l[i] or han_l[i]:
                 continue
-            if remaining <= 0:
+            if remaining <= 0 or slots <= 0:
                 break
             p, h = rp_l[i], h_l[i]
             qm, qs = qmin_l[i], qstep_l[i]
@@ -353,6 +367,41 @@ def simulate(mkt: Market, score: Optional[np.ndarray], t0: int, t1: int, *,
                     sh = h + math.copysign(qty_floor(abs(d), qm, qs), d)
             remaining -= sh * p
             target[i] = sh
+            if sh > 0:
+                slots -= 1
+        if max_names and weights is None and slots <= 0 and remaining > TOPUP_IDLE * nav and math.isfinite(cap_frac):
+            cap_v = cap_frac * nav
+            lim_v = cap_v * (1.0 + TOPUP_SLACK)
+            min_v = TOPUP_MIN * cap_v
+            for i in order.tolist():
+                if remaining < min_v:
+                    break
+                if fo_l[i] or not pr_l[i] or not cb_l[i] or target[i] <= 0:
+                    continue
+                p, h = rp_l[i], h_l[i]
+                room = min(lim_v - target[i] * p, remaining)
+                if room < min_v:
+                    continue
+                want_sh = target[i] + room / p
+                if lot:
+                    qm, qs = qmin_l[i], qstep_l[i]
+                    if h > 0 and want_sh >= h:         # 相对现有持仓买进:增量往下取到合法股数
+                        new_sh = h + qty_floor(want_sh - h, qm, qs)
+                    elif h > 0:                        # 还是要卖(只是少卖一点):卖出量往上取到合法股数,不超空间
+                        need = h - want_sh
+                        q = qty_floor(need, qm, qs)
+                        if q < need - 1e-9:
+                            q = q + qs if q >= qm else qm
+                        new_sh = max(h - q, 0.0)
+                    else:
+                        new_sh = qty_floor(want_sh, qm, qs)
+                else:
+                    new_sh = want_sh
+                add = new_sh - target[i]
+                if add <= 0 or add * p < min_v or add * p > room + 1e-6:
+                    continue
+                target[i] = new_sh
+                remaining -= add * p
 
         # 成交量上限:超出的部分这次不做(卖单也一样,剩下的明天再说)
         delta = np.where(priced, target - h_sh, 0.0)
@@ -687,7 +736,7 @@ def _sweep_cell(args):
     name, hl, kw = args
     m, bench, split, D, base = _G["mkt"], _G["bench"], _G["split"], _G["D"], _G["base"]
     sm = _G["smoothed"][hl]
-    tr = simulate(m, sm, 0, split, compound=False, **{**base, **kw})
+    tr = simulate(m, sm, _G.get("t0", 0), split, compound=False, **{**base, **kw})
     te = simulate(m, sm, split, D, compound=True, **{**base, **kw})
     return name, hl, kw, summarize(tr, bench, base["capital"]), summarize(te, bench, base["capital"])
 
@@ -738,13 +787,18 @@ def sweep(a: argparse.Namespace) -> int:
     cost = COST_MODELS[a.cost]
     hls = [float(h) for h in a.halflives.split(",")]
     base = dict(capital=a.capital, lot=LOT, pool_frac=a.pool, costs=cost, participation=a.participation,
-                tradability=True, reserve=a.reserve, min_age=a.min_age)
+                tradability=True, reserve=a.reserve, min_age=a.min_age, max_names=a.max_names)
     smoothed = {hl: ema_rows(sig, hl) for hl in hls}
     if universe is not None:
         for hl in hls:                                   # 先平滑再圈池子:平滑可以用池外那段历史
             smoothed[hl][~universe] = np.nan
-    _G.update(mkt=mkt, bench=bench, split=split, D=D, base=base, smoothed=smoothed)
-    print(f"测试段从 {mkt.dates[split]} 起;初始资金 {a.capital:,.0f} 元;费用 {cost.name};"
+    t0 = 0
+    if a.train_start:                                    # 滚动信号前几百天是空的:训练段从有信号的那天算起
+        t0 = next((i for i, x in enumerate(mkt.dates) if str(x) >= a.train_start), split)
+        if t0 >= split:
+            raise SystemExit(f"--train-start {a.train_start} 不在训练段里")
+    _G.update(mkt=mkt, bench=bench, split=split, D=D, base=base, smoothed=smoothed, t0=t0)
+    print(f"训练段从 {mkt.dates[t0]} 起;测试段从 {mkt.dates[split]} 起;初始资金 {a.capital:,.0f} 元;费用 {cost.name};"
           f"上市不足 {a.min_age} 天不买;候选池 = 信号前 {a.pool:.0%}"
           f"{';股票池 ' + a.universe + '(基准 = 池内等权)' if universe is not None else ''}", flush=True)
 
@@ -762,7 +816,7 @@ def sweep(a: argparse.Namespace) -> int:
     b1 = max(r1, key=lambda r: r[3]["ex_sharpe"] if np.isfinite(r[3]["ex_sharpe"]) else -9e9)
     print(f"[{time.time() - t_start:.0f}s] 第 1 轮 {len(cells)} 格", flush=True)
     _print_cells("第 1 轮:省手续费(等权)", r1, b1, top=a.top)
-    ref = [r for r in r1 if r[2] == dict(cap=0.005, band=0.0, keep=0.0) and r[1] == 10.0]
+    ref = [] if a.max_names else [r for r in r1 if r[2] == dict(cap=0.005, band=0.0, keep=0.0) and r[1] == 10.0]
     if ref:
         _print_cells("对照:上一版(等权 0.5%,不调 0,不保留,hl10)", ref, None)
     else:
@@ -855,6 +909,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     w.add_argument("--skips", default="0.001,0.002,0.005,0.01", help="第 2 轮剔除头部的比例")
     w.add_argument("--universe", default="", help="股票池掩码 (D, S) bool(scripts/universe.py),基准换成池内等权")
     w.add_argument("--stage1-only", action="store_true", help="只跑第 1 轮(单票上限 x 不调区间 x 保留区 x 半衰期)")
+    w.add_argument("--train-start", default="", help="训练段从这天(YYYYMMDD)起算;滚动拟合的信号前面是空的")
+    w.add_argument("--max-names", type=int, default=0, help="最多持有几只(0 = 不限);一般配 --caps1 1/N")
     w.add_argument("--pool", type=float, default=0.2)
     w.add_argument("--participation", type=float, default=0.1)
     w.add_argument("--reserve", type=float, default=0.002)

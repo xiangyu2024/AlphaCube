@@ -28,3 +28,15 @@ def test_combine_train_aligns_signs_on_the_training_days():
     sig = ev.combine_train([-x, rng.normal(size=(D, S))], target, 70)     # 第一个是反号的好因子
     ic = np.mean([np.corrcoef(sig[t], target[t])[0, 1] for t in range(70, D)])
     assert ic > 0.5
+
+
+def test_seed_keys_from_gp_checkpoint_and_rl_yaml(tmp_path):
+    (tmp_path / "checkpoints").mkdir()
+    (tmp_path / "checkpoints" / "seeds_used.csv").write_text(
+        'block,train_fitness,expression\n1,0.02,"day_std(Ret)"\n', encoding="utf-8")
+    y = tmp_path / "s.yaml"
+    y.write_text("seed_factors:\n- name: a\n  expression: day_mean(Ret)\n", encoding="utf-8")
+    from alphacube.parser import parse
+    keys = ev.seed_keys(tmp_path, [str(y)])
+    assert keys == {parse("day_std(Ret)").key(), parse("day_mean(Ret)").key()}
+    assert ev.seed_keys(tmp_path / "nothing") == set()

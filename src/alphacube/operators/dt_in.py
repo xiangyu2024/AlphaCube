@@ -590,20 +590,17 @@ def in_mask_nearby_ones(x: torch.Tensor, d: int) -> torch.Tensor:
     """
     if d < 0:
         raise ValueError("d must be non-negative")
+    # 原来按元素逐个扫(每个 1 一次 .item() 同步):全市场约 1000 万行 x 每行十来个 1,要跑好几天。
+    # 贪心本身只在一行之内有先后,行与行无关,所以改成按分钟列扫、所有行一起走,结果逐位不变。
     result = x.clone()
-    ones = torch.nonzero(~torch.isnan(x))
-    if ones.numel() == 0:
-        return result
-    _, idx = torch.sort(ones[:, 0] * x.shape[1] + ones[:, 1])
-    sorted_ones = ones[idx]
+    present = ~torch.isnan(x)
     last_anchor = torch.full((x.shape[0],), -(10 ** 9), dtype=torch.long, device=x.device)
-    for i in range(sorted_ones.size(0)):
-        b = int(sorted_ones[i, 0].item())
-        pos = int(sorted_ones[i, 1].item())
-        if pos > last_anchor[b] + d:
-            last_anchor[b] = pos
-        else:
-            result[b, pos] = float("nan")
+    nan = torch.tensor(float("nan"), dtype=x.dtype, device=x.device)
+    for pos in range(x.shape[1]):
+        col = present[:, pos]
+        keep = col & (pos > last_anchor + d)
+        last_anchor = torch.where(keep, torch.full_like(last_anchor, pos), last_anchor)
+        result[:, pos] = torch.where(col & ~keep, nan, result[:, pos])
     return result
 
 

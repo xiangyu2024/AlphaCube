@@ -53,3 +53,16 @@ def test_backtest_never_buys_outside_the_universe():
     res = tb.simulate(m, score, 0, 3, capital=10_000, cap=0.5, pool_frac=1.0, costs=tb.Costs("零", rate=0.0),
                       keep_units=True)
     assert (res["units"][:, :3] == 0).all() and (res["units"][:, 3:] > 0).any()
+
+
+def test_complement_writes_the_daily_complement_and_metadata(tmp_path):
+    import json
+    import universe as un
+    u = np.array([[True, False, False], [False, True, False]])
+    np.save(tmp_path / "u.npy", u)
+    (tmp_path / "u.json").write_text(json.dumps({"dates": ["d1", "d2"], "symbols": ["a", "b", "c"]}), encoding="utf-8")
+    assert un.main(["--complement-of", str(tmp_path / "u.npy"), "--out", str(tmp_path / "c.npy")]) == 0
+    c = np.load(tmp_path / "c.npy")
+    assert c.dtype == bool and np.array_equal(c, ~u)
+    meta = json.loads((tmp_path / "c.json").read_text(encoding="utf-8"))
+    assert meta["symbols"] == ["a", "b", "c"] and "补集" in meta["rule"]

@@ -2,6 +2,8 @@
 
 原来在 _bench/deploy_check.py(不在 git 里)。配置不变:按 |rank corr| 0.7 聚类(只用训练段指纹),
 成员 <= 3 的小族要过质量门槛,按训练段适应度取最好的 100 族,每族最多 60 个成员。
+适应度 = |训练段 rank IC| - 0.14 x **训练段**换手(metrics.csv 的 turnover_train)。2026-10-03 之前用的是
+全样本换手(含测试段的因子值),之前建的冠军 / families.json 都带这个偏差;旧 metrics.csv 要重新打分。
 
 --buyable:拟合用的标签剔除"次日开盘封涨停、买不进"的那部分收益(Label(buyable=True))。
 打分(metrics.csv 的训练段 rank IC,决定哪些族入选、族内成员顺序)也要用同一个标签重跑:
@@ -18,7 +20,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import sys
 import time
 from pathlib import Path
@@ -38,16 +39,18 @@ def _num(r: dict, k: str) -> float:
 
 
 def healthy_rows(d: Path) -> List[dict]:
-    rows = [r for r in csv.DictReader(open(d / "metrics.csv", encoding="utf-8")) if r["healthy"] == "True"]
-    return [r for r in rows if np.isfinite(_num(r, "rank_ic_train")) and np.isfinite(_num(r, "turnover"))]
+    from select_factors import selectable_rows
+
+    return selectable_rows(d / "metrics.csv")
 
 
 def pick_families(rows: List[dict], fp: np.ndarray, cluster: float, max_families: int,
                   max_members: int) -> List[List[int]]:
-    from select_factors import LAMBDA, MIN_FIT, MIN_RIC, cluster_by_correlation, pairwise_abs_corr
+    """只看训练段:聚类用训练段指纹,小族门槛、族内成员排序、族的排名都用训练段适应度。"""
+    from select_factors import MIN_FIT, MIN_RIC, cluster_by_correlation, fitness, pairwise_abs_corr
 
     def fit(j):
-        return abs(_num(rows[j], "rank_ic_train")) - LAMBDA * _num(rows[j], "turnover")
+        return fitness(rows[j])
 
     labels = cluster_by_correlation(pairwise_abs_corr(fp), cluster)
     fams = []

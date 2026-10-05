@@ -7,6 +7,8 @@ tearsheet.index_members):第一天和每年 1 月、7 月第一个交易日调�
 
   cd /root/autodl-tmp/AlphaCube && PYTHONPATH=src python -u scripts/universe.py \\
       --out _bench/universe/hs300_proxy.npy
+  # 反过来:每天不在某个名单里的票("专门不买沪深300")
+  python scripts/universe.py --complement-of _bench/universe/hs300_proxy_v1.npy --out _bench/universe/non_hs300_v1.npy
 """
 from __future__ import annotations
 
@@ -31,6 +33,23 @@ def load_universe(path: Optional[str], shape) -> Optional[np.ndarray]:
     return u
 
 
+def complement(src: str, out: str) -> int:
+    """名单的补集:每天不在 src 里的票都算进来(还没上市、停牌的格子也在里面 —— 回测自己会跳过买不了的)。"""
+    import json
+
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    u = np.load(src)
+    if u.dtype != bool:
+        raise SystemExit(f"{src} 不是 bool 掩码")
+    np.save(out, ~u)
+    meta_src = Path(src).with_suffix(".json")
+    meta = json.loads(meta_src.read_text(encoding="utf-8")) if meta_src.exists() else {}
+    meta["rule"] = f"{src} 的补集(每天不在名单里的票)"
+    Path(out).with_suffix(".json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    print(f"{out}:{src} 的补集,每天 {(~u).sum(1).min()}~{(~u).sum(1).max()} 只(含还没上市的格子)")
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--inputs", default="_bench/tradable/market_20180102_20251231.npz")
@@ -38,7 +57,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--amount", default="_bench/tradable/amount_day.npy")
     ap.add_argument("--n", type=int, default=300)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--complement-of", default="", help="不重新搭名单,只写这个名单的补集")
     a = ap.parse_args(argv)
+    if a.complement_of:
+        return complement(a.complement_of, a.out)
 
     import tradable_backtest as tb
     import tearsheet as ts

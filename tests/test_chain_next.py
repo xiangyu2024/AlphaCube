@@ -72,3 +72,12 @@ def test_bad_ban_keys_are_caught_before_a_launch():
     broken = '--ban "O:nt_ts_cov(F:Open" --ban "F:Vwap)|w5" --ban "O:day_max(F:Nonexistent)"'
     bad = [k for k, _why in check(broken)]
     assert bad == ["O:nt_ts_cov(F:Open", "F:Vwap)|w5", "O:day_max(F:Nonexistent)"]
+
+
+def test_an_empty_ban_line_does_not_swallow_the_next_log_line():
+    from chain_next import new_bans
+
+    log = ("  封禁 0 个一层结构,累计生效 12 个: \n"
+           "  按 rank 相关封禁:本块新增样本 0 个,累计 220 个\n"
+           "  封禁 2 个一层结构,累计生效 14 个: O:day_cov(F:Amt,F:Amt), O:cross_autocorr_s1(F:Open)|w3\n")
+    assert new_bans(log) == ["O:day_cov(F:Amt,F:Amt)", "O:cross_autocorr_s1(F:Open)|w3"]
