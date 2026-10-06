@@ -141,6 +141,32 @@ class Constant(Expression):
         return repr(int(v)) if v.is_integer() and abs(v) < 1e15 else repr(v)
 
 
+class DailyFeature(Expression):
+    """A field that exists only at daily frequency (market cap, limit width, board
+    code, listing age): no minute-cube definition, so no ``day_*`` reduction can
+    produce it. Its shape is the COLLAPSED constant itself -- the exact ``Shape`` a
+    ``day_*`` output already carries -- rather than a fourth field on ``Shape``, so
+    every static rule in this module treats it as a day-reduced value for free and
+    ``operand_ok``'s hot path (one ``isinstance`` per operand per node) never needs a
+    tree walk to know it. Its key is tagged ``DF:`` (the other tags in use are ``F:``
+    ``C:`` ``O:`` ``G:``) so it can never collide, in the key-based CSE
+    (``engine/dag``), population/ban dedup (``mining/gp``) or seed dedup
+    (``mining/boosting``), with a same-named minute ``Feature``."""
+    __slots__ = ("field",)
+
+    def __init__(self, field: str) -> None:
+        self.field = field
+
+    def _make_key(self) -> str:
+        return f"DF:{self.field}"
+
+    def _infer_shape(self) -> Shape:
+        return COLLAPSED
+
+    def _repr(self) -> str:
+        return self.field
+
+
 def operand_ok(spec: OpSpec, operand: Expression, strict: bool = True) -> bool:
     """May ``operand`` be fed to an operator described by ``spec``?
 
@@ -154,6 +180,8 @@ def operand_ok(spec: OpSpec, operand: Expression, strict: bool = True) -> bool:
     if spec.restores_m:
         return sh.collapsed if strict else sh.degenerate
     if spec.needs_full_m:
+        if isinstance(operand, DailyFeature):
+            return False                  # a per-minute op over a BARE daily leaf is meaningless: strict AND legacy
         if not sh.degenerate:
             return True
         return (not strict) and spec.reduces_m and sh.collapsed
@@ -167,6 +195,9 @@ def _why_not(spec: OpSpec, operand: Expression) -> str:
     if spec.restores_m:
         return f"{spec.name} needs a width-1 (day-collapsed) operand, got {operand!r}"
     if spec.needs_full_m:
+        if isinstance(operand, DailyFeature):
+            return (f"{spec.name} ({spec.face}/{spec.family}) needs genuine per-minute variation, but "
+                    f"{operand!r} is a daily-only field with no minute axis at all")
         return (f"{spec.name} ({spec.face}/{spec.family}) needs genuine per-minute variation, "
                 f"got {'collapsed' if sh.collapsed else 'minute-degenerate'} operand {operand!r}")
     return f"{spec.name} (ND face) needs a one-value-per-stock-day operand, got {operand!r}"
@@ -401,7 +432,7 @@ def is_valid_root(expr: Expression) -> bool:
         return False
     if expr.spec is not None and expr.spec.non_root:
         return False
-    return any(isinstance(n, Feature) for n in expr.nodes())
+    return any(isinstance(n, (Feature, DailyFeature)) for n in expr.nodes())
 
 
 def contains_lookahead(expr: Expression) -> bool:
@@ -426,6 +457,6 @@ def max_window(expr: Expression, axis: str) -> int:
 
 __all__ = [
     "Shape", "FULL", "COLLAPSED", "WIDE_DEGENERATE", "ShapeError", "Expression", "Feature",
-    "Constant", "Unary", "Binary", "Rolling", "PairRolling", "GeneralCall", "LITERAL_TYPES",
+    "Constant", "DailyFeature", "Unary", "Binary", "Rolling", "PairRolling", "GeneralCall", "LITERAL_TYPES",
     "make_node", "replace", "operand_ok", "is_valid_root", "contains_lookahead", "max_window",
 ]

@@ -33,12 +33,27 @@ from typing import Dict, Optional, Sequence, Tuple
 
 from .axes import OpSpec
 from .catalog import Registry, default_registry
-from .expression import Constant, Expression, Feature, GeneralCall, ShapeError, make_node, operand_ok
+from .expression import Constant, DailyFeature, Expression, Feature, GeneralCall, ShapeError, make_node, operand_ok
 from .fullcatalog import COLLAPSED_INDEX_OPERANDS, OPERATOR_ARITY_ALIASES, OPERATOR_NAME_ALIASES, default_full_catalog
 
 FIELD_ALIASES: Dict[str, str] = {
     "close": "Close", "open": "Open", "high": "High", "low": "Low",
     "vol": "Volume", "volume": "Volume", "vwap": "Vwap", "ret": "Ret", "amt": "Amt", "returns": "Ret",
+}
+
+# Lowercase/legacy spellings of the daily-field namespace (Registry.daily_fields,
+# catalog.DAILY_FIELDS), parallel to FIELD_ALIASES. Deliberately NO bare "age": it
+# is too easily confused with a window-length argument spelled the same way.
+DAILY_FIELD_ALIASES: Dict[str, str] = {
+    "floatcap": "FloatCap", "float_cap": "FloatCap", "circ_mv": "FloatCap",
+    "totalcap": "TotalCap", "total_cap": "TotalCap", "total_mv": "TotalCap",
+    "floatshares": "FloatShares", "float_shares": "FloatShares",
+    "limitwidth": "LimitWidth", "limit_width": "LimitWidth",
+    "boardcode": "BoardCode", "board": "BoardCode",
+    "listage": "ListAge", "list_age": "ListAge",
+    "logfloatcap": "LogFloatCap", "log_float_cap": "LogFloatCap",
+    "logtotalcap": "LogTotalCap", "log_total_cap": "LogTotalCap",
+    "logfloatshares": "LogFloatShares", "log_float_shares": "LogFloatShares",
 }
 
 # Daily fields as cube expressions (parsed recursively). Also the daily
@@ -79,7 +94,11 @@ class _Parser:
         self.coerce_daily = coerce_daily
         self.n_minutes = int(n_minutes)
         self.full = default_full_catalog() if allow_general else None
-        self.daily_fields = False
+        # Whether a BARE minute field means its daily aggregate (coerce_daily's own
+        # mechanism) -- named away from "daily_fields" (the Registry's namespace of
+        # DailyFeature names, e.g. FloatCap) so the two do not read as the same thing
+        # two lines apart.
+        self.coerce_bare_fields = False
 
     # -- entry --------------------------------------------------------------------------
     def parse(self, text: str) -> Expression:
@@ -88,7 +107,7 @@ class _Parser:
         except SyntaxError as exc:
             raise ParseError(f"not a valid expression: {text!r} ({exc})") from None
         if self.coerce_daily and not self.uses_minute_operators(tree):
-            self.daily_fields = True
+            self.coerce_bare_fields = True
         return self.convert(tree.body)
 
     def uses_minute_operators(self, tree: ast.AST) -> bool:
@@ -133,22 +152,32 @@ class _Parser:
     def name(self, ident: str) -> Expression:
         field = ident if ident in self.reg.fields else FIELD_ALIASES.get(ident)
         if field is not None:
-            if self.daily_fields:
+            if self.coerce_bare_fields:
                 return self.macro(DAILY_OF_FIELD[field])
             return Feature(field)
         if ident in DAILY_MACROS:
             return self.macro(ident)
         if ident in DAILY_NAME_ALIASES:
             return self.macro(DAILY_NAME_ALIASES[ident])
-        raise ParseError(f"unknown field {ident!r}; cube fields are {self.reg.fields}")
+        # The daily-leaf namespace (Registry.daily_fields, e.g. FloatCap): checked
+        # LAST, after every minute-field spelling and macro above, and deliberately
+        # NOT routed through coerce_bare_fields -- a daily leaf has no minute-level
+        # definition, so there is no day_* macro to rewrite it into.
+        if ident in self.reg.daily_fields:
+            return DailyFeature(ident)
+        dfield = DAILY_FIELD_ALIASES.get(ident)
+        if dfield is not None and dfield in self.reg.daily_fields:
+            return DailyFeature(dfield)
+        raise ParseError(f"unknown field {ident!r}; cube fields are {self.reg.fields}, "
+                         f"daily fields are {self.reg.daily_fields}")
 
     def macro(self, name: str) -> Expression:
-        saved = self.daily_fields
-        self.daily_fields = False                       # macro bodies are written in minute terms
+        saved = self.coerce_bare_fields
+        self.coerce_bare_fields = False                  # macro bodies are written in minute terms
         try:
             return self.convert(ast.parse(DAILY_MACROS[name], mode="eval").body)
         finally:
-            self.daily_fields = saved
+            self.coerce_bare_fields = saved
 
     def call(self, node: ast.Call) -> Expression:
         if isinstance(node.func, ast.Attribute) and not node.args and node.func.attr in ("float", "double"):
@@ -293,4 +322,5 @@ def parse_legacy(text: str, registry: Optional[Registry] = None, n_minutes: int 
     return parse(text, registry, strict=False, coerce_daily=True, n_minutes=n_minutes, allow_general=True)
 
 
-__all__ = ["parse", "parse_legacy", "ParseError", "FIELD_ALIASES", "DAILY_MACROS", "DAILY_OF_FIELD", "DAILY_NAME_ALIASES"]
+__all__ = ["parse", "parse_legacy", "ParseError", "FIELD_ALIASES", "DAILY_MACROS", "DAILY_OF_FIELD",
+           "DAILY_NAME_ALIASES", "DAILY_FIELD_ALIASES"]
