@@ -321,10 +321,17 @@ class SkipRecord:
 class Registry:
     """Name -> OpSpec, plus the field list and constant pool."""
 
-    def __init__(self, fields: Tuple[str, ...], constants: Tuple[float, ...] = CONSTANTS):
+    def __init__(self, fields: Tuple[str, ...], constants: Tuple[float, ...] = CONSTANTS,
+                 daily_fields: Tuple[str, ...] = ()):
         self._ops: Dict[str, OpSpec] = {}
         self.fields: Tuple[str, ...] = tuple(fields)
         self.constants: Tuple[float, ...] = tuple(constants)
+        # A namespace PARALLEL to `fields`, never merged into it: TypedTreeGenerator
+        # and Vocabulary both default their own `fields` to `registry.fields`, so
+        # keeping daily names out of that tuple is what keeps the minute-leaf draw
+        # (and therefore the whole random stream) unchanged whether or not any
+        # daily fields are registered. Empty by default.
+        self.daily_fields: Tuple[str, ...] = tuple(daily_fields)
         self.skipped: List[SkipRecord] = []
 
     def register(self, spec: OpSpec) -> None:
@@ -374,15 +381,49 @@ class Registry:
 
 CUBE_FIELDS = ("Open", "High", "Low", "Close", "Volume", "Vwap", "Ret", "Amt")
 
+# The daily-field namespace: parallel to CUBE_FIELDS (the 8 minute fields) but never
+# merged into it -- a Registry carries both as two separate tuples (see
+# Registry.daily_fields below) so the minute-field draw sequence, and therefore the
+# whole random stream, is unaffected by whether any daily fields are registered.
+# WP1 ships only the name set; the DailyFeature leaf, the parser branch and the
+# (S, D) data resolver that make these names actually parseable/resolvable are WP2+.
+STORED_DAILY_FIELDS = ("FloatCap", "TotalCap", "FloatShares")
+DERIVED_DAILY_FIELDS = ("LimitWidth", "BoardCode", "ListAge")
+LOG_DAILY_FIELDS = ("LogFloatCap", "LogTotalCap", "LogFloatShares")
+DAILY_FIELDS = STORED_DAILY_FIELDS + DERIVED_DAILY_FIELDS + LOG_DAILY_FIELDS
+
+# A plugin's declaration channel for a kernel it does not own (so it cannot add
+# real_valued=True at the @op(...) call site itself). Empty by default: WP1 ships
+# the mechanism and applies it to nothing, so the vocabulary this builds today
+# (searchable(include_boolean=False) == 218, == 214 with resource-risk also
+# excluded) does not move. See REAL_VALUED_OVERRIDES's use in _make_spec below.
+REAL_VALUED_OVERRIDES: set = set()
+
 
 def _make_spec(name: str, face: str, family: str, category: str, meta: dict,
                fn: Callable, kernel_id: str) -> OpSpec:
     reduces = family == "day"
     restores = name in RESTORES_M_NAMES
-    try:
-        distinct = _probe_distinct_values(fn, category, reduces, restores)
-    except Exception:  # noqa: BLE001 - a probe failure just means "unknown", not boolean
-        distinct = 10**9
+    # A declared real-valued kernel (its own `@op(..., real_valued=True)`, or named
+    # in REAL_VALUED_OVERRIDES by a plugin that does not own it) skips both probes
+    # below rather than having its result overridden: `meta.get`, not `meta[...]`,
+    # since the three manual binaries registered near the bottom of this module
+    # carry no "real_valued" key at all. Measured today: exactly three of
+    # AlphaCube's own kernels are mis-flagged by the probes -- in_sustain_mean,
+    # in_sustain_stddev, in_sustain_product (unlike in_sustain itself, which
+    # genuinely propagates a 0/1 mask and must stay flagged). Declaring those three
+    # would move searchable(include_boolean=False) 218 -> 221 and the generator's
+    # default vocabulary 214 -> 217; WP1 leaves that declaration to the plugin that
+    # wants it (see tests/test_real_valued_flag.py) rather than making it a default.
+    real = bool(meta.get("real_valued", False)) or name in REAL_VALUED_OVERRIDES
+    if real:
+        distinct, trivial = 10 ** 9, False
+    else:
+        try:
+            distinct = _probe_distinct_values(fn, category, reduces, restores)
+        except Exception:  # noqa: BLE001 - a probe failure just means "unknown", not boolean
+            distinct = 10**9
+        trivial = (distinct <= 2 and _probe_constant_capable(fn, category, restores))
     return OpSpec(
         name=name, face=face, family=family, category=category,
         arity=meta["arity"], requires_window=(True if restores else meta["requires_window"]),
@@ -391,7 +432,7 @@ def _make_spec(name: str, face: str, family: str, category: str, meta: dict,
         reduces_m=reduces, restores_m=restores,
         lookahead=(kernel_id.split(".")[-1] in LOOKAHEAD_KERNELS),
         boolean_output=(distinct <= 2), coarse_output=(2 < distinct <= 3),
-        trivial_boolean=(distinct <= 2 and _probe_constant_capable(fn, category, restores)),
+        trivial_boolean=trivial,
         # ND kernels run once over the whole (D, S) panel, so a Python loop over its
         # 5219 stocks costs seconds (ts_spearman, kept on purpose -- see
         # test_only_the_nt_face_pair_kernels_leave_the_action_set). Every other face
@@ -402,8 +443,9 @@ def _make_spec(name: str, face: str, family: str, category: str, meta: dict,
     )
 
 
-def build_registry(fields: Tuple[str, ...] = CUBE_FIELDS) -> Registry:
-    reg = Registry(fields)
+def build_registry(fields: Tuple[str, ...] = CUBE_FIELDS,
+                    daily_fields: Tuple[str, ...] = DAILY_FIELDS) -> Registry:
+    reg = Registry(fields, daily_fields=daily_fields)
     accepted: List[Tuple[str, dict, Callable, str]] = []   # (name, meta, fn, kernel_id)
     for name, meta in real_ops.OPERATOR_REGISTRY.items():
         if name in EXCLUDED_KERNELS:
@@ -455,4 +497,6 @@ def default_registry() -> Registry:
 
 
 __all__ = ["Registry", "SkipRecord", "build_registry", "default_registry", "CUBE_FIELDS",
-           "WINDOWS", "CONSTANTS", "LOOKAHEAD_KERNELS", "EXCLUDED_KERNELS"]
+           "WINDOWS", "CONSTANTS", "LOOKAHEAD_KERNELS", "EXCLUDED_KERNELS",
+           "STORED_DAILY_FIELDS", "DERIVED_DAILY_FIELDS", "LOG_DAILY_FIELDS", "DAILY_FIELDS",
+           "REAL_VALUED_OVERRIDES"]

@@ -53,7 +53,8 @@ Number = Union[int, float]
 OPERATOR_REGISTRY: Dict[str, dict] = {}
 
 
-def op(mode: str, category: str, arity: int = 1, requires_window: bool = False, pair: bool = False):
+def op(mode: str, category: str, arity: int = 1, requires_window: bool = False, pair: bool = False,
+       real_valued: bool = False):
     """Tag a function with taxonomy metadata and register it.
 
     mode: "nd" | "dt" | "shared" (shared = elementwise/utility, valid in both)
@@ -61,11 +62,17 @@ def op(mode: str, category: str, arity: int = 1, requires_window: bool = False, 
     arity: number of Expression-tensor operands (excludes window/scalar params)
     requires_window: whether the function takes an integer window `d`
     pair: whether it's a 2-tensor-operand (pair-rolling) op, e.g. cov/corr
+    real_valued: declare that this kernel's output is genuinely real-valued -- not
+        boolean/trivial on any input worth searching. catalog._make_spec skips its
+        two empirical probes for a name declared this way (own-kernel use); a
+        plugin declaring the same thing for a kernel it does not own instead adds
+        the name to catalog.REAL_VALUED_OVERRIDES. Off by default, so every
+        existing call site is unaffected.
     """
     def deco(fn):
         OPERATOR_REGISTRY[fn.__name__] = dict(
             mode=mode, category=category, arity=arity,
-            requires_window=requires_window, pair=pair, fn=fn,
+            requires_window=requires_window, pair=pair, real_valued=real_valued, fn=fn,
         )
         return fn
     return deco

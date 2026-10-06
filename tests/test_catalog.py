@@ -1,7 +1,7 @@
 import torch
 
 from alphacube.axes import MODE_D, MODE_P, MODE_S
-from alphacube.catalog import LOOKAHEAD_KERNELS
+from alphacube.catalog import CUBE_FIELDS, DAILY_FIELDS, LOOKAHEAD_KERNELS, Registry, build_registry, default_registry
 
 
 def test_registry_faces_and_twins(registry):
@@ -90,3 +90,36 @@ def test_per_element_python_kernels_leave_the_search():
                 "ts_spearman"} & flagged(a)
     searchable = {s.name for s in a.searchable(include_boolean=False, include_resource_risk=False)}
     assert "in_mask_nearby_ones" not in searchable and "in_mask_nearby_ones" in {s.name for s in a.list_all()}
+
+
+def test_default_registry_daily_fields_is_the_9_name_namespace():
+    """WP1: default_registry() (-> build_registry() with no args) carries the
+    9-name daily-field namespace by default, as a separate `daily_fields`
+    tuple -- `fields` (the 8 minute fields TypedTreeGenerator/Vocabulary draw
+    from) is untouched, so the random stream is unaffected whether or not any
+    daily fields are registered."""
+    reg = default_registry()
+    assert reg.daily_fields == DAILY_FIELDS
+    assert len(reg.daily_fields) == 9
+    assert reg.fields == CUBE_FIELDS
+
+
+def test_registry_daily_fields_defaults_to_empty_tuple():
+    """The Registry CLASS itself (as opposed to build_registry()) defaults
+    daily_fields to (), so a bare Registry(fields) construction -- the shape
+    of the single call site before WP1 -- is unaffected."""
+    reg = Registry(CUBE_FIELDS)
+    assert reg.daily_fields == ()
+    assert reg.fields == CUBE_FIELDS == tuple(CUBE_FIELDS)
+
+
+def test_build_registry_daily_fields_override():
+    """build_registry's daily_fields keyword actually reaches the Registry,
+    both ways: empty when passed explicitly, and the full 9-name default
+    otherwise (test_default_registry_daily_fields_is_the_9_name_namespace)."""
+    reg = build_registry(daily_fields=())
+    assert reg.daily_fields == ()
+    assert reg.fields == CUBE_FIELDS
+    custom = ("FloatCap",)
+    reg2 = build_registry(daily_fields=custom)
+    assert reg2.daily_fields == custom
