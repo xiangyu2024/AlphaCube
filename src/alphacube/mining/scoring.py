@@ -20,7 +20,7 @@ GPU 花在扣完成本归零的高换手因子上(gpu5~gpu9 反复发生过)。
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -507,19 +507,62 @@ class LongHitScorer(LongScorer):
         return out
 
 
+# --- 工厂注册表:给插件(比如 Partura 的 ParturaScorer)加新的 --fitness 取值 -----------------
+
+SCORER_FACTORIES: Dict[str, Callable[..., Any]] = {}
+
+
+def register_scorer(kind: str, factory: Callable[..., Any], *, replace: bool = False) -> None:
+    """注册一个新的 ``--fitness`` 取值。``factory`` 会被 `make_scorer` 这样调用:
+
+        factory(target, dates=<view.dates 或 None>, warmup=<dates 里的预热行数>,
+                turnover_penalty=..., signed=..., cost_per_side=..., top_frac=...,
+                min_coverage=..., min_scored_days=...)
+
+    返回值必须满足打分器协议 —— 不是新发明的,是现有代码已经在按鸭子类型用的那四样:
+        .score(panel, gated=True) -> dict,里面有 "fit"(有限数;或者 -inf,表示这个候选被拒)
+        .score_combined(panel)    -> dict,里面有 "fit"                 (RL 的奖励路径用这个)
+        .target_t64, .target_ranks_t                                   (GPMiner 两个都读)
+        .columns  -> 存档里多出来的列名(可选)
+
+    ``dates`` **包含**预热那些行,``dates[warmup]`` 才是第一个真正被打分的日子 —— factory 要
+    靠这两个自己切 train / valid,`make_scorer` 本身不做任何切分,也不替内置的两个分支转发它们。
+
+    ``kind`` 撞上 FITNESS_KINDS 里的内置名字一律报错(内置的不能被覆盖);撞上已经注册过的
+    名字,除非 ``replace=True``,否则也报错。
+    """
+    if kind in FITNESS_KINDS:
+        raise ValueError(f"{kind!r} is a built-in fitness kind, cannot be registered as a scorer factory")
+    if kind in SCORER_FACTORIES and not replace:
+        raise ValueError(f"scorer kind {kind!r} is already registered (pass replace=True to override it)")
+    SCORER_FACTORIES[kind] = factory
+
+
+def scorer_kinds() -> Tuple[str, ...]:
+    """``--fitness`` 当前全部合法取值:四个内置的,加上插件注册过的(按名字排序)。"""
+    return tuple(FITNESS_KINDS) + tuple(sorted(SCORER_FACTORIES))
+
+
 def make_scorer(target: np.ndarray, kind: str, *, turnover_penalty: float = 0.0, signed: bool = False,
                 cost_per_side: float = 0.0015, top_frac: float = BOOK_TOP_FRAC, min_coverage: float = 0.5,
-                min_scored_days: float = 0.5):
+                min_scored_days: float = 0.5, dates: Optional[Sequence[str]] = None, warmup: int = 0):
     """``kind`` -> 打分器。"long" / "long_hit" 是纯多头口径(换手按 cost_per_side 直接扣,turnover_penalty
-    不用;后者加了命中率和几种做多组合);其余是老的 ``|IC 或 rank IC| - turnover_penalty x 换手``。"""
+    不用;后者加了命中率和几种做多组合),``dates``/``warmup`` 这两个内置分支都不转发;再查插件的
+    SCORER_FACTORIES,查到就把 ``dates``/``warmup`` 连同其余参数一起转给它;两处都没有就退回老的
+    ``|IC 或 rank IC| - turnover_penalty x 换手``(PanelScorer),未知 kind 在这里报同一个 ValueError。"""
     if kind in ("long", "long_hit"):
         cls = LongScorer if kind == "long" else LongHitScorer
         return cls(target, cost_per_side=cost_per_side, top_frac=top_frac, min_coverage=min_coverage,
                    min_scored_days=min_scored_days)
+    factory = SCORER_FACTORIES.get(kind)
+    if factory is not None:
+        return factory(target, dates=dates, warmup=warmup, turnover_penalty=turnover_penalty, signed=signed,
+                       cost_per_side=cost_per_side, top_frac=top_frac, min_coverage=min_coverage,
+                       min_scored_days=min_scored_days)
     return PanelScorer(target, kind=kind, turnover_penalty=turnover_penalty, signed=signed, top_frac=top_frac,
                        min_coverage=min_coverage, min_scored_days=min_scored_days)
 
 
 __all__ = ["PanelScorer", "LongScorer", "LongHitScorer", "make_scorer", "FITNESS_KINDS", "BOOK_TOP_FRAC",
            "LONG_COLUMNS", "LONG_SCALES", "LONG_WEIGHTS", "LONG_UNIT", "HIT_SCALES", "HIT_WEIGHTS", "HIT_TOPS",
-           "HIT_FLOOR"]
+           "HIT_FLOOR", "SCORER_FACTORIES", "register_scorer", "scorer_kinds"]
