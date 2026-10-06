@@ -2,8 +2,14 @@
 stock-day status plane. The on-disk layout is the V2 minute store of the
 previous project (``dt_meta.json`` + ``dtfield_<name>.npy`` +
 ``day_status.npy``), so a server store compiled by ``qmt_ingest`` opens here
-unchanged. There is no separate daily store: daily fields are cube
-expressions (``day_last(Close)``), see parser.DAILY_MACROS.
+unchanged. Most daily fields are still cube expressions (``day_last(Close)``,
+see parser.DAILY_MACROS) -- but nine names (market cap, limit width, board
+code, listing age, ...) have no minute-cube definition at all, and for those a
+store may optionally carry a *second*, separate daily-frequency source: see
+``dailyfields.py`` and ``CubeView.daily()`` below. Unrelated to the
+pre-existing ``alphacube.daily`` module (cube-expression daily panels) or the
+``daily/`` V2 comparison layout in ``scripts/compare_daily_store.py`` -- three
+different things share the word "daily" in this codebase.
 
 Three readers share one interface (``fields / symbols / dates / n_* /
 read_cube(name, rows, d0, d1) / read_status(rows, d0, d1)``):
@@ -89,7 +95,8 @@ def advise_access(arr, random: bool) -> bool:
 
 
 class CubeStore:
-    def __init__(self, directory: PathLike, mirror_dir: Optional[PathLike] = None) -> None:
+    def __init__(self, directory: PathLike, mirror_dir: Optional[PathLike] = None,
+                daily_root: Optional[PathLike] = None) -> None:
         self.directory = Path(directory)
         # Where to look for a D-major mirror when the store's own meta lists none --
         # a directory of our own, since the production store is read-only.
@@ -108,8 +115,26 @@ class CubeStore:
         self._advised: Dict[str, bool] = {}          # field -> last access advice given
         self._mirror: Dict[str, np.ndarray] = {}
         self._status: Optional[np.ndarray] = None
+        # The (S, D) daily-field source this store is attached to, or None when no
+        # daily_root was given (every existing caller) -- see dailyfields.py. Lazy
+        # import: dailyfields.py imports nothing from here (no cycle), but a store
+        # built with no daily_root pays nothing for the feature. must_fix #2's
+        # COMPOSITION assertion over the full universe -- require_board_rule --
+        # is documented (dailyfields.py) as running "where the full list is in
+        # hand: the daily-source attach ... (over store.symbols)"; this is that
+        # attach, so it runs here rather than staying unreachable from any
+        # non-test code path.
+        self.daily = None
+        if daily_root is not None:
+            from .dailyfields import DailyFieldStore, require_board_rule
+            require_board_rule(self.symbols)
+            self.daily = DailyFieldStore(daily_root)
         self.meta_sha256 = sha256_file(self.directory / META_FILE)
-        self.contract_hash = canonical_hash({"meta_sha256": self.meta_sha256})
+        parts = {"meta_sha256": self.meta_sha256}
+        if self.daily is not None:
+            from .dailyfields import fingerprint
+            parts["daily"] = fingerprint(self.daily)          # None daily_root -> byte-identical hash
+        self.contract_hash = canonical_hash(parts)
 
     # -- raw access ---------------------------------------------------------------------
     def field(self, name: str) -> np.ndarray:
@@ -264,7 +289,7 @@ class SegmentedCubeStore:
     """History base ``<root>/minute`` + segments ``<root>/incremental/<rel>/minute``."""
 
     def __init__(self, compute_root: PathLike, include_segments: bool = True,
-                 mirror_root: Optional[PathLike] = None) -> None:
+                 mirror_root: Optional[PathLike] = None, daily_root: Optional[PathLike] = None) -> None:
         self.compute_root = Path(compute_root)
         # D-major mirrors live under mirror_root at each source's own relative path
         # (minute/, incremental/<rel>/minute/) -- see scripts/build_mirror.py.
@@ -321,11 +346,24 @@ class SegmentedCubeStore:
         self._codes = dict(base._codes)
         self.meta = {**base.meta, "n_symbols": self.n_symbols, "n_days": self.n_days, "symbols": self.symbols,
                      "dates": self.dates, "segmented": True}
+        # SegmentedCubeStore is not a subclass of CubeStore (MRO is just
+        # (SegmentedCubeStore, object)) and never calls super().__init__, so the
+        # daily-field attach needs its own assignment here too; see
+        # CubeStore.__init__ for the lazy import, why it is lazy, and why
+        # require_board_rule runs here.
+        self.daily = None
+        if daily_root is not None:
+            from .dailyfields import DailyFieldStore, require_board_rule
+            require_board_rule(self.symbols)
+            self.daily = DailyFieldStore(daily_root)
         self.contract = {
             "base_minute_meta_sha256": sha256_file(self.compute_root / "minute" / META_FILE),
             "index_sha256": sha256_file(index_path) if index_path.is_file() else None,
             "segment_meta_sha256": [s.meta_sha256 for s in sources[1:]],
         }
+        if self.daily is not None:
+            from .dailyfields import fingerprint
+            self.contract["daily"] = fingerprint(self.daily)
         self.contract_hash = canonical_hash(self.contract)
         self.directory = self.compute_root
 
@@ -393,14 +431,22 @@ class SegmentedCubeStore:
     view = CubeStore.view
 
 
-def open_cube_store(path: PathLike, include_segments: bool = True, mirror_root: Optional[PathLike] = None):
+def open_cube_store(path: PathLike, include_segments: bool = True, mirror_root: Optional[PathLike] = None,
+                    daily_root: Optional[PathLike] = None):
     """A compute root (``<root>/minute`` exists) opens as a SegmentedCubeStore, a
     bare minute directory as a CubeStore. ``mirror_root``: where D-major mirrors
-    built by scripts/build_mirror.py live (the store itself may be read-only)."""
+    built by scripts/build_mirror.py live (the store itself may be read-only).
+    ``daily_root``: where a DailyFieldStore directory (dailyfields.py) lives,
+    defaulting to ``$ALPHACUBE_DAILY_FIELDS`` when not given explicitly -- unlike
+    ``mirror_root``, which has no such default. ``CubeStore``/``SegmentedCubeStore``
+    constructed directly (as most tests do) do NOT consult the environment, so
+    they stay deterministic regardless of what is set in the caller's shell."""
+    if daily_root is None:
+        daily_root = os.environ.get("ALPHACUBE_DAILY_FIELDS")
     p = Path(path)
     if (p / "minute" / META_FILE).is_file():
-        return SegmentedCubeStore(p, include_segments, mirror_root=mirror_root)
-    return CubeStore(p, mirror_dir=mirror_root)
+        return SegmentedCubeStore(p, include_segments, mirror_root=mirror_root, daily_root=daily_root)
+    return CubeStore(p, mirror_dir=mirror_root, daily_root=daily_root)
 
 
 class CubeView:
@@ -418,6 +464,8 @@ class CubeView:
         self.fields = list(store.fields)
         self._contiguous = bool(np.all(np.diff(self.sym_idx) == 1)) if self.n_symbols > 1 else True
         self._tradable: Optional[np.ndarray] = None
+        self._day_status: Optional[np.ndarray] = None
+        self._daily: Dict[str, np.ndarray] = {}      # daily-field name -> (S, D) float32, resolved once
 
     def _rows(self, s_lo: int, s_hi: int):
         if self._contiguous:
@@ -435,9 +483,8 @@ class CubeView:
     def tradable(self) -> np.ndarray:
         """(S, D) bool for the whole view."""
         if self._tradable is None:
-            st = self.store.read_status(self._rows(0, self.n_symbols), self.d0, self.d1)
             codes = getattr(self.store, "_codes", DAY_STATUS_CODES)
-            self._tradable = np.isin(st, [codes["TRADING"], codes["RESUMED"]])
+            self._tradable = np.isin(self.day_status(), [codes["TRADING"], codes["RESUMED"]])
         return self._tradable
 
     def tradable_s(self, s_lo: int, s_hi: int) -> np.ndarray:
@@ -445,6 +492,66 @@ class CubeView:
 
     def tradable_d(self, d_lo: int, d_hi: int) -> np.ndarray:
         return self.tradable()[:, d_lo:d_hi]
+
+    def day_status(self) -> np.ndarray:
+        """(S, D) int8 day-status codes (store.DAY_STATUS_CODES) for the whole
+        view -- the richer signal behind tradable() (which only distinguishes
+        TRADING/RESUMED from everything else), cached the same way."""
+        if self._day_status is None:
+            self._day_status = self.store.read_status(self._rows(0, self.n_symbols), self.d0, self.d1)
+        return self._day_status
+
+    # -- daily fields (dailyfields.py): a second, (S, D)-only data source --------------
+    @property
+    def daily_fields(self) -> Tuple[str, ...]:
+        """Daily field names actually resolvable on this view right now: the three
+        DERIVED_FIELDS always (symbols/dates alone are enough), plus the attached
+        daily store's own stored fields and their log derivative, if any -- see
+        dailyfields.available(), which this just forwards to."""
+        from .dailyfields import available
+        return available(self.store.daily)
+
+    def daily(self, name: str) -> np.ndarray:
+        """(S, D) float32 for one of ``daily_fields``, resolved once per view and
+        cached -- built on the same once-per-view template as tradable() above.
+
+        Aligned on ``self.symbols`` / ``self.dates``, which are already the
+        view-local label lists set in __init__: an arbitrary symbol subset (in
+        the caller's order), an arbitrary date range, and warmed_view's
+        backward-extended d0 all line up for free, with no alignment code here --
+        dailyfields.DailyFieldStore.align does it all by LABEL.
+
+        Returns (S, D) -- the engine's internal panel orientation -- NOT the
+        (D, S) that EvalResult exposes and that tradability.board_limit() /
+        tearsheet.load_caps() both hand back; the one transpose happens inside
+        dailyfields.derive()'s LimitWidth branch, not here.
+
+        Unmasked by tradability: this is the raw resolved plane, exactly like
+        every other leaf reader before the engine's own masking step runs (see
+        the design's "risks" section on why the engine masks, not the view).
+        ``tradable()`` / ``day_status()`` are passed through only as the
+        lifecycle SIGNAL ``derive("ListAge", ...)`` needs to tell an unlisted
+        stock-day from a merely-suspended one -- status wins when both are
+        given (dailyfields._lifecycle_mask), so passing both here is safe and
+        is simply unused by every other daily field.
+        """
+        if name not in self._daily:
+            from .dailyfields import resolve
+            self._daily[name] = resolve(name, self.symbols, self.dates, store=self.store.daily,
+                                        tradable=self.tradable(), status=self.day_status())
+        return self._daily[name]
+
+    def daily_s(self, name: str, s_lo: int, s_hi: int) -> np.ndarray:
+        """(C, D) float32 for symbols [s_lo, s_hi) of the view -- a thin slice of
+        daily(name), the (S, D)-plane analogue of read_s."""
+        return self.daily(name)[s_lo:s_hi, :]
+
+    def daily_d(self, name: str, d_lo: int, d_hi: int) -> np.ndarray:
+        """(S, C) float32 for view days [d_lo, d_hi) -- the (S, D)-plane analogue
+        of read_d. ``d_lo``/``d_hi`` are view-local, like read_d's, but unlike
+        read_d this needs no self.d0 offset: daily(name) is already aligned to
+        self.dates, which IS the view-local date axis."""
+        return self.daily(name)[:, d_lo:d_hi]
 
 
 # ---- builders ------------------------------------------------------------------------------

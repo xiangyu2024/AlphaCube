@@ -20,7 +20,11 @@ EXPRS = ["day_std(in_mean_rolling(Close, 5))", "cs_rank(ts_mean(day_std(Ret), 5)
 @pytest.fixture(scope="module")
 def layouts(tmp_path_factory):
     root = tmp_path_factory.mktemp("layouts")
-    cubes, symbols, dates, status = make_synthetic_cube(n_symbols=9, n_days=50, n_minutes=24, seed=7, suspended_frac=0.05)
+    # WP3 gave make_synthetic_cube a 5th return value (identifiable daily-field
+    # planes, empty here since daily_fields is not passed) -- see synthetic.py
+    # and this package's output deviations.
+    cubes, symbols, dates, status, _daily_planes = make_synthetic_cube(
+        n_symbols=9, n_days=50, n_minutes=24, seed=7, suspended_frac=0.05)
     mono = build_cube_store(root / "mono", cubes, symbols, dates, status)
     # segmented: base = first 30 days, segment A = next 12 days, segment B = last 8 days with one NEW symbol
     comp = root / "comp"
