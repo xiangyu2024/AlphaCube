@@ -135,6 +135,39 @@ def test_duplicate_registration_raises_unless_replace():
     assert isinstance(make_scorer(_target(), "dummy_wp6"), _DummyScorerB)  # now swapped
 
 
+def test_registering_the_same_factory_again_is_a_no_op():
+    """Registration must be idempotent for the SAME factory object, or plugin loading is a
+    one-shot: `load_plugins` calls a plugin's register() on every call, while import_module is
+    cached so the module body (and therefore the factory object) does NOT change. Two loads in
+    one process -- a repeated --plugin name, two cli.main() calls in one pytest process, a
+    caller looping arms with the load inside the loop -- would otherwise kill the run before
+    any mining. A genuine collision (a DIFFERENT factory under the same name) must still raise,
+    which is the whole point of the rule."""
+    register_scorer("dummy_wp6", _DummyScorerA)
+    register_scorer("dummy_wp6", _DummyScorerA)            # must not raise
+    register_scorer("dummy_wp6", _DummyScorerA, replace=True)   # and replace=True is still fine
+    assert SCORER_FACTORIES["dummy_wp6"] is _DummyScorerA
+    assert scorer_kinds().count("dummy_wp6") == 1
+    assert isinstance(make_scorer(_target(), "dummy_wp6"), _DummyScorerA)
+
+    # the no-op is keyed on the factory, not on the name: a different one still collides
+    with pytest.raises(ValueError, match="already registered"):
+        register_scorer("dummy_wp6", _DummyScorerB)
+    assert SCORER_FACTORIES["dummy_wp6"] is _DummyScorerA
+
+
+def test_a_plugins_register_hook_survives_being_called_twice():
+    """The flow above, shaped the way a plugin loader actually drives it: import once (so the
+    factory object is fixed), then call register() once per load_plugins() call."""
+    def register():                      # a plugin module's register(), closing over one factory
+        register_scorer("dummy_wp6", _DummyScorerA)
+
+    for _ in range(3):                   # three loads in one process
+        register()
+    assert SCORER_FACTORIES["dummy_wp6"] is _DummyScorerA
+    assert "dummy_wp6" in scorer_kinds()
+
+
 def test_registering_over_a_builtin_name_raises():
     for kind in FITNESS_KINDS:
         with pytest.raises(ValueError, match="built-in"):

@@ -528,13 +528,21 @@ def register_scorer(kind: str, factory: Callable[..., Any], *, replace: bool = F
     ``dates`` **包含**预热那些行,``dates[warmup]`` 才是第一个真正被打分的日子 —— factory 要
     靠这两个自己切 train / valid,`make_scorer` 本身不做任何切分,也不替内置的两个分支转发它们。
 
-    ``kind`` 撞上 FITNESS_KINDS 里的内置名字一律报错(内置的不能被覆盖);撞上已经注册过的
-    名字,除非 ``replace=True``,否则也报错。
+    ``kind`` 撞上 FITNESS_KINDS 里的内置名字一律报错(内置的不能被覆盖)。撞上已经注册过的
+    名字、而且 ``factory`` 是**另一个**对象时,除非 ``replace=True``,否则也报错 —— 两个插件
+    抢同一个名字这种真冲突照样拦下。
+
+    但拿**同一个** ``factory`` 对象重复注册是幂等的空操作,注册必须可以重复调用:插件加载器
+    (``plugins.load_plugins``)每次被调用都会把插件的 ``register()`` 再跑一遍 ——
+    ``importlib.import_module`` 有缓存,模块体不会重跑,``register()`` 却照调不误 —— 而它一个
+    进程里被调两次是正常的(``--plugin`` 写重了、一个 pytest 进程里跑了两次 ``cli.main``、
+    上层脚本按 arm 循环时把加载放进了循环)。第二次必须不报错,否则整个 run 还没开始挖就死了。
     """
     if kind in FITNESS_KINDS:
         raise ValueError(f"{kind!r} is a built-in fitness kind, cannot be registered as a scorer factory")
-    if kind in SCORER_FACTORIES and not replace:
-        raise ValueError(f"scorer kind {kind!r} is already registered (pass replace=True to override it)")
+    if kind in SCORER_FACTORIES and SCORER_FACTORIES[kind] is not factory and not replace:
+        raise ValueError(f"scorer kind {kind!r} is already registered to a different factory "
+                         f"(pass replace=True to override it)")
     SCORER_FACTORIES[kind] = factory
 
 
