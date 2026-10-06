@@ -299,11 +299,12 @@ def test_derive_board_code_matches_the_same_prefix_rule():
 
 @pytest.mark.parametrize("field", ["LimitWidth", "BoardCode"])
 def test_derive_raises_on_the_old_prefix_free_symbol_spelling(field):
-    """must_fix #2's format guard. DEVIATION (documented, not a file-ownership
-    change): the design's own text states the MUST-raise requirement for
-    LimitWidth; this module applies the identical guard to BoardCode too,
-    since an undetected all-MAIN BoardCode is exactly the other half of the
-    same silent failure the design's Overview/Risks sections call out."""
+    """must_fix #2's FORMAT guard, the half that stays a hard raise per call.
+    DEVIATION (documented, not a file-ownership change): the design's own text
+    states the MUST-raise requirement for LimitWidth; this module applies the
+    identical guard to BoardCode too, since an undetected all-MAIN BoardCode is
+    exactly the other half of the same silent failure the design's
+    Overview/Risks sections call out."""
     bad_symbols = ["SH.600000", "SH.600001", "SH.600002"]
     with pytest.raises(ValueError, match="STAR.*GEM.*BSE"):
         df.derive(field, bad_symbols, _DATES)
@@ -318,6 +319,62 @@ def test_require_board_rule_error_names_the_first_five_symbols():
         assert repr(s) in msg
     assert repr(bad_symbols[6]) not in msg          # only the first five are named
     assert "7 symbols" in msg
+
+
+# --- must_fix #2, the format/composition split (regression) ------------------
+# A board-COMPOSITION check cannot run per call: store.view(max_symbols=k)
+# takes sym_idx[:k] (store.py:215) and warmed_view(symbols=[...]) takes the
+# caller's own list (research.py:84), so a legitimately main-board-only symbol
+# list is a normal input. Raising there would kill every factor touching
+# LimitWidth / BoardCode on such a view once WP3's CubeView.daily() calls
+# resolve() with self.symbols. Per call we check FORMAT (raise) and warn about
+# composition; the strict composition assertion is require_board_rule(), which
+# a caller holding the FULL universe runs once.
+
+# WP3 step 6's planned synthetic spelling: the special boards are necessarily a
+# minority, so any short prefix of this list is main-board-only.
+_WP3_SYMBOLS = [f"{600000 + i}.SH" for i in range(12)] + ["688001.SH", "300001.SZ", "830001.BJ"]
+# a hand-picked real-world main-board-only selection (warmed_view(symbols=[...]))
+_MAIN_ONLY = ["600000.SH", "600036.SH", "601398.SH", "000001.SZ"]
+
+
+@pytest.mark.parametrize("field", ["LimitWidth", "BoardCode"])
+@pytest.mark.parametrize("symbols", [_WP3_SYMBOLS[:4], _WP3_SYMBOLS[:8], _WP3_SYMBOLS[:12], _MAIN_ONLY],
+                         ids=["max_symbols=4", "max_symbols=8", "max_symbols=12", "hand-picked"])
+def test_derive_accepts_a_main_board_only_symbol_subset(field, symbols):
+    """The regression itself: a correctly spelled main-board-only subset must
+    EVALUATE, not raise -- and give the main-board answer."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)       # the composition warning below
+        got = df.derive(field, symbols, _DATES)
+    assert got.shape == (len(symbols), len(_DATES))
+    expect = 0.10 if field == "LimitWidth" else df.BOARD_MAIN
+    np.testing.assert_array_equal(got, np.full(got.shape, expect))
+    # and the same through resolve(), which is what CubeView.daily() will call
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        assert df.resolve(field, symbols, _DATES).shape == (len(symbols), len(_DATES))
+
+
+@pytest.mark.parametrize("field", ["LimitWidth", "BoardCode"])
+def test_derive_warns_rather_than_raises_on_a_main_board_only_subset(field):
+    """Degrade loudly, not fatally: the composition case is a warning per call."""
+    with pytest.warns(RuntimeWarning, match="no STAR.*GEM.*BSE"):
+        df.derive(field, _MAIN_ONLY, _DATES)
+    # a subset that DOES contain a special board stays silent
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        df.derive(field, _SYMBOLS, _DATES)
+
+
+def test_require_board_rule_is_the_strict_full_universe_check():
+    """The composition assertion keeps its teeth where the full symbol list is
+    in hand (WP3's daily-source attach, WP9's build script)."""
+    assert df.require_board_rule(_WP3_SYMBOLS) is None       # the full universe is fine
+    with pytest.raises(ValueError, match="no STAR.*GEM.*BSE"):
+        df.require_board_rule(_MAIN_ONLY)                     # main-board-only universe: impossible
+    with pytest.raises(ValueError, match="starts with a digit"):
+        df.require_board_rule(["SH.600000", "SH.600001"])     # and the format half still fires
 
 
 def test_derive_list_age_sentinel_day_zero_and_suspension_monotonicity():
@@ -348,17 +405,38 @@ def test_derive_list_age_with_no_signal_defaults_to_in_lifecycle_everywhere():
 
 
 def test_derive_list_age_prefers_status_over_tradable():
-    """A SUSPENDED day (status != OUTSIDE_LIFECYCLE, so in lifecycle) is NOT
-    tradable -- status is the richer signal and must win when both are given."""
+    """status is the richer signal and must win when BOTH are given.
+
+    The pair below DISAGREES, which is the whole point: with agreeing inputs
+    the assertion holds under either priority, so it pins nothing (verified by
+    mutation -- swapping _lifecycle_mask to consult tradable first left the
+    agreeing-inputs version of this test green). WP3's CubeView.daily() is
+    exactly the caller that has both view.tradable() and view.day_status() in
+    hand, so the priority has to be nailed down here."""
     from alphacube.store import DAY_STATUS_CODES
-    T, S = DAY_STATUS_CODES["TRADING"], DAY_STATUS_CODES["SUSPENDED"]
+    T, S, O = DAY_STATUS_CODES["TRADING"], DAY_STATUS_CODES["SUSPENDED"], DAY_STATUS_CODES["OUTSIDE_LIFECYCLE"]
     symbols, dates = ["A"], ["20200101", "20200102", "20200103"]
-    status = np.array([[T, S, T]], dtype=np.int8)
-    tradable = np.array([[True, False, True]])          # agrees with status here
-    age_status = df.derive("ListAge", symbols, dates, status=status)
-    age_tradable = df.derive("ListAge", symbols, dates, tradable=tradable)
-    np.testing.assert_array_equal(age_status, age_tradable)
-    np.testing.assert_array_equal(age_status[0], [10000.0, 10001.0, 10002.0])
+    status = np.array([[O, T, T]], dtype=np.int8)       # not listed on day 0
+    tradable = np.array([[True, True, True]])           # DISAGREES: claims day 0 is live
+    both = df.derive("ListAge", symbols, dates, status=status, tradable=tradable)
+    # status wins: day 0 is pre-listing, so NaN there and the count starts at 0
+    # on day 1. The inverted priority would read tradable's "listed on day 0"
+    # and return [10000, 10001, 10002] instead -- a listing date off by one day
+    # and a sentinel where there should be none.
+    assert np.isnan(both[0, 0])
+    np.testing.assert_array_equal(both[0, 1:], [0.0, 1.0])
+    # each signal alone still drives its own branch, and they differ here
+    np.testing.assert_array_equal(df.derive("ListAge", symbols, dates, status=status)[0, 1:],
+                                  [0.0, 1.0])
+    np.testing.assert_array_equal(df.derive("ListAge", symbols, dates, tradable=tradable)[0],
+                                  [10000.0, 10001.0, 10002.0])
+    # and with inputs that AGREE (a SUSPENDED day is in lifecycle but not
+    # tradable, so these two genuinely agree only on the sentinel row) the two
+    # paths coincide, as before
+    agree_status = np.array([[T, S, T]], dtype=np.int8)
+    agree_tradable = np.array([[True, False, True]])
+    np.testing.assert_array_equal(df.derive("ListAge", symbols, dates, status=agree_status),
+                                  df.derive("ListAge", symbols, dates, tradable=agree_tradable))
 
 
 def test_derive_unknown_field_raises():
@@ -501,6 +579,73 @@ def test_warn_once_message_fires_only_when_the_field_starts_late():
     with warnings.catch_warnings():
         warnings.simplefilter("error")                   # any warning here fails the test
         df._warn_once_if_late_start("Field", on_time, dates)
+
+
+# --- the all-NaN / near-empty plane (regression) -----------------------------
+# The late-start check above provably CANNOT fire on a 100% NaN plane: with no
+# finite cell there is no first finite date to compare against dates[0]. That
+# is precisely the case the guard was written for -- a daily store whose symbol
+# or date spelling does not match the view's, which align() answers with a NaN
+# fill by design. Two more checks cover it; see _warn_once_if_late_start.
+
+def test_warn_fires_on_an_all_nan_plane():
+    dates = ["20200101", "20200102", "20200103"]
+    with pytest.warns(RuntimeWarning, match="no finite value ANYWHERE"):
+        df._warn_once_if_late_start("Field", np.full((4, 3), np.nan), dates)
+
+
+def test_warn_fires_below_the_coverage_floor_and_not_above_it():
+    dates = [f"202001{d:02d}" for d in range(1, 11)]
+    thin = np.full((40, 10), np.nan)
+    thin[0, 0] = 1.0                                     # 1 of 400 = 0.25%, below the 1% floor
+    assert float(np.isfinite(thin).mean()) < df.LOW_COVERAGE_FLOOR
+    with pytest.warns(RuntimeWarning, match="finite in only"):
+        df._warn_once_if_late_start("Field", thin, dates)
+
+    thick = np.full((40, 10), np.nan)
+    thick[:, 0] = 1.0                                    # 40 of 400 = 10%, above the floor
+    assert float(np.isfinite(thick).mean()) > df.LOW_COVERAGE_FLOOR
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        df._warn_once_if_late_start("Field", thick, dates)
+
+
+def _write_daily_store(root, symbols, dates, arr, field="FloatCap"):
+    import json
+
+    np.save(root / f"daily_{field}.npy", np.asarray(arr, dtype=np.float64))
+    (root / "meta.json").write_text(
+        json.dumps({"fields": [field], "symbols": list(symbols), "dates": list(dates)}),
+        encoding="utf-8")
+    return df.DailyFieldStore(root)
+
+
+@pytest.mark.parametrize("mismatch", ["symbols", "dates"])
+def test_resolve_warns_when_a_label_mismatch_nans_every_cell(tmp_path, mismatch):
+    """must_fix #2's failure mode applied to the STORED half: the store spells
+    its labels one way, the view asks another, every cell comes back NaN. It
+    used to return that plane silently."""
+    store_syms = ["SH.600000", "SH.600001", "SH.688001"]
+    store_dates = ["20200101", "20200102", "20200103"]
+    arr = 1e9 * (np.arange(3)[:, None] + 1) + np.arange(3)[None, :]
+    store = _write_daily_store(tmp_path, store_syms, store_dates, arr)
+
+    ask_syms = ["600000.SH", "600001.SH", "688001.SH"] if mismatch == "symbols" else store_syms
+    ask_dates = store_dates if mismatch == "symbols" else ["2020-01-01", "2020-01-02", "2020-01-03"]
+    with pytest.warns(RuntimeWarning, match="no finite value ANYWHERE"):
+        plane = df.resolve("FloatCap", ask_syms, ask_dates, store=store)
+    assert not np.isfinite(plane).any()                   # the plane itself is unchanged
+
+
+def test_resolve_warns_when_the_store_covers_almost_none_of_the_view(tmp_path):
+    """The partial mismatch one finite cell is enough to hide from the
+    late-start check: a store overlapping the view on 1 of 200 symbols."""
+    dates = ["20200101", "20200102", "20200103"]
+    store = _write_daily_store(tmp_path, ["600000.SH"], dates, np.full((1, 3), 1e9))
+    view_syms = ["600000.SH"] + [f"{600001 + i}.SH" for i in range(199)]
+    with pytest.warns(RuntimeWarning, match="finite in only"):
+        plane = df.resolve("FloatCap", view_syms, dates, store=store)
+    assert np.isfinite(plane).sum() == 3
 
 
 def test_resolve_warns_when_a_stored_field_starts_after_the_requested_range(daily_store):

@@ -30,6 +30,14 @@ unit-testable on plain symbol/date label lists, independent of the rest of the
 cube machinery. ``store.CubeView.daily(name)`` (the engine-facing side) is what
 actually calls :func:`resolve` with a real view's labels and its own
 ``tradable()`` / ``day_status()`` planes.
+
+Every entry point here is given a VIEW's labels, which may be any subset of the
+universe, so must_fix #2's symbol-spelling guard is split in two:
+:func:`derive` raises only on a spelling no board rule could ever match and
+warns when the spelling is fine but no rule fired (normal for a main-board-only
+subset), while :func:`require_board_rule` is the strict assertion for a caller
+holding the FULL symbol list -- the store's daily-source attach and
+``scripts/build_daily_fields.py``.
 """
 
 from __future__ import annotations
@@ -77,6 +85,11 @@ _BSE_PREFIXES = ("4", "8", "92")
 # delisted" -- is one that every status plane in the codebase already follows.
 _OUTSIDE_LIFECYCLE = 0
 
+# resolve() warns when fewer than this fraction of the requested (S, D) cells
+# came back finite. A daily store that carries, say, 3 of 5000 symbols is a
+# label mismatch, not data; see _warn_once_if_late_start.
+LOW_COVERAGE_FLOOR = 0.01
+
 
 def _board_masks(symbols: Sequence[str]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """(star, gem, bse) boolean arrays over ``symbols``, one entry per symbol."""
@@ -86,26 +99,83 @@ def _board_masks(symbols: Sequence[str]) -> Tuple[np.ndarray, np.ndarray, np.nda
     return star, gem, bse
 
 
-def _require_board_rule(symbols: Sequence[str], star: np.ndarray, gem: np.ndarray, bse: np.ndarray) -> None:
-    """Raise unless at least one STAR/GEM/BSE prefix matched.
+def _require_prefix_first(symbols: Sequence[str]) -> None:
+    """must_fix #2's FORMAT half, cheap enough to run on every ``derive`` call:
+    raise unless at least one symbol could possibly match a board rule, i.e.
+    starts with a digit.
 
-    Measured (must_fix #2): on a ``SH.600000``-style symbol spelling every board
-    rule misses, so ``board_limit`` quietly returns a uniform 0.10 plane and a
+    Measured (must_fix #2): on a ``SH.600000``-style spelling every board rule
+    misses, so ``board_limit`` quietly returns a uniform 0.10 plane and a
     same-prefix ``BoardCode`` would be one constant category at 100% finite
-    coverage -- wrong, and nothing else catches it. This guard applies to BOTH
-    ``LimitWidth`` and ``BoardCode`` (the design's own text states it for
-    LimitWidth; this module extends the same guard to BoardCode since it is
-    exactly the second half of the same failure mode and the two share this
-    helper, so they cannot disagree about when to raise either)."""
+    coverage -- wrong, and nothing else catches it. ``'SH.600000'[:1]`` is not a
+    digit, so this catches that spelling (and any other prefix-last one) without
+    asking anything about which boards the symbols happen to be on.
+
+    It deliberately does NOT ask "did a STAR/GEM/BSE rule actually fire": a
+    correctly spelled main-board-only list -- ``store.view(max_symbols=4)``,
+    ``warmed_view(symbols=['600000.SH', '600036.SH', ...])`` -- is a normal
+    input, not a format error, and the composition question can only be answered
+    over the FULL universe. That is :func:`require_board_rule`, which callers
+    holding the whole symbol list run once; per call, ``derive`` only warns (see
+    :func:`_warn_if_no_board_rule`)."""
+    if any(str(s)[:1].isdigit() for s in symbols):
+        return
+    sample = ", ".join(repr(s) for s in list(symbols)[:5])
+    raise ValueError(
+        f"no board rule -- STAR (688/689), GEM (300/301/302) or BSE (4/8/92) -- can ever fire: "
+        f"not one of the {len(symbols)} symbols even starts with a digit; first five: {sample}. "
+        "This almost always means the symbol spelling does not put the market prefix first "
+        "(e.g. 'SH.600000' instead of '600000.SH'); LimitWidth would otherwise ship as a "
+        "constant 0.10 plane and BoardCode as a single category, both silently."
+    )
+
+
+def _warn_if_no_board_rule(name: str, symbols: Sequence[str], star: np.ndarray,
+                           gem: np.ndarray, bse: np.ndarray) -> None:
+    """must_fix #2's COMPOSITION half, downgraded to a warning for the per-call
+    path: a prefix-first symbol list on which no STAR/GEM/BSE rule fires is
+    either a genuine main-board-only subset (fine) or the whole universe
+    mis-spelled in some way the format check did not catch (not fine), and this
+    function cannot tell which, because it is not given the universe.
+
+    Warns once per distinct message, the same way :func:`_warn_once_if_late_start`
+    does. ``stacklevel=3`` points at ``derive``'s caller on the direct path and
+    at ``resolve`` on the resolve path."""
+    if star.any() or gem.any() or bse.any():
+        return
+    sample = ", ".join(repr(s) for s in list(symbols)[:5])
+    warnings.warn(
+        f"daily field {name!r}: no STAR (688/689), GEM (300/301/302) or BSE (4/8/92) prefix "
+        f"matched any of {len(symbols)} symbols; first five: {sample}. Over a symbol SUBSET "
+        "that is normal (a main-board-only selection); over the full universe it means the "
+        "spelling is wrong and the field is a constant. Run dailyfields.require_board_rule() "
+        "on the full symbol list to tell the two apart.",
+        RuntimeWarning, stacklevel=3,
+    )
+
+
+def require_board_rule(symbols: Sequence[str]) -> None:
+    """must_fix #2's composition assertion, for a caller holding the FULL
+    universe: raise unless at least one STAR/GEM/BSE prefix matched.
+
+    This is the strict form, and it is strict precisely because "no special
+    board anywhere in the whole A-share universe" cannot be true. It is NOT run
+    per ``derive`` call -- a subset view legitimately contains main-board
+    symbols only, and raising there kills every factor touching ``LimitWidth``
+    or ``BoardCode`` on a ``max_symbols`` / explicit-``symbols`` view. Call it
+    where the full list is in hand: the daily-source attach on
+    ``CubeStore`` / ``SegmentedCubeStore`` (over ``store.symbols``), and
+    ``scripts/build_daily_fields.py`` next to its coverage floor."""
+    _require_prefix_first(symbols)
+    star, gem, bse = _board_masks(symbols)
     if star.any() or gem.any() or bse.any():
         return
     sample = ", ".join(repr(s) for s in list(symbols)[:5])
     raise ValueError(
         f"no STAR (688/689), GEM (300/301/302) or BSE (4/8/92) symbol prefix matched any of "
-        f"{len(symbols)} symbols; first five: {sample}. This almost always means the symbol "
-        "spelling does not put the market prefix first (e.g. 'SH.600000' instead of "
-        "'600000.SH'); LimitWidth would otherwise ship as a constant 0.10 plane and BoardCode "
-        "as a single category, both silently."
+        f"{len(symbols)} symbols; first five: {sample}. On a full universe that cannot be "
+        "right: LimitWidth would ship as a constant 0.10 plane and BoardCode as a single "
+        "category, both silently and both at 100% finite coverage."
     )
 
 
@@ -161,21 +231,25 @@ def derive(name: str, symbols: Sequence[str], dates: Sequence[str], *,
     build step -- that is what makes these three fields free of a dependency on
     ``daily_root`` being attached at all (see ``resolve`` / ``available``).
 
-    Raises ``ValueError`` for ``LimitWidth``/``BoardCode`` unless at least one
-    STAR/GEM/BSE board rule actually fires on ``symbols`` -- the symbol-format
-    guard of must_fix #2 (see ``_require_board_rule``)."""
+    Raises ``ValueError`` for ``LimitWidth``/``BoardCode`` when the symbol
+    spelling makes a board rule impossible (must_fix #2's format half, see
+    :func:`_require_prefix_first`), and merely WARNS when the spelling is fine
+    but no rule fired, which over a symbol subset is normal (see
+    :func:`_warn_if_no_board_rule` / :func:`require_board_rule`)."""
     symbols = list(symbols)
     dates = list(dates)
     S, D = len(symbols), len(dates)
     if name == "LimitWidth":
-        _require_board_rule(symbols, *_board_masks(symbols))
+        _require_prefix_first(symbols)
+        _warn_if_no_board_rule(name, symbols, *_board_masks(symbols))
         # board_limit returns (D, S); transpose FIRST, then make contiguous -- the
         # other order would make ascontiguousarray's work free (the (D, S) array
         # already is contiguous) and ship a non-contiguous (S, D) view instead.
         return np.ascontiguousarray(board_limit(symbols, dates).T, dtype=np.float64)
     if name == "BoardCode":
         star, gem, bse = _board_masks(symbols)
-        _require_board_rule(symbols, star, gem, bse)
+        _require_prefix_first(symbols)
+        _warn_if_no_board_rule(name, symbols, star, gem, bse)
         code = np.full((S, D), BOARD_MAIN, dtype=np.float64)
         code[star, :] = BOARD_STAR
         code[gem, :] = BOARD_GEM
@@ -244,18 +318,52 @@ class DailyFieldStore:
 
 
 def _warn_once_if_late_start(name: str, plane: np.ndarray, dates: Sequence[str]) -> None:
-    """The silent-empty-warm-up failure: if ``name``'s first finite date is
-    after ``dates[0]``, every rolling window reaching back past it is NaN,
-    which reads as a short warm-up rather than as missing data. Warns once per
-    distinct message (name + first finite date): Python's default warning
-    filter already de-duplicates an identical (message, category, module,
-    lineno), so no extra bookkeeping is needed here, and a test can still force
-    it to re-fire with ``pytest.warns`` / ``simplefilter("always")``."""
+    """The module's single "is this plane actually there?" guard, run on every
+    :func:`resolve`. Three checks, most specific first:
+
+    1. **Nothing anywhere.** An all-NaN plane is the loudest symptom of a LABEL
+       mismatch -- the daily store spelling its symbols ``'SH.600000'`` while
+       the view asks ``'600000.SH'``, or its dates ``'2020-01-01'`` against
+       ``'20200101'`` -- which ``DailyFieldStore.align`` answers with a NaN fill
+       by design, since a label the store does not carry is legal. This check
+       exists because the late-start check below provably cannot fire here:
+       with no finite cell there is no first finite date to compare.
+    2. **Almost nothing.** Below ``LOW_COVERAGE_FLOOR`` of the requested cells
+       finite is a PARTIAL label mismatch (a store overlapping the view on a
+       handful of symbols), which check 1 misses -- one finite cell is enough to
+       give the field a first finite date and a sane-looking warm-up.
+    3. **Late start** -- the silent-empty-warm-up failure: if ``name``'s first
+       finite date is after ``dates[0]``, every rolling window reaching back
+       past it is NaN, which reads as a short warm-up rather than as missing
+       data.
+
+    Warns once per distinct message: Python's default warning filter already
+    de-duplicates an identical (message, category, module, lineno), so no extra
+    bookkeeping is needed here, and a test can still force it to re-fire with
+    ``pytest.warns`` / ``simplefilter("always")``."""
     if not dates or plane.size == 0:
         return
-    finite_days = np.flatnonzero(np.isfinite(plane).any(axis=0))
+    finite = np.isfinite(plane)
+    finite_days = np.flatnonzero(finite.any(axis=0))
     if finite_days.size == 0:
+        warnings.warn(
+            f"daily field {name!r} has no finite value ANYWHERE in the requested range "
+            f"[{dates[0]!r}, {dates[-1]!r}] over {plane.shape[0]} symbols: the store's "
+            "symbol/date spelling almost certainly does not match the view's (align() "
+            "NaN-fills every label it does not carry), so every factor built on this "
+            "field will evaluate on an empty panel",
+            RuntimeWarning, stacklevel=3,
+        )
         return
+    coverage = float(finite.mean())
+    if coverage < LOW_COVERAGE_FLOOR:
+        warnings.warn(
+            f"daily field {name!r} is finite in only {coverage:.3%} of the "
+            f"{plane.shape[0]}x{plane.shape[1]} requested cells (floor "
+            f"{LOW_COVERAGE_FLOOR:.1%}): this is a near-empty panel, usually a PARTIAL "
+            "symbol/date label mismatch between the daily store and the view",
+            RuntimeWarning, stacklevel=3,
+        )
     first = dates[int(finite_days[0])]
     if first <= dates[0]:
         return
@@ -329,6 +437,6 @@ def fingerprint(store: Optional[DailyFieldStore]) -> Optional[str]:
 
 __all__ = [
     "STORED_FIELDS", "DERIVED_FIELDS", "LOG_OF", "LIST_AGE_SENTINEL", "DERIVED_VERSION",
-    "BOARD_MAIN", "BOARD_STAR", "BOARD_GEM", "BOARD_BSE",
-    "derive", "DailyFieldStore", "resolve", "available", "fingerprint",
+    "LOW_COVERAGE_FLOOR", "BOARD_MAIN", "BOARD_STAR", "BOARD_GEM", "BOARD_BSE",
+    "derive", "require_board_rule", "DailyFieldStore", "resolve", "available", "fingerprint",
 ]
