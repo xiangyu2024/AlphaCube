@@ -24,8 +24,10 @@ import pytest
 
 import alphacube.dailyfields as dailyfields
 from alphacube.research import warmed_view
-from alphacube.store import CubeStore, DAY_STATUS_CODES, SegmentedCubeStore, build_cube_store, open_cube_store, write_segment
-from alphacube.synthetic import _synthetic_symbols, make_synthetic_cube, write_daily_fields, write_synthetic_store
+from alphacube.store import (CubeStore, DAY_STATUS_CODES, SegmentedCubeStore, build_cube_store, canonical_hash,
+                             open_cube_store, write_segment)
+from alphacube.synthetic import (_DATE_STEP, _synthetic_symbols, make_synthetic_cube, write_daily_fields,
+                                 write_synthetic_store)
 from alphacube.tradability import board_limit
 
 
@@ -79,13 +81,37 @@ def test_identifiable_planes_formula_and_relationships():
     _, symbols, dates, _, planes = make_synthetic_cube(n_symbols=4, n_days=3, n_minutes=2, seed=0,
                                                         daily_fields=("FloatCap", "TotalCap", "FloatShares"))
     s, d = np.arange(4)[:, None], np.arange(3)[None, :]
-    expect_fc = 1e9 * (s + 1.0) + d
+    expect_fc = 1e9 * (s + 1.0) + _DATE_STEP * d
     np.testing.assert_array_equal(planes["FloatCap"], expect_fc)
     np.testing.assert_allclose(planes["TotalCap"], expect_fc / 0.6)
     np.testing.assert_allclose(planes["FloatShares"], expect_fc / 10.0)
     for name, arr in planes.items():
         assert arr.dtype == np.float64
         assert arr.shape == (4, 3)
+
+
+@pytest.mark.parametrize("n_symbols,n_days", [(4, 3), (10, 60), (24, 80), (1, 1)])
+def test_identifiable_planes_stay_identifiable_after_the_float32_cast(n_symbols, n_days):
+    """Regression, review defect 3: the design's literal ``FloatCap[s, d] =
+    1e9*(s+1) + d`` is identifiable in float64 but NOT after
+    ``dailyfields.resolve``'s float32 cast -- float32's spacing at 1e9/5e9/1e10
+    is 64/512/1024, so ``+ d`` (d in 0..59) collapsed each symbol row to 1 or 2
+    distinct values (measured), and with each row constant along the date axis
+    no view-level test on this fixture could see a date-axis-by-POSITION
+    alignment bug. Pin what the fixture is FOR: every (s, d) cell must stay
+    distinguishable from every other one in float32, on BOTH axes."""
+    _, _, _, _, planes = make_synthetic_cube(n_symbols=n_symbols, n_days=n_days, n_minutes=2, seed=0,
+                                             daily_fields=("FloatCap",))
+    cast = planes["FloatCap"].astype(np.float32)
+    assert np.unique(cast).size == n_symbols * n_days            # no two cells collide
+    for s in range(n_symbols):
+        assert np.unique(cast[s]).size == n_days                 # the DATE axis survives
+    for d in range(n_days):
+        assert np.unique(cast[:, d]).size == n_symbols           # the SYMBOL axis survives
+    # and the design's own `+ d` really would NOT survive, so this is not vacuous
+    if n_days > 1:
+        literal = (1e9 * (np.arange(n_symbols)[:, None] + 1.0) + np.arange(n_days)[None, :]).astype(np.float32)
+        assert np.unique(literal[0]).size < n_days
 
 
 def test_daily_fields_kwarg_only_returns_the_requested_names():
@@ -140,9 +166,16 @@ def test_cube_store_attaches_a_daily_field_store_when_given_a_root(store, daily_
 def test_contract_hash_is_byte_identical_without_a_daily_source(store):
     """Backward compatibility (design item 7): building the SAME store twice
     with no daily_root must give the identical hash, and must equal the
-    original fixture's own hash."""
+    original fixture's own hash.
+
+    Review defect 2: the self-consistency comparison below is true of ANY
+    implementation, including one that breaks byte-identity, so the LITERAL
+    pre-WP3 payload is pinned too -- see
+    test_contract_hash_payload_is_literally_the_pre_wp3_one for why.
+    """
     reopened = CubeStore(store.directory)
     assert reopened.contract_hash == store.contract_hash
+    assert store.contract_hash == canonical_hash({"meta_sha256": store.meta_sha256})
 
 
 def test_contract_hash_changes_with_a_daily_source_attached_cube_store(store, daily_root):
@@ -188,11 +221,45 @@ def test_contract_hash_unchanged_and_changed_for_a_two_segment_segmented_store(t
     plain_a, plain_b = SegmentedCubeStore(comp), SegmentedCubeStore(comp)
     assert plain_a.daily is None
     assert plain_a.contract_hash == plain_b.contract_hash         # deterministic, no daily source
+    # Review defect 2: pin the literal pre-WP3 PAYLOAD, not just its
+    # self-consistency -- an unconditional "daily" key turns both of these red.
+    pre_wp3_keys = ("base_minute_meta_sha256", "index_sha256", "segment_meta_sha256")
+    assert set(plain_a.contract) == set(pre_wp3_keys)
+    assert plain_a.contract_hash == canonical_hash({k: plain_a.contract[k] for k in pre_wp3_keys})
 
     droot = write_daily_fields(tmp_path / "daily", planes, symbols, dates)
     with_daily = SegmentedCubeStore(comp, daily_root=droot)
     assert with_daily.daily is not None
     assert with_daily.contract_hash != plain_a.contract_hash      # changes once attached
+
+
+def test_contract_hash_payload_is_literally_the_pre_wp3_one(store, tmp_path):
+    """Regression, review defect 2: every backward-compatibility guard for
+    contract_hash compared two stores built by the SAME code
+    (``CubeStore(store.directory).contract_hash == store.contract_hash``), and
+    tests/test_store_layouts.py:50 only asserts segmented != monolithic. All of
+    those stay green under the exact break design item 7 forbids -- adding
+    ``parts["daily"] = dailyfields.fingerprint(self.daily)`` UNCONDITIONALLY,
+    which is a no-op-looking change because fingerprint() returns None with no
+    daily source, but which rewrites the hash and so invalidates every
+    contract_hash recorded on the server (calculate.py:174; Partura's
+    PanelSet.view_id is about to mix it in per the design).
+
+    Measured against the read-only baseline tree (517fd09): a store's
+    no-daily hash is exactly ``canonical_hash({"meta_sha256": ...})``, and the
+    unconditional-key variant gives a different digest. Pin the PAYLOAD."""
+    assert store.daily is None
+    assert store.contract_hash == canonical_hash({"meta_sha256": store.meta_sha256})
+    # non-vacuous: the forbidden variant is genuinely a different hash, so the
+    # assertion above is what stands between it and a silent cache invalidation
+    assert canonical_hash({"meta_sha256": store.meta_sha256, "daily": None}) != store.contract_hash
+
+    comp, _, _, _ = _two_segment_store(tmp_path)
+    seg = SegmentedCubeStore(comp)
+    assert seg.daily is None
+    assert set(seg.contract) == {"base_minute_meta_sha256", "index_sha256", "segment_meta_sha256"}
+    assert seg.contract_hash == canonical_hash(seg.contract)
+    assert canonical_hash({**seg.contract, "daily": None}) != seg.contract_hash
 
 
 def test_open_cube_store_forwards_daily_root_to_either_class(tmp_path, daily_root):
@@ -274,8 +341,11 @@ def test_daily_view_float_cap_matches_the_identifiable_plane_exactly(daily_view,
     fc = daily_view.daily("FloatCap")
     assert fc.dtype == np.float32
     s, d = np.arange(store.n_symbols)[:, None], np.arange(store.n_days)[None, :]
-    expect = (1e9 * (s + 1.0) + d).astype(np.float32)
+    expect = (1e9 * (s + 1.0) + _DATE_STEP * d).astype(np.float32)
     np.testing.assert_array_equal(fc, expect)
+    # review defect 3: the plane that reaches a VIEW must still name its own
+    # cell, on both axes, or every alignment test built on it is vacuous.
+    assert np.unique(fc).size == store.n_symbols * store.n_days
 
 
 def test_daily_returns_s_d_orientation_not_d_s(daily_view, store):
@@ -347,6 +417,16 @@ def test_view_independence_symbol_subset_and_warmed_view_padding(store, daily_ro
     idx = [store.symbols.index(s) for s in subset_syms]
     np.testing.assert_array_equal(got, full[idx][:, padded.d0:padded.d1])
 
+    # The DATE half of this test, made non-vacuous (review defect 3): the window
+    # really does start after the store's day 0, and the plane really does vary
+    # along the date axis AFTER the float32 cast. Without both, indexing the
+    # date axis by POSITION instead of by label leaves the assertion above green
+    # (measured on the design's literal `+ d` plane), which is exactly what this
+    # test exists to rule out.
+    assert padded.d0 > 0
+    assert np.unique(got[0]).size == got.shape[1]
+    assert not np.array_equal(got, full[idx][:, :padded.n_days])   # not a by-position date read
+
 
 # ---------------------------------------------------------------------------
 # derive('LimitWidth') / derive('BoardCode') on the NEW fixture symbol
@@ -399,6 +479,58 @@ def test_list_age_sentinel_and_sticky_through_suspension_on_the_fixture(daily_vi
     # +1-per-day property holds straight through it for every listed symbol.
     assert (store.day_status() == DAY_STATUS_CODES["SUSPENDED"]).any()
     assert np.all(np.diff(age[:-1], axis=1) == 1.0)
+
+
+def test_list_age_is_anchored_to_the_store_not_to_the_view(store, daily_root):
+    """Regression, review defect 1: ``ListAge`` was resolved on ``self.dates``,
+    so its sticky counter restarted at the VIEW's first day. Measured before the
+    fix, on this fixture (unlisted_days=8, so the last symbol lists on store day
+    8), for the SAME store day 30:
+
+      st.view().daily("ListAge")                -> young 22.0, old 10030.0 (2 distinct)
+      st.view(start=dates[20]).daily("ListAge")  -> young 10010.0, old 10010.0 (1 distinct)
+      warmed_view(..., start=dates[30], warmup=10) -> the column is [10010.]*10
+
+    Two silent consequences: the same (symbol, date) cell was worth a different
+    number in a research window than in an export window (contract_hash does not
+    depend on the window, so nothing flagged it), and on ANY windowed view every
+    stock listed before the window collected LIST_AGE_SENTINEL, making the plane
+    cross-sectionally constant -- ``cs_rank(ListAge)`` a flat tie, i.e. zero
+    information. pipeline.py:244 / research.py:111 / calculate.py:126 all build
+    their view through warmed_view, so a window is the normal case.
+
+    The design (section "New module dailyfields.py", and the LIST_AGE_SENTINEL
+    comment) anchors the sentinel to "the STORE's first day", and ``ListAge`` was
+    the one field for which the design's own WP3 bullet -- "view independence ...
+    equals the full-view plane indexed by that subset" -- failed. Pin it."""
+    st = CubeStore(store.directory, daily_root=daily_root)
+    full = st.view().daily("ListAge")
+
+    # 1. a plain date window, in both orientations
+    for start_idx in (1, 10, 20, 40):
+        windowed = st.view(start=store.dates[start_idx]).daily("ListAge")
+        np.testing.assert_array_equal(windowed, full[:, start_idx:])
+    for end_idx in (5, 30, 59):
+        np.testing.assert_array_equal(st.view(end=store.dates[end_idx]).daily("ListAge"),
+                                      full[:, :end_idx + 1])
+
+    # 2. a non-ascending symbol subset AND a warmed_view-padded range together,
+    #    which is what pipeline/research/calculate actually construct
+    subset_syms = [store.symbols[9], store.symbols[1], store.symbols[4]]
+    padded, pad = warmed_view(st, start=store.dates[30], end=store.dates[50], warmup=10, symbols=subset_syms)
+    assert pad == 10 and padded.d0 == 20
+    idx = [store.symbols.index(s) for s in subset_syms]
+    np.testing.assert_array_equal(padded.daily("ListAge"), full[idx][:, padded.d0:padded.d1])
+
+    # 3. non-vacuous, and the exact numbers from the failure above: the young
+    #    symbol is genuinely YOUNGER than the sentinel-carrying ones on store
+    #    day 30, and the windowed view agrees cell for cell.
+    windowed = st.view(start=store.dates[20]).daily("ListAge")
+    assert full[-1, 30] == 22.0 and full[0, 30] == 10000.0 + 30
+    assert windowed[-1, 10] == 22.0 and windowed[0, 10] == 10000.0 + 30
+    assert np.unique(windowed[:, 10]).size == 2          # NOT a flat cross-section
+    # ...and the sticky +1 really does keep counting inside the window
+    assert np.all(np.diff(windowed[:-1], axis=1) == 1.0)
 
 
 # ---------------------------------------------------------------------------

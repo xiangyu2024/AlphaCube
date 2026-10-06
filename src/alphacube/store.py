@@ -449,6 +449,18 @@ def open_cube_store(path: PathLike, include_segments: bool = True, mirror_root: 
     return CubeStore(p, mirror_dir=mirror_root, daily_root=daily_root)
 
 
+# Daily fields whose value at a (symbol, date) cell depends on where the DAY
+# AXIS STARTS and not on that cell alone, so they MUST be resolved over the
+# store's whole day axis and then sliced to the window -- see CubeView.daily().
+# Only ``ListAge`` qualifies: it is a sticky cumulative count from a stock's
+# first in-lifecycle day, with LIST_AGE_SENTINEL added for a stock already
+# listed on the FIRST day it is shown (dailyfields._list_age). ``LimitWidth``
+# is per-date (the 2020-08-24 GEM switch is a function of the date label
+# itself), ``BoardCode`` is date-independent, and every stored/log field is
+# aligned by label, so all of those are already window-independent.
+_STORE_ANCHORED_DAILY_FIELDS: Tuple[str, ...] = ("ListAge",)
+
+
 class CubeView:
     """Symbol subset x day range of a store, readable in either chunk orientation."""
 
@@ -534,11 +546,37 @@ class CubeView:
         stock-day from a merely-suspended one -- status wins when both are
         given (dailyfields._lifecycle_mask), so passing both here is safe and
         is simply unused by every other daily field.
+
+        A field in ``_STORE_ANCHORED_DAILY_FIELDS`` (``ListAge``) is resolved
+        over the STORE's whole day axis and then sliced to ``[d0, d1)``: its
+        counter has to start where the store's data does, not where this
+        window happens to begin. Resolving it on ``self.dates`` instead made
+        the same (symbol, date) cell worth 22.0 on a full view and 10010.0 on a
+        view starting 20 days in, and -- because every stock listed before the
+        window's first day then collects the sentinel -- left the plane
+        cross-sectionally CONSTANT on any windowed view, so ``cs_rank(ListAge)``
+        was a flat tie. ``contract_hash`` does not depend on the window, so
+        nothing flagged it. pipeline.py / research.py / calculate.py all build
+        their view through ``warmed_view(store, start, end, ...)``, i.e. a
+        window is the normal case. This is the one place that knows both axes;
+        doing it here costs one extra (S_view, D_store) int8 status read on a
+        windowed view, and nothing at all on a full one. Only ``status`` is
+        passed on this path: it is never None here and it already wins over
+        ``tradable`` inside dailyfields._lifecycle_mask.
         """
         if name not in self._daily:
             from .dailyfields import resolve
-            self._daily[name] = resolve(name, self.symbols, self.dates, store=self.store.daily,
-                                        tradable=self.tradable(), status=self.day_status())
+            if name in _STORE_ANCHORED_DAILY_FIELDS:
+                if self.d0 == 0 and self.d1 == self.store.n_days:
+                    store_dates, store_status = self.dates, self.day_status()   # already the whole axis
+                else:
+                    store_dates = self.store.dates
+                    store_status = self.store.read_status(self._rows(0, self.n_symbols), 0, self.store.n_days)
+                plane = resolve(name, self.symbols, store_dates, store=self.store.daily, status=store_status)
+                self._daily[name] = np.ascontiguousarray(plane[:, self.d0:self.d1])
+            else:
+                self._daily[name] = resolve(name, self.symbols, self.dates, store=self.store.daily,
+                                            tradable=self.tradable(), status=self.day_status())
         return self._daily[name]
 
     def daily_s(self, name: str, s_lo: int, s_hi: int) -> np.ndarray:

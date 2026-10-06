@@ -37,6 +37,17 @@ _SPECIAL_BOARD_SYMBOLS: Tuple[str, ...] = ("688001.SH", "300001.SZ", "830001.BJ"
 # agree_with_catalog_py is the kind of check that would catch a drift).
 _SYNTHETIC_DAILY_FIELDS: Tuple[str, ...] = ("FloatCap", "TotalCap", "FloatShares")
 
+# Step of the DATE term in the identifiable planes (see make_synthetic_cube's
+# ``daily_fields``). Must be (a) far ABOVE float32's spacing at the plane's
+# magnitude, or the float32 cast in dailyfields.resolve erases the date axis,
+# and (b) far BELOW the 1e9 step of the SYMBOL term, or the two axes collide.
+# 1e6 satisfies both for n_symbols up to ~8000 (float32 spacing is m / 2**23,
+# so it stays under 1e6 while 1e9 * n_symbols < 8.4e12) and n_days up to 1000
+# (1e6 * n_days < 1e9) -- orders of magnitude past any test fixture;
+# tests/test_daily_fields_store.py::test_identifiable_planes_stay_identifiable_
+# after_the_float32_cast asserts the property at the sizes actually used.
+_DATE_STEP: float = 1e6
+
 
 def _synthetic_symbols(n_symbols: int) -> List[str]:
     """``n_symbols`` symbols, mostly main board (``f"{600000+i}.SH"``) with the
@@ -66,10 +77,22 @@ def make_synthetic_cube(n_symbols: int = 12, n_days: int = 80, n_minutes: int = 
     ``daily_fields``: names from ``("FloatCap", "TotalCap", "FloatShares")`` to
     also return as a FIFTH element -- a dict of (S, D) float64 planes over the
     SAME symbols/dates, with IDENTIFIABLE (not random) values: ``FloatCap[s, d]
-    = 1e9 * (s + 1) + d`` where ``s``/``d`` are plain 0-based POSITION indices
-    (not symbol/date values), so a bug that aligns a symbol subset by position
-    instead of by label is visible rather than silently plausible; ``TotalCap =
-    FloatCap / 0.6``, ``FloatShares = FloatCap / 10.0``. Keyword-gated: empty by
+    = 1e9 * (s + 1) + _DATE_STEP * d`` where ``s``/``d`` are plain 0-based
+    POSITION indices (not symbol/date values), so a bug that aligns EITHER axis
+    by position instead of by label is visible rather than silently plausible;
+    ``TotalCap = FloatCap / 0.6``, ``FloatShares = FloatCap / 10.0``.
+
+    DEVIATION from the design's literal ``+ d`` (design step 7), measured: the
+    date term has to survive ``dailyfields.resolve``'s float32 cast, and it did
+    not. float32's spacing at 1e9/5e9/1e10 is 64/512/1024, so ``+ d`` with
+    d in 0..59 quantised away completely -- ``CubeView.daily("FloatCap")`` came
+    back with 1 or 2 distinct values per symbol ROW (measured) instead of 60,
+    i.e. each row was constant along the date axis. Sabotaging
+    ``DailyFieldStore.align`` to index the DATE axis by POSITION then left both
+    view-level WP3 tests green: the date half of "view independence" asserted
+    nothing. ``_DATE_STEP`` keeps the same ~1e9 magnitude and the same
+    by-POSITION identifiability while putting the date term far above that
+    spacing. Keyword-gated: empty by
     default, so every existing caller keeps today's 4-tuple-shaped contents at
     this position (write_synthetic_store below unpacks five unconditionally,
     so its own arity never depends on this argument) and today's RNG draw
@@ -131,7 +154,8 @@ def make_synthetic_cube(n_symbols: int = 12, n_days: int = 80, n_minutes: int = 
         if unknown:
             raise ValueError(f"make_synthetic_cube: daily_fields has unknown name(s) {unknown}; "
                              f"the stored daily fields are {_SYNTHETIC_DAILY_FIELDS}")
-        float_cap = 1e9 * (np.arange(S, dtype=np.float64)[:, None] + 1.0) + np.arange(D, dtype=np.float64)[None, :]
+        float_cap = (1e9 * (np.arange(S, dtype=np.float64)[:, None] + 1.0)
+                     + _DATE_STEP * np.arange(D, dtype=np.float64)[None, :])
         available = {"FloatCap": float_cap, "TotalCap": float_cap / 0.6, "FloatShares": float_cap / 10.0}
         planes = {name: available[name] for name in daily_fields}
     return cubes, symbols, dates, status, planes
