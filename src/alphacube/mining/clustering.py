@@ -18,7 +18,7 @@ from typing import Dict, List, Sequence
 
 import numpy as np
 
-from ..expression import Constant, Expression, Feature
+from ..expression import Constant, DailyFeature, Expression, Feature
 
 
 def constant_class(value: float) -> str:
@@ -31,6 +31,8 @@ def skeleton_key(expr: Expression) -> str:
         return "F"
     if isinstance(expr, Constant):
         return "C:pct" if constant_class(expr.value) == "percent" else "C:scl"
+    if isinstance(expr, DailyFeature):
+        return "DF"
     inner = ",".join(skeleton_key(o) for o in expr.operands)
     w = "" if expr.window is None else f"@{expr.window}"
     return f"O:{expr.spec.name}({inner}){w}"

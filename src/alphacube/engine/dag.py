@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Sequence
 
 from ..axes import OpSpec
-from ..expression import Constant, Expression, Feature, Shape
+from ..expression import Constant, DailyFeature, Expression, Feature, Shape
 
 
 class Node:
@@ -37,7 +37,7 @@ class Node:
 
     @property
     def is_leaf(self) -> bool:
-        return isinstance(self.expr, (Feature, Constant))
+        return isinstance(self.expr, (Feature, Constant, DailyFeature))
 
     @property
     def is_root(self) -> bool:

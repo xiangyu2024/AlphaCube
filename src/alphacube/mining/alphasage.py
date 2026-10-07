@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 
-from ..expression import Binary, Constant, Expression, Feature, PairRolling, Rolling, Unary
+from ..expression import Binary, Constant, DailyFeature, Expression, Feature, PairRolling, Rolling, Unary
 from .base import MinerReport, ProgressFn, TokenMiner
 from .env import BatchRewarder
 from .tokens import BEG, ConstantToken, ExpressionBuilder, FeatureToken, OperatorToken, Vocabulary
@@ -37,6 +37,12 @@ class PartialTreeGraph:
 
 def _unroll(expr: Expression, vocab: Vocabulary, nodes: List[int], edges: List[Tuple[int, int, int]]) -> int:
     if isinstance(expr, Feature):
+        nodes.append(vocab.index_of(FeatureToken(expr.field)))
+        return len(nodes) - 1
+    if isinstance(expr, DailyFeature):
+        # Same token family as a minute Feature -- vocab carries no daily tokens
+        # until WP10 adds them, so this raises vocab's own KeyError (naming the
+        # token) rather than this function's AttributeError on expr.spec.name.
         nodes.append(vocab.index_of(FeatureToken(expr.field)))
         return len(nodes) - 1
     if isinstance(expr, Constant):

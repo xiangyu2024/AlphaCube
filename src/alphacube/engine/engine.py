@@ -29,7 +29,7 @@ import numpy as np
 import torch
 
 from ..axes import MODE_D, MODE_P, MODE_S
-from ..expression import Constant, Expression, Feature
+from ..expression import Constant, DailyFeature, Expression, Feature
 from ..store import CubeView, advise_access
 from .dag import Dag, Node
 from .kernels import apply_cube, apply_panel
@@ -158,6 +158,7 @@ class CubeEngine:
         # VmFlags in /proc/<pid>/smaps while the other three had it).
         self._bound_advice = {}
         self._bound_layout: Dict[str, str] = {}      # boundary key -> "S" / "D" (axis order of its file)
+        self._daily_t: Dict[str, torch.Tensor] = {}  # daily field -> cached (D, S) panel tensor, this call only
         tmp = None
         if plan.boundaries:
             tmp = tempfile.TemporaryDirectory(dir=self.workdir, prefix="alphacube_")
@@ -200,16 +201,25 @@ class CubeEngine:
             for b in list(bounds.values()):
                 del b
             bounds.clear()
+            self._daily_t.clear()
             if tmp is not None:
                 tmp.cleanup()
         return EvalResult(panels=out, errors=errors, plan=plan, seconds=time.perf_counter() - t0, stats=stats)
 
     # ---- helpers -----------------------------------------------------------------
     def _leaf_panel(self, expr: Expression) -> np.ndarray:
-        """A bare degenerate leaf root (a Constant) as an (S, D) panel."""
+        """A bare degenerate leaf root (a Constant, or a DailyFeature) as an (S, D) panel."""
         S, D = self.view.n_symbols, self.view.n_days
         if isinstance(expr, Constant):
             p = np.full((S, D), expr.value, dtype=self.np_dtype)
+            if self._mask_needed:
+                p[~self.view.tradable()] = np.nan
+            return p
+        if isinstance(expr, DailyFeature):
+            # view.daily() is cached on the view and resolved unmasked (store.py);
+            # astype(..., copy=True) both casts and detaches this from that cache so
+            # the mask below never mutates the view's own plane.
+            p = self.view.daily(expr.field).astype(self.np_dtype, copy=True)
             if self._mask_needed:
                 p[~self.view.tradable()] = np.nan
             return p
@@ -227,6 +237,13 @@ class CubeEngine:
     def _load_leaf_cube(self, expr: Expression, mode: str, lo: int, hi: int, tradable: torch.Tensor) -> torch.Tensor:
         if isinstance(expr, Constant):
             return torch.full((1, 1, 1), expr.value, dtype=self.dtype, device=self.device)
+        if isinstance(expr, DailyFeature):
+            sl = self.view.daily_s(expr.field, lo, hi) if mode == MODE_S else self.view.daily_d(expr.field, lo, hi)
+            expected = (hi - lo, self.view.n_days) if mode == MODE_S else (self.view.n_symbols, hi - lo)
+            if sl.shape != expected:
+                raise ValueError(f"daily leaf {expr.field!r} slice shape {sl.shape} != expected {expected}")
+            t = torch.from_numpy(np.ascontiguousarray(sl)).to(self.device, self.dtype).unsqueeze(-1)
+            return self._mask_cube(t, tradable)
         arr = self.view.read_s(expr.field, lo, hi) if mode == MODE_S else self.view.read_d(expr.field, lo, hi)
         t = torch.from_numpy(arr).to(self.device, self.dtype)
         return self._mask_cube(t, tradable)
@@ -356,6 +373,20 @@ class CubeEngine:
         def operand(c: Node) -> torch.Tensor:
             if isinstance(c.expr, Constant):
                 return torch.full((1, 1), c.expr.value, dtype=self.dtype, device=self.device)
+            if isinstance(c.expr, DailyFeature):
+                # Leaves are never written into `values` (only this round's computed
+                # nodes are), so without this cache a daily leaf consumed by several
+                # parents in the same P round would repeat the numpy->torch copy and
+                # the mask once per consuming edge -- this dict is what dedups that,
+                # across the whole evaluate() call (allocated/cleared there).
+                t = self._daily_t.get(c.expr.field)
+                if t is None:
+                    plane = self.view.daily(c.expr.field)          # (S, D) float32, view-cached
+                    t = torch.from_numpy(np.ascontiguousarray(plane.T)).to(self.device, self.dtype)
+                    if self._mask_needed:
+                        t = torch.where(tradable_ds, t, torch.full((), float("nan"), dtype=t.dtype, device=t.device))
+                    self._daily_t[c.expr.field] = t
+                return t
             if c.key in values:
                 return values[c.key]
             if c.key in panels:
