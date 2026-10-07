@@ -410,10 +410,20 @@ def run_mining(
                             panel_cache_bytes=cfg.get("panel_cache_bytes", 8 * 1024 ** 3))
         if rank_ban is not None and cfg.get("ban_exemplars"):
             if cfg.get("exemplar_cache"):
+                from .dailyfields import fingerprint
                 from .mining.rankban import ExemplarCache, view_cache_key
+                # daily= exactly as gp.py's own construction passes it (WP7 step 8).
+                # Without it this branch keys the SAME daily-aware view differently
+                # from the GP branch, and ExemplarCache._drop_other_views() rmtrees
+                # whichever key it did not just open -- so a sweep alternating a GP
+                # arm and an RL arm against one --exemplar-cache root re-pays the
+                # whole ban-archive fingerprint install (1h-2h04m for 1049-1673
+                # exemplars) on every switch, and the stale-fingerprint hazard this
+                # keyword closes stays open on the RL half.
                 rew.exemplar_cache = ExemplarCache(
                     cfg["exemplar_cache"],
-                    view_cache_key(view, rank_ban.index.days.size, rank_ban.index.cols.size),
+                    view_cache_key(view, rank_ban.index.days.size, rank_ban.index.cols.size,
+                                   daily=fingerprint(getattr(view.store, "daily", None))),
                     max_bytes=int(float(cfg.get("exemplar_cache_gb", 12.0)) * 1024 ** 3))
             n = rew.add_exemplars(list(cfg["ban_exemplars"]))
             say(f"rank-ban exemplars: {n} 个(来自 {len(cfg['ban_exemplars'])} 条表达式)")

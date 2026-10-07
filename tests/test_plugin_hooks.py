@@ -5,6 +5,11 @@
 ``view_cache_key``'s daily-fingerprint keyword. See
 docs/alphacube_steering_design.md, "乙 Steering hooks" section 3 ("Reaching the
 hooks") and section 4 ("GPMiner plumbing"), and work package "### WP7".
+
+The last test is the one cross-package pin in this file: the fingerprint only
+helps if BOTH ExemplarCache call sites key a daily-aware view the same way, and
+the second one lives in ``pipeline.py``'s RL branch (WP8's file), so it is
+checked here next to the GP-side key it has to agree with.
 """
 
 from __future__ import annotations
@@ -234,12 +239,16 @@ def test_search_hooks_op_weight_reaches_pick_via_gpminer(registry, mining_view, 
 
 
 def test_search_hooks_daily_fields_reach_the_generator_via_gpminer(registry, mining_view, mining_target):
-    """The other four SearchHooks fields forward through the identical
-    ``hooks.X if hooks is not None else <default>`` line op_weight does; this
-    checks daily_fields / daily_leaf_prob specifically, since a DailyFeature
-    leaf is generatable (if not evaluatable) without a daily store attached --
-    daily fields are always PARSEABLE, per WP2's design note; whether data for
-    them exists is a view-time question."""
+    """daily_fields / daily_leaf_prob specifically: a DailyFeature leaf is
+    generatable (if not evaluatable) without a daily store attached -- daily
+    fields are always PARSEABLE, per WP2's design note; whether data for them
+    exists is a view-time question.
+
+    Each of the five SearchHooks fields is forwarded by its OWN
+    ``hooks.X if hooks is not None else <default>`` line, so one test per field
+    is what it takes: measured, deleting the ``accept=`` forward alone, or the
+    ``leaf_slots=`` forward alone, left the whole 883-test suite green before
+    the two tests below existed."""
     from alphacube.expression import DailyFeature
 
     pool = MsePool(4, mining_target)
@@ -253,6 +262,55 @@ def test_search_hooks_daily_fields_reach_the_generator_via_gpminer(registry, min
     plain = GPMiner(registry, mining_view, mining_target, plain_pool, population_size=8, max_depth=4, seed=6)
     plain_pop = plain.generator.generate_population(30)
     assert not any(isinstance(n, DailyFeature) for e in plain_pop for n in e.nodes())
+
+
+def test_search_hooks_accept_reaches_the_generator_via_gpminer(registry, mining_view, mining_target):
+    """``accept`` is the load-bearing lever of 乙 -- it is how a plugin's reverse
+    guidance thins candidates -- and it needs its own pin: deleting just the
+    ``accept=hooks.accept if hooks is not None else None`` line left the whole
+    883-test suite green (measured, before this test).
+
+    Non-vacuous by construction: the control miner, same seed and depth, breeds
+    15 of 40 trees carrying a ``pow_*`` call, and the hooked one breeds none,
+    with ``unaccepted_fallbacks == 0`` -- so every tree really passed the hook
+    rather than coming back through ``generate()``'s relaxed fallback."""
+    def reject_pow(expr):
+        return "O:pow_" not in expr.key()
+
+    hooks = SearchHooks(accept=reject_pow)
+    miner = GPMiner(registry, mining_view, mining_target, MsePool(4, mining_target), population_size=8,
+                    max_depth=4, seed=6, hooks=hooks)
+    assert miner.generator.accept_hook is reject_pow        # the forward itself
+    pop = miner.generator.generate_population(40)
+    assert len(pop) == 40
+    assert not [e.key() for e in pop if "O:pow_" in e.key()]
+    assert miner.generator.unaccepted_fallbacks == 0
+
+    plain = GPMiner(registry, mining_view, mining_target, MsePool(4, mining_target), population_size=8,
+                    max_depth=4, seed=6)
+    assert plain.generator.accept_hook is None              # hooks omitted: today's construction exactly
+    plain_pop = plain.generator.generate_population(40)
+    # Reachable without the hook, which is what makes the check above non-vacuous.
+    # 15 of 40 measured at this seed/depth; asserted as a floor rather than the
+    # exact count so an unrelated change to the grammar reads as a grammar change.
+    assert len([e for e in plain_pop if "O:pow_" in e.key()]) >= 10
+
+
+def test_search_hooks_leaf_slots_reach_the_generator_via_gpminer(registry, mining_view, mining_target):
+    """Same story as ``accept`` above: deleting the ``leaf_slots=`` forward alone
+    also left the full suite green. The mapping must arrive as the SAME object
+    (``is``), not merely an equal copy -- a plugin that mutates its slot table
+    between blocks would otherwise be steering a stale copy. What the generator
+    then DOES with it is pinned by WP5's
+    tests/test_generator_hooks.py::test_leaf_slots_fills_only_the_named_slot."""
+    slots = {"cs_regres": {1: ("FloatCap",)}}
+    miner = GPMiner(registry, mining_view, mining_target, MsePool(4, mining_target), population_size=8,
+                    max_depth=3, seed=6, hooks=SearchHooks(daily_fields=("FloatCap",), leaf_slots=slots))
+    assert miner.generator.leaf_slots is slots
+
+    plain = GPMiner(registry, mining_view, mining_target, MsePool(4, mining_target), population_size=8,
+                    max_depth=3, seed=6)
+    assert plain.generator.leaf_slots is None               # hooks omitted: today's construction exactly
 
 
 # ---------------------------------------------------------------------------
@@ -455,3 +513,58 @@ def test_gpminer_exemplar_cache_uses_the_daily_fingerprint(registry, store, dail
                                   daily=dailyfields.fingerprint(view.store.daily))
     assert miner._exemplar_cache.view_key == expected_key
     assert miner._exemplar_cache.dir == tmp_path / expected_key
+
+
+def test_the_rl_branch_keys_one_shared_exemplar_cache_the_way_the_gp_branch_does(
+        registry, store, daily_root, tmp_path):
+    """The GP branch and ``pipeline.run_mining``'s RL branch must key the SAME
+    daily-aware view identically, because ``ExemplarCache.__init__`` ->
+    ``_drop_other_views()`` rmtrees every directory under the root that is not
+    the key it just opened. Measured on this fixture before the fix: the GP key
+    ``808c024d0c2c22e5`` and, for the very same view, a different unfingerprinted
+    key -- opening the second reported ``dropped_views=1`` and the panel the
+    first had cached came back a miss. So with the ``daily=`` fingerprint on the
+    GP side only, a sweep that alternates a GP arm and an RL arm against one
+    ``--exemplar-cache`` root under ``--daily-fields`` re-pays the entire
+    ban-archive fingerprint install on every switch -- 1h for 1049 exemplars,
+    2h04m for 1673 -- which is the exact cost the cache exists to avoid, and the
+    stale-fingerprint hazard stays open on the RL half.
+
+    A live store object is passed straight in (``run_mining`` only calls
+    ``open_cube_store`` for a path, pipeline.py:233-234), so this pins the RL
+    branch's own key today, without waiting for WP8's ``daily_root=`` keyword."""
+    from alphacube import dailyfields
+    from alphacube.parser import parse
+    from alphacube.pipeline import run_mining
+
+    daily_store = CubeStore(store.directory, daily_root=daily_root)
+    view = daily_store.view(start=store.dates[5])
+    target = Label("close", 1).compute(view)
+    root = tmp_path / "exemplars"
+    gp_miner = GPMiner(registry, view, target, MsePool(4, target), population_size=6, max_depth=3, seed=0,
+                       ban_rank_corr=0.95, exemplar_cache=str(root), exemplar_cache_gb=1.0)
+    gp_key = gp_miner._exemplar_cache.view_key
+    assert gp_key == view_cache_key(view, gp_miner._rank_ban.index.days.size,
+                                    gp_miner._rank_ban.index.cols.size,
+                                    daily=dailyfields.fingerprint(view.store.daily))
+    installed = gp_miner._exemplar_cache.dir / "already_installed.npy"
+    installed.write_bytes(b"")                 # stands in for a fingerprint the GP arm paid for
+
+    # The RL arm of the same sweep: same store, same --exemplar-cache root.
+    # warmup=0 so run_mining's own warmed_view spans exactly the window above --
+    # the default 60 would push the start back to the store's first day, and the
+    # keys would then differ over the DATES, which is the cache working as
+    # designed and would say nothing about the fingerprint.
+    logs: list = []
+    run_mining(daily_store, start=store.dates[5], label="close", miner="alphasage", budget=16,
+               warmup=0, pool_capacity=3, rl_params=dict(trajectories_per_update=8), max_expr_len=12,
+               combine_methods=(), log=logs.append,
+               gp_params=dict(ban_rank_corr=0.95, exemplar_cache=str(root), exemplar_cache_gb=1.0,
+                              ban_exemplars=[parse("day_mean(Amt)")]))
+    # The RL branch's exemplar path really ran -- without this the two asserts
+    # below would hold for a run that never opened an ExemplarCache at all.
+    assert [s for s in logs if s.startswith("rank-ban exemplars: 1 ")], logs
+    assert sorted(p.name for p in root.iterdir() if p.is_dir()) == [gp_key]
+    assert installed.exists()                  # the GP arm's work survived the RL arm
+    written = sorted(p.name for p in (root / gp_key).iterdir() if p.is_file())
+    assert installed.name in written and len(written) == 2, written   # the RL fingerprint landed HERE
