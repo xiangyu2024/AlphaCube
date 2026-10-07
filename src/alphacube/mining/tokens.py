@@ -161,12 +161,25 @@ def operator_logit_bias(vocab: Vocabulary, op_weight: Optional[Callable[[OpSpec]
 
     ``op_weight=None`` -- the GP-side default too -- returns an all-zero array:
     no operator is biased.
+
+    A non-finite weight is REJECTED (``ValueError``, naming the operator), the
+    same bound ``generator._check_weight`` enforces on the GP side: ``max(w, tiny)``
+    only floors the low end -- ``max(nan, 1e-9)`` is ``nan`` and ``max(inf, 1e-9)``
+    is ``inf`` -- and one such entry poisons the whole logit row, so
+    ``Categorical(logits=...)`` would later fail with no operator named (the
+    expected caller derives weights from research output, where a mean over an
+    empty group is NaN). A *negative* finite weight is floored to ``log(tiny)``
+    instead of rejected, matching ``generator._pick_weighted``'s use-time
+    ``max(0.0, w)`` clamp: it already means "never draw this operator", which is
+    exactly what ``log(tiny)`` encodes.
     """
     bias = np.zeros(vocab.size, dtype=np.float64)
     if op_weight is None:
         return bias
     for spec in vocab.operators:
         w = float(op_weight(spec))
+        if not math.isfinite(w):
+            raise ValueError(f"op_weight for {spec.name!r} must be a finite float, got {w!r}")
         bias[vocab.index_of(OperatorToken(spec.name))] = math.log(max(w, tiny))
     return bias
 

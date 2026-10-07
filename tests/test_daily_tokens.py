@@ -4,6 +4,12 @@ helper that lets a GP-side ``op_weight`` steer an RL policy too.
 No cube/store fixtures needed -- `Vocabulary` and `ExpressionBuilder` are pure
 functions of the registry, so every test here uses only the session-scoped
 `registry` fixture (tests/conftest.py).
+
+Two tests at the bottom reach into `mining.alphasage` (imported locally, to keep
+torch off this module's import path): the token vocabulary is only half of the RL
+action space -- the AlphaSAGE state encoder reads the builder's stack back out
+through `_unroll`, so a token family the encoder cannot look up is a crash, not a
+gap, and that round trip belongs to whatever introduces the token family.
 """
 
 import math
@@ -172,3 +178,86 @@ def test_operator_logit_bias_floors_a_negative_weight_at_tiny_same_as_zero(regis
     tiny = 1e-9
     bias = operator_logit_bias(vocab, lambda spec: -5.0 if spec.name == "day_mean" else 1.0, tiny=tiny)
     assert bias[vocab.index_of(OperatorToken("day_mean"))] == pytest.approx(math.log(tiny))
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_operator_logit_bias_rejects_a_non_finite_weight_naming_the_operator(registry, bad):
+    """REGRESSION: `max(w, tiny)` only floors the LOW end -- `max(nan, 1e-9)` is
+    `nan` (max returns the first argument unless the second compares greater) and
+    `max(inf, 1e-9)` is `inf`, so a non-finite weight used to be written straight
+    into the bias array. Added to a policy's logits, one such entry poisons the
+    whole row and the failure surfaces much later, inside
+    `Categorical(logits=...)`, naming no operator and no field. A data-driven
+    `op_weight` is the expected caller (a mean over an empty group is NaN), and
+    the GP side already rejects exactly this bound in `generator._check_weight`,
+    so refusing it here is also what makes "one shared op_weight steers both
+    searches" true rather than one arm crashing opaquely."""
+    def op_weight(spec):
+        return bad if spec.name == "day_mean" else 1.0
+
+    vocab = Vocabulary(registry, n_minutes=24)
+    with pytest.raises(ValueError, match="day_mean"):
+        operator_logit_bias(vocab, op_weight)
+
+
+def test_operator_logit_bias_stays_finite_for_every_token_under_extreme_weights(registry):
+    """The array a caller actually gets is always finite-valued, so adding it to
+    a logit row can never introduce a NaN/inf of its own."""
+    vocab = Vocabulary(registry, n_minutes=24, daily_fields=("FloatCap",))
+    bias = operator_logit_bias(vocab, lambda spec: 0.0 if spec.name.startswith("day_") else 1e300)
+    assert bias.shape == (vocab.size,)
+    assert np.all(np.isfinite(bias))
+
+
+# ---------------------------------------------------------------------------
+# Token parity with the AlphaSAGE state encoder (the other half of the action space)
+# ---------------------------------------------------------------------------
+
+def test_alphasage_state_graph_resolves_a_daily_leaf_on_a_wp10_vocabulary(registry):
+    """REGRESSION: `alphasage._unroll` looked a daily leaf up as
+    `FeatureToken(field)`, written before the daily namespace had a token family
+    of its own. A vocabulary that carries daily fields never carries a
+    `FeatureToken` for the same name (`fields` and `daily_fields` are parallel
+    namespaces), so that lookup KeyError'd on every vocabulary this package can
+    build -- i.e. on exactly the vocabularies the daily tokens exist for."""
+    from alphacube.mining.alphasage import build_partial_tree_graph
+
+    vocab = Vocabulary(registry, n_minutes=24, daily_fields=("FloatCap",))
+    assert FeatureToken("FloatCap") not in vocab.token_to_index
+    b = ExpressionBuilder(vocab)
+    b.push(BEG)
+    b.push(DailyFeatureToken("FloatCap"))
+
+    g = build_partial_tree_graph(b.stack, vocab)
+    assert g.node_token_idx == [vocab.index_of(DailyFeatureToken("FloatCap"))]
+    assert g.root_ids == [0] and g.edges == [] and g.n_pending_windows == 0
+
+    # and inside a tree, under an operator, with the stack re-read from scratch
+    b.push(OperatorToken("cs_rank"))
+    g2 = build_partial_tree_graph(b.stack, vocab)
+    assert vocab.index_of(DailyFeatureToken("FloatCap")) in g2.node_token_idx
+    assert vocab.index_of(OperatorToken("cs_rank")) in g2.node_token_idx
+
+
+def test_gflownet_sampler_draws_a_daily_token_and_keeps_going(registry):
+    """END TO END on the real path: `GFlowNetSampler.sample` rebuilds the state
+    graph from the stack at the TOP of every step, so the step AFTER the policy
+    first draws a daily token is where the stale lookup died. A policy biased
+    toward the daily token (what a trained one that found a size factor useful
+    looks like) must complete its trajectory."""
+    import torch
+
+    from alphacube.mining.alphasage import ForwardPolicy, GFlowNetSampler, RGCNEncoder
+
+    vocab = Vocabulary(registry, n_minutes=24, daily_fields=("FloatCap",))
+    torch.manual_seed(0)
+    encoder = RGCNEncoder(vocab.size, 16)
+    policy = ForwardPolicy(16, vocab.size, sep_index=vocab.sep_index)
+    with torch.no_grad():                      # daily leaf first, then terminate
+        policy.net[-1].bias[vocab.index_of(DailyFeatureToken("FloatCap"))] = 50.0
+        policy.net[-1].bias[vocab.sep_index] = 100.0
+
+    traj = GFlowNetSampler(vocab, encoder, policy, max_len=20).sample(greedy=True)
+    assert traj.n_steps == 2                                   # daily token, then SEP
+    assert traj.expr is not None and traj.expr.key() == "DF:FloatCap"
+    assert is_valid_root(traj.expr)

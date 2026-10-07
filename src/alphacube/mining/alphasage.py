@@ -21,7 +21,8 @@ from torch.distributions import Categorical
 from ..expression import Binary, Constant, DailyFeature, Expression, Feature, PairRolling, Rolling, Unary
 from .base import MinerReport, ProgressFn, TokenMiner
 from .env import BatchRewarder
-from .tokens import BEG, ConstantToken, ExpressionBuilder, FeatureToken, OperatorToken, Vocabulary
+from .tokens import (BEG, ConstantToken, DailyFeatureToken, ExpressionBuilder, FeatureToken, OperatorToken,
+                     Vocabulary)
 
 RELATIONS = ["unary_arg", "binary_lhs", "binary_rhs", "rolling_operand", "pair_rolling_lhs", "pair_rolling_rhs"]
 REL = {r: i for i, r in enumerate(RELATIONS)}
@@ -40,10 +41,15 @@ def _unroll(expr: Expression, vocab: Vocabulary, nodes: List[int], edges: List[T
         nodes.append(vocab.index_of(FeatureToken(expr.field)))
         return len(nodes) - 1
     if isinstance(expr, DailyFeature):
-        # Same token family as a minute Feature -- vocab carries no daily tokens
-        # until WP10 adds them, so this raises vocab's own KeyError (naming the
-        # token) rather than this function's AttributeError on expr.spec.name.
-        nodes.append(vocab.index_of(FeatureToken(expr.field)))
+        # Its OWN token family: WP10 gave the daily namespace `DailyFeatureToken`,
+        # parallel to `fields`/`FeatureToken`, so a vocabulary built with
+        # `daily_fields=(...)` carries DailyFeatureToken('FloatCap') and never a
+        # FeatureToken for the same name. Looking up the minute token here is what
+        # the builder's own inverse (tokens.ExpressionBuilder.push) would never do,
+        # and would KeyError on every WP10 vocabulary -- `GFlowNetSampler.sample`
+        # re-reads the whole stack through this function at every step, so the step
+        # after the policy first draws a daily leaf would die.
+        nodes.append(vocab.index_of(DailyFeatureToken(expr.field)))
         return len(nodes) - 1
     if isinstance(expr, Constant):
         try:

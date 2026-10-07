@@ -40,7 +40,7 @@ from alphacube.engine.schedule import plan_rounds
 from alphacube.expression import DailyFeature
 from alphacube.mining.alphasage import _unroll
 from alphacube.mining.clustering import cluster_population, skeleton_key
-from alphacube.mining.tokens import FeatureToken, Vocabulary
+from alphacube.mining.tokens import DailyFeatureToken, FeatureToken, Vocabulary
 from alphacube.parser import parse
 
 
@@ -459,11 +459,16 @@ def test_alphasage_unroll_raises_vocab_keyerror_not_attributeerror(registry):
 
 
 def test_alphasage_unroll_resolves_once_a_vocabulary_carries_the_token(registry):
-    """Forward-looking: _unroll's own logic is correct given ANY vocabulary
-    that does carry a FeatureToken for the field (however WP10 arranges for
-    that), not only that it currently raises cleanly."""
-    vocab = Vocabulary(registry, fields=list(registry.fields) + ["FloatCap"])
+    """_unroll's own logic is correct given a vocabulary that carries a token for
+    the daily field. The fixture is the shape WP10 actually produces --
+    ``Vocabulary(registry, daily_fields=[...])``, whose daily namespace is
+    ``DailyFeatureToken``; the original `fields=list(registry.fields) + ["FloatCap"]`
+    written here pre-WP10 ("however WP10 arranges for that") is a shape WP10 does
+    not and cannot produce, so it asserted nothing about the real path and left
+    the KeyError on every real WP10 vocabulary green."""
+    vocab = Vocabulary(registry, daily_fields=["FloatCap"])
+    assert FeatureToken("FloatCap") not in vocab.token_to_index
     nodes, edges = [], []
     idx = _unroll(DailyFeature("FloatCap"), vocab, nodes, edges)
-    assert nodes[idx] == vocab.index_of(FeatureToken("FloatCap"))
+    assert nodes[idx] == vocab.index_of(DailyFeatureToken("FloatCap"))
     assert edges == []
