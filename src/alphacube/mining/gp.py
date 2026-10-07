@@ -40,11 +40,12 @@ from ..engine.engine import CubeEngine
 from ..expression import Expression, GeneralCall, contains_lookahead, is_valid_root
 from ..metrics import (MIN_PAIRS, _cs_corr_days_t, batched_ic, cs_pearson, nanmean_quiet, rank_ic_turnover,
                        torch_rank_rows)
+from ..plugins import SearchHooks
 from ..store import CubeView
 from .clustering import cluster_population, cull_clusters, skeleton_key
 from .generator import TypedTreeGenerator, one_layer_keys
 from .rankban import CompactRankIndex, ExemplarCache, RankSimilarityBan, view_cache_key
-from .scoring import BOOK_TOP_FRAC as _SHARED_TOP_FRAC, PanelScorer, make_scorer
+from .scoring import BOOK_TOP_FRAC as _SHARED_TOP_FRAC, PanelScorer, make_scorer, scorer_kinds
 from .pool import LinearPool
 
 ProgressFn = Callable[[int, int, dict], None]
@@ -131,6 +132,7 @@ class MiningReport:
     dup_demoted: int = 0
     seconds: float = 0.0
     engine_seconds: float = 0.0
+    stopped_early: str = ""      # "" ran the full budget; else why mine() returned early (e.g. "wall clock")
 
 
 _BAN_KEY = re.compile(r"^O:([A-Za-z0-9_]+)\((.*)\)(\|w\d+)?$")
@@ -138,9 +140,14 @@ _BAN_KEY = re.compile(r"^O:([A-Za-z0-9_]+)\((.*)\)(\|w\d+)?$")
 
 def check_ban_key(key: str, registry: Registry, fields: Sequence[str]) -> None:
     """``key`` must be a depth-1 structure as ``one_layer_keys`` writes it --
-    ``O:<operator>(<leaf>,...)[|w<window>]`` over leaves ``F:<field>`` / ``C:<value>``,
-    e.g. ``O:log(F:Amt)`` or ``O:nt_ts_argmax(F:High)|w3`` -- naming a registered
-    operator and existing fields."""
+    ``O:<operator>(<leaf>,...)[|w<window>]`` over leaves ``F:<field>`` / ``C:<value>``
+    / ``DF:<daily field>``, e.g. ``O:log(F:Amt)``, ``O:nt_ts_argmax(F:High)|w3``
+    or ``O:cs_rank(DF:FloatCap)`` -- naming a registered operator and existing
+    (minute or daily) fields. Without the ``DF:`` branch (WP7) a ban key naming
+    a daily leaf was a hard error instead of a ban -- it matters for the
+    standing rule that each rolling GP block inherits the previous blocks'
+    most-frequent banned substructures, which can themselves name a daily leaf
+    once one has been searched."""
     m = _BAN_KEY.match(key)
     if not m:
         raise ValueError(f"ban key {key!r} is not a depth-1 structure like 'O:log(F:Amt)'")
@@ -148,7 +155,10 @@ def check_ban_key(key: str, registry: Registry, fields: Sequence[str]) -> None:
     if name not in registry:
         raise ValueError(f"ban key {key!r}: no operator named {name!r}")
     for a in args.split(","):
-        if a.startswith("F:"):
+        if a.startswith("DF:"):
+            if a[3:] not in registry.daily_fields:
+                raise ValueError(f"ban key {key!r}: no daily field named {a[3:]!r}")
+        elif a.startswith("F:"):
             if a[2:] not in fields:
                 raise ValueError(f"ban key {key!r}: no field named {a[2:]!r}")
         elif not a.startswith("C:"):
@@ -177,7 +187,9 @@ class GPMiner:
                  checkpoint_every: int = 0,
                  initial_population: Sequence[Expression] = (), seed_keep: int = 0,
                  seed_max_depth: int = 0, seed_per_block: bool = False,
-                 workdir: Optional[os.PathLike] = None, seed: int = 0) -> None:
+                 workdir: Optional[os.PathLike] = None, seed: int = 0,
+                 hooks: Optional[SearchHooks] = None, warmup: int = 0,
+                 wall_seconds: float = 0.0) -> None:
         self.registry = registry
         self.view = view
         self.pool = pool
@@ -238,10 +250,19 @@ class GPMiner:
         self.checkpoint_every = max(0, int(checkpoint_every))
         if self.checkpoint_dir and self.checkpoint_every:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        # hooks=None forwards exactly TypedTreeGenerator's own defaults for the five
+        # keywords below, so construction is byte-identical to before SearchHooks
+        # existed -- see plugins.SearchHooks and docs/alphacube_steering_design.md,
+        # "Backward compatibility" item 15.
         self.generator = TypedTreeGenerator(registry, fields=fields, n_minutes=view.n_minutes,
                                             min_depth=min_depth, max_depth=max_depth,
                                             allow_boolean_ops=allow_boolean_ops,
-                                            allow_resource_risk=allow_resource_risk, rng=self._rng)
+                                            allow_resource_risk=allow_resource_risk, rng=self._rng,
+                                            op_weight=hooks.op_weight if hooks is not None else None,
+                                            accept=hooks.accept if hooks is not None else None,
+                                            daily_fields=hooks.daily_fields if hooks is not None else (),
+                                            daily_leaf_prob=hooks.daily_leaf_prob if hooks is not None else 0.0,
+                                            leaf_slots=hooks.leaf_slots if hooks is not None else None)
         # Structures banned from the first generation on -- e.g. what an earlier run's
         # rolling blocks already exhausted -- on top of whatever this run bans itself.
         # A key that names nothing would ban nothing, silently, so each is checked.
@@ -279,9 +300,11 @@ class GPMiner:
         self._pending_exemplars = list(ban_exemplars) if self._rank_ban is not None else []
         self._exemplar_cache = None
         if self._rank_ban is not None and exemplar_cache:
+            from .. import dailyfields     # lazy: only this path needs it
             self._exemplar_cache = ExemplarCache(
                 exemplar_cache, view_cache_key(view, self._rank_ban.index.days.size,
-                                               self._rank_ban.index.cols.size),
+                                               self._rank_ban.index.cols.size,
+                                               daily=dailyfields.fingerprint(getattr(view.store, "daily", None))),
                 max_bytes=int(exemplar_cache_gb * 1024 ** 3))
         self._rank_verdict: Dict[str, Tuple[int, bool]] = {}
         self._gen_similar = 0
@@ -304,8 +327,8 @@ class GPMiner:
         # Rank IC because the book trades ranks: gpu9's block-2 leaders were
         # pow_2(kurtosis) factors with IC +0.028 and rank IC -0.015 -- a Pearson IC
         # carried by a few extreme values, and a decile book that lost 2.4 Sharpe.
-        if fitness_kind not in FITNESS_KINDS:
-            raise ValueError(f"fitness_kind must be one of {FITNESS_KINDS}, not {fitness_kind!r}")
+        if fitness_kind not in scorer_kinds():
+            raise ValueError(f"fitness_kind must be one of {scorer_kinds()}, not {fitness_kind!r}")
         if turnover_penalty < 0:
             raise ValueError("turnover_penalty must be >= 0")
         self.fitness_kind = fitness_kind
@@ -321,7 +344,8 @@ class GPMiner:
                                        turnover_penalty=self.turnover_penalty,
                                        signed=self.fitness_signed, cost_per_side=float(cost_per_side),
                                        top_frac=BOOK_TOP_FRAC, min_coverage=self.min_coverage,
-                                       min_scored_days=self.min_scored_days)
+                                       min_scored_days=self.min_scored_days,
+                                       dates=list(self.view.dates), warmup=int(warmup))
             self._target_t64 = self._scorer.target_t64
             self._target_ranks_t = self._scorer.target_ranks_t
         # Only for the checkpoint's after-cost column; the fitness charges costs
@@ -355,6 +379,9 @@ class GPMiner:
         self._archive: Dict[str, Tuple[Expression, float]] = {}
         self.engine_seconds = 0.0
         self.evaluated = 0
+        # 0 (default) short-circuits `if ws and ...` in mine() without ever calling
+        # time.perf_counter() for the comparison -- see mine()'s own comment.
+        self.wall_seconds = float(wall_seconds)
 
     # -- fitness ---------------------------------------------------------------------
     def _refused(self, expr: Expression) -> bool:
@@ -730,9 +757,18 @@ class GPMiner:
                 fh.write(f'{b},{f:.6f},"{text}"\n')
 
     # -- entry -----------------------------------------------------------------------
-    def mine(self, budget: int, on_generation: Optional[ProgressFn] = None) -> MiningReport:
+    def mine(self, budget: int, on_generation: Optional[ProgressFn] = None,
+             wall_seconds: Optional[float] = None) -> MiningReport:
         t0 = time.perf_counter()
         n_gen = max(1, math.ceil(budget / self.population_size))
+        # None (the default) defers to the constructor's self.wall_seconds, so a
+        # caller that never heard of wall_seconds (passes neither) reproduces
+        # today's behaviour exactly: 0.0 there makes `ws` falsy, `if ws and ...`
+        # short-circuits on that first operand, and time.perf_counter() is never
+        # even called for the comparison below -- no new behaviour, no new cost.
+        ws = self.wall_seconds if wall_seconds is None else float(wall_seconds)
+        stopped_early = ""
+        done_gen = 0
         if self._pending_exemplars:
             self.initial_exemplars = self._add_exemplars(self._pending_exemplars)
             self._pending_exemplars = []
@@ -757,8 +793,12 @@ class GPMiner:
                                              "gen_mean": float(finite.mean()) if finite.size else float("nan"),
                                              "archive": len(self._archive), "valid": int(finite.size),
                                              **self._similar_info()})
+            done_gen = g + 1
             if self.checkpoint_every and self.checkpoint_dir and (g + 1) % self.checkpoint_every == 0:
                 self.write_checkpoint(g + 1)
+            if ws and time.perf_counter() - t0 >= ws:
+                stopped_early = "wall clock"
+                break
             if self.rolling_block and (g + 1) % self.rolling_block == 0 and g + 1 < n_gen:
                 banned = self._roll(population, raw, g + 1)
                 population = (self._seeded_population(len(self.blocks) + 1) if self.seed_per_block
@@ -780,10 +820,14 @@ class GPMiner:
                                                  "archive": len(self._archive),
                                                  "valid": int(finite.size), "rolled": len(banned),
                                                  **self._similar_info()})
+                if ws and time.perf_counter() - t0 >= ws:
+                    stopped_early = "wall clock"
+                    break
         if self.rolling_block and self.on_block is not None and len(self._archive) > len(self._block_seen):
             self._roll(population, raw, n_gen)          # the final, unrolled block still gets scored
         report = self._commit()
-        report.generations = n_gen
+        report.generations = done_gen
+        report.stopped_early = stopped_early
         report.evaluated = self.evaluated
         report.archive_size = len(self._archive)
         report.best_fitness = best

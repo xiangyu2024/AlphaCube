@@ -239,13 +239,22 @@ class ExemplarCache:
         return f"exemplar 缓存 {n} 条 / {gb:.1f} GB(命中 {self.hits},未命中 {self.misses})"
 
 
-def view_cache_key(view, sample_days: int, sample_symbols: int) -> str:
-    """指纹取决于这些东西,任何一个变了,缓存就作废。"""
+def view_cache_key(view, sample_days: int, sample_symbols: int, daily: Optional[str] = None) -> str:
+    """指纹取决于这些东西,任何一个变了,缓存就作废。
+
+    ``daily``(WP7):调用方算好的日频数据指纹(``dailyfields.fingerprint(view.
+    store.daily)``,None 表示没挂日频数据)—— 这个函数本身不碰 store,保持
+    "按 symbol/date 标签列表就能测"。只有不是 None 才拼进去,所以不带日频数据
+    的调用(今天所有调用点)哈希字节不变;两个不同的日频根目录各有自己的
+    meta_sha256,指纹不同,这里就是两个不同的键,ExemplarCache 也就是两个
+    不同的目录 —— 日频数据重建后旧的秩指纹不会被错误地当成仍然有效。"""
     import hashlib
 
     dates = [str(x) for x in view.dates]
     raw = "|".join([dates[0], dates[-1], str(len(dates)), str(view.n_symbols),
                     str(int(sample_days)), str(int(sample_symbols))])
+    if daily is not None:
+        raw += "|" + daily
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
