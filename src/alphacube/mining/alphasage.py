@@ -133,8 +133,14 @@ class Trajectory:
 
 
 class GFlowNetSampler:
-    def __init__(self, vocabulary: Vocabulary, encoder: RGCNEncoder, policy: ForwardPolicy, max_len: int = 20) -> None:
+    def __init__(self, vocabulary: Vocabulary, encoder: RGCNEncoder, policy: ForwardPolicy, max_len: int = 20,
+                 logit_bias: Optional[torch.Tensor] = None) -> None:
         self.vocabulary, self.encoder, self.policy, self.max_len = vocabulary, encoder, policy, max_len
+        # TokenMiner.logit_bias: added to the forward policy's raw logits BEFORE the
+        # grammar mask, so weight 0 is an effective mask once softmax runs. log_pf is
+        # then taken from the SAME biased distribution the action came from, which is
+        # what keeps the trajectory-balance loss self-consistent.
+        self.logit_bias = logit_bias
 
     def sample(self, greedy: bool = False) -> Trajectory:
         b = ExpressionBuilder(self.vocabulary)
@@ -148,7 +154,10 @@ class GFlowNetSampler:
             if not valid:
                 break
             mask[valid] = True
-            logits = self.policy(state).masked_fill(~mask, -1e9)
+            raw = self.policy(state)
+            if self.logit_bias is not None:
+                raw = raw + self.logit_bias
+            logits = raw.masked_fill(~mask, -1e9)
             dist = Categorical(logits=logits)
             action = torch.argmax(logits) if greedy else dist.sample()
             log_pf = log_pf + dist.log_prob(action)
@@ -169,8 +178,8 @@ class TrajectoryBalanceLoss(nn.Module):
 class AlphaSAGEMiner(TokenMiner):
     def __init__(self, vocabulary: Vocabulary, rewarder: BatchRewarder, max_expr_len: int = 20,
                  hidden_dim: int = 64, trajectories_per_update: int = 8, lr: float = 1e-3,
-                 reward_eps: float = 1e-3, seed: int = 0) -> None:
-        super().__init__(vocabulary, rewarder, max_expr_len)
+                 reward_eps: float = 1e-3, seed: int = 0, logit_bias=None) -> None:
+        super().__init__(vocabulary, rewarder, max_expr_len, logit_bias=logit_bias)
         if not rewarder.with_novelty:
             rewarder.with_novelty = True
         self.trajectories_per_update, self.reward_eps = int(trajectories_per_update), float(reward_eps)
@@ -178,7 +187,8 @@ class AlphaSAGEMiner(TokenMiner):
         self.encoder = RGCNEncoder(vocabulary.size, hidden_dim)
         self.policy = ForwardPolicy(hidden_dim, vocabulary.size, sep_index=vocabulary.sep_index)
         self.tb = TrajectoryBalanceLoss()
-        self.sampler = GFlowNetSampler(vocabulary, self.encoder, self.policy, max_expr_len)
+        self.sampler = GFlowNetSampler(vocabulary, self.encoder, self.policy, max_expr_len,
+                                       logit_bias=self.logit_bias)
         self.optimizer = torch.optim.Adam(list(self.encoder.parameters()) + list(self.policy.parameters())
                                           + list(self.tb.parameters()), lr=lr)
 

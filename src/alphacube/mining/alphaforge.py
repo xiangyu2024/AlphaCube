@@ -50,8 +50,12 @@ class DecodedSample:
 
 
 class Masker:
-    def __init__(self, vocabulary: Vocabulary, embedding: nn.Embedding) -> None:
+    def __init__(self, vocabulary: Vocabulary, embedding: nn.Embedding,
+                 logit_bias: Optional[torch.Tensor] = None) -> None:
         self.vocabulary, self.embedding = vocabulary, embedding
+        # TokenMiner.logit_bias: added to the Generator's raw per-position logits
+        # BEFORE the grammar mask, so weight 0 is an effective mask once softmax runs.
+        self.logit_bias = logit_bias
 
     def decode(self, raw_logits: torch.Tensor, sample: bool = False) -> DecodedSample:
         v = self.vocabulary
@@ -66,7 +70,8 @@ class Masker:
             if not valid:
                 break
             mask[valid] = True
-            masked = raw_logits[pos].masked_fill(~mask, -1e9)
+            raw = raw_logits[pos] if self.logit_bias is None else raw_logits[pos] + self.logit_bias
+            masked = raw.masked_fill(~mask, -1e9)
             probs = F.softmax(masked, dim=-1)
             idx = int(torch.multinomial(probs, 1).item()) if sample else int(torch.argmax(masked).item())
             hard = F.one_hot(torch.tensor(idx), v.size).float()
@@ -105,14 +110,15 @@ def diversity_penalty(batch_position_probs: List[List[torch.Tensor]]) -> torch.T
 class AlphaForgeMiner(TokenMiner):
     def __init__(self, vocabulary: Vocabulary, rewarder: BatchRewarder, max_expr_len: int = 20,
                  latent_dim: int = 16, batch_size: int = 16, diversity_coef: float = 0.05,
-                 gen_lr: float = 1e-3, pred_lr: float = 1e-3, sample: bool = False, seed: int = 0) -> None:
-        super().__init__(vocabulary, rewarder, max_expr_len)
+                 gen_lr: float = 1e-3, pred_lr: float = 1e-3, sample: bool = False, seed: int = 0,
+                 logit_bias=None) -> None:
+        super().__init__(vocabulary, rewarder, max_expr_len, logit_bias=logit_bias)
         self.latent_dim, self.batch_size, self.diversity_coef = int(latent_dim), int(batch_size), float(diversity_coef)
         self.sample = bool(sample)
         torch.manual_seed(seed)
         self.generator = Generator(latent_dim, vocabulary.size, max_expr_len, sep_index=vocabulary.sep_index)
         self.predictor = Predictor(vocabulary.size)
-        self.masker = Masker(vocabulary, self.predictor.embedding)
+        self.masker = Masker(vocabulary, self.predictor.embedding, logit_bias=self.logit_bias)
         self.gen_optimizer = torch.optim.Adam(self.generator.parameters(), lr=gen_lr)
         self.pred_optimizer = torch.optim.Adam(self.predictor.parameters(), lr=pred_lr)
 

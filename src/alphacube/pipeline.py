@@ -257,6 +257,21 @@ def run_mining(
         say(f"universe {universe}: {view.n_symbols} symbols ever in, {member.sum(1).mean():.0f} a day on average")
     say(f"store {getattr(store, 'directory', store)}: {view.dates[0]}..{view.dates[-1]} {view.n_days} days x "
         f"{view.n_symbols} symbols (warm-up {trim}); label {lab.describe()}; tradable {view.tradable().mean():.1%}")
+    # The steer config's daily fields and this run's --daily-fields root are set by
+    # different people at different times, so "the hook asks for a field this run has
+    # no source for" is the normal mismatch, not an exotic one -- and it used to cost
+    # one evaluated candidate per tree that drew such a leaf, in total silence (GP
+    # evaluates tolerant=True; the RL rewarder likewise returns no panel). Named here
+    # once for BOTH branches and recorded in meta.json, so an arm that quietly burnt
+    # budget can be told from a steered one afterwards. See mining.gp.
+    # unresolvable_daily_fields for the measurement and for why this is not a raise.
+    from .mining.gp import unresolvable_daily_fields
+    unresolvable_daily = unresolvable_daily_fields((gp_params or {}).get("hooks"), view)
+    if unresolvable_daily:
+        say(f"!! search hooks name {len(unresolvable_daily)} daily field(s) this view cannot resolve: "
+            f"{', '.join(unresolvable_daily)}; resolvable here: {', '.join(view.daily_fields) or '(none)'}. "
+            f"Every candidate carrying one is dropped unevaluated -- attach the daily store it needs "
+            f"(--daily-fields), or take the field out of the hooks.")
     reg = default_registry()
     pool_obj = build_pool(pool, pool_capacity, target, realized, dedup, min_coverage, meanstd_lr, meanstd_steps,
                           dynamic_window, min_scored_days=min_scored_days)
@@ -395,13 +410,29 @@ def run_mining(
     else:
         if miner not in MINERS:
             raise ValueError(f"unknown miner {miner!r}; choose from {MINERS}")
-        vocab = Vocabulary(reg, n_minutes=view.n_minutes, allow_boolean_ops=allow_boolean_ops,
-                           allow_resource_risk=allow_resource_risk)
         # RL 和 GP 用同一个目标函数和同一套封禁 —— CLI 上的 --fitness /
         # --turnover-penalty / --ban / --ban-rank-corr / --ban-archive 走的是同一个
         # gp_params。以前 RL 的奖励是 Pearson 池 IC,和 gpu10 起 GP 用的
         # |rank IC| - 0.14 x 换手 不是一个东西,两条线挖出来的没法比。
         cfg = dict(gp_params or {})
+        # 读在建词表之前:同一份 hooks 既要给 BatchRewarder 的 accept,也要决定词表里
+        # 有没有日频叶子、以及策略 logit 的偏置 —— 这两样以前都接不上(词表只收
+        # n_minutes/两个开关,miner 只收 rl_params),所以同一个 steer 配置指到 GP 臂
+        # 是被指引的、指到 RL 臂是没被指引的,而 stdout 和 meta.json 都看不出区别。
+        hooks = cfg.get("hooks")
+        # daily_fields 原样传,不和 view.daily_fields 取交集:两条臂得搜同一套语法
+        # (GP 臂就是照 hooks 原样建的),这个视图解析不了的已经在上面 say() 点名了。
+        # 但名字本身要校验 —— GP 这条路由 TypedTreeGenerator 构造时把关,RL 这条路不
+        # 建生成器,Vocabulary 又会给任何字符串发一个 DailyFeatureToken(连 parser 自己
+        # 都不认的名字),所以在这里补上同一个检查。
+        daily_tokens = tuple(hooks.daily_fields) if hooks is not None else ()
+        if hooks is not None:
+            from .mining.generator import check_daily_field_names
+            check_daily_field_names(daily_tokens, hooks.leaf_slots, reg)
+        vocab = Vocabulary(reg, n_minutes=view.n_minutes, allow_boolean_ops=allow_boolean_ops,
+                           allow_resource_risk=allow_resource_risk, daily_fields=daily_tokens)
+        if daily_tokens:
+            say(f"RL action space: + {len(daily_tokens)} daily-feature token(s) ({', '.join(daily_tokens)})")
         kind = str(cfg.get("fitness_kind", "ic"))
         penalty = float(cfg.get("turnover_penalty", 0.0))
         scorer = None
@@ -424,7 +455,6 @@ def run_mining(
             from .mining.gp import check_ban_key
             for key in banned_substructures:
                 check_ban_key(key, reg, reg.fields)
-        hooks = cfg.get("hooks")
         rew = BatchRewarder(engine, pool_obj, scorer=scorer, rank_ban=rank_ban, min_solo=cfg.get("rl_min_solo"),
                             banned_substructures=banned_substructures,
                             accept=(hooks.accept if hooks is not None else None),
@@ -451,7 +481,19 @@ def run_mining(
             say(f"rank-ban exemplars: {n} 个(来自 {len(cfg['ban_exemplars'])} 条表达式)")
         cls = {"alphagen": AlphaGenMiner, "alphaqcm": AlphaQCMMiner, "alphaforge": AlphaForgeMiner,
                "alphasage": AlphaSAGEMiner, "warmstart": PPOWarmStartQCMMiner}[miner]
-        m = cls(vocab, rew, max_expr_len=max_expr_len, seed=seed, **(rl_params or {}))
+        # 同一个 op_weight 两边都用:GP 这边进 TypedTreeGenerator 的 _pick_weighted,
+        # RL 这边折成每个 OperatorToken 一个 log(max(w, tiny)) 的 logit 偏置,在
+        # action_mask 之前加到策略分数上,所以权重 0 在两边都等于"抽不到"。以前
+        # operator_logit_bias 这个函数全树没有一个调用者。
+        extra = {}
+        if hooks is not None and hooks.op_weight is not None:
+            from .mining.tokens import operator_logit_bias
+            bias = operator_logit_bias(vocab, hooks.op_weight)
+            extra["logit_bias"] = bias
+            n_down, n_up = int((bias < 0).sum()), int((bias > 0).sum())
+            say(f"RL op_weight -> logit bias: {n_down} of {len(vocab.operators)} operators down-weighted, "
+                f"{n_up} up" + (f"; lowest {float(bias.min()):+.2f}" if n_down else ""))
+        m = cls(vocab, rew, max_expr_len=max_expr_len, seed=seed, **extra, **(rl_params or {}))
         rep = m.mine(budget, on_progress=progress)
         added, evaluated, engine_s = rep.added, rep.evaluated, rep.engine_seconds
         summary = f"{rep.episodes} episodes, {rep.completed} completed expressions, best reward {rep.best_reward:+.4f}"
@@ -526,6 +568,7 @@ def run_mining(
             "start": start, "end": end, "dates": view.dates[trim:],
             "symbols": view.symbols, "label": lab.describe(), "miner": miner, "pool": pool, "budget": budget,
             "seed": seed, "pool_metrics": {k: float(v) for k, v in ens.items()}, "rejected": dict(rejected),
+            "unresolvable_daily_fields": list(unresolvable_daily),
             "seconds": round(time.time() - t0, 1), "engine_seconds": round(engine_s, 1),
         }, ensure_ascii=False, indent=2), encoding="utf-8")
         say(f"wrote {run_dir}")

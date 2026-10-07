@@ -31,8 +31,8 @@ class WarmStartStats:
 class PPOWarmStartQCMMiner(TokenMiner):
     def __init__(self, vocabulary: Vocabulary, rewarder: BatchRewarder, max_expr_len: int = 20,
                  ppo_fraction: float = 0.4, ppo_kwargs: Optional[Dict[str, Any]] = None,
-                 qcm_kwargs: Optional[Dict[str, Any]] = None, seed: int = 0) -> None:
-        super().__init__(vocabulary, rewarder, max_expr_len)
+                 qcm_kwargs: Optional[Dict[str, Any]] = None, seed: int = 0, logit_bias=None) -> None:
+        super().__init__(vocabulary, rewarder, max_expr_len, logit_bias=logit_bias)
         if not (0.0 < ppo_fraction < 1.0):
             raise ValueError(f"ppo_fraction must be in (0, 1), got {ppo_fraction}")
         self.ppo_fraction = float(ppo_fraction)
@@ -45,11 +45,15 @@ class PPOWarmStartQCMMiner(TokenMiner):
             raise ValueError("budget must be >= 2")
         ppo_budget = max(1, min(budget - 1, round(budget * self.ppo_fraction)))
         qcm_budget = budget - ppo_budget
+        # logit_bias forwarded to BOTH halves: the replay buffer the PPO half fills is
+        # what the QCM half bootstraps from, so a bias on one and not the other would
+        # train the second stage on actions its own policy can never take.
         ppo = AlphaGenMiner(self.vocabulary, self.rewarder, self.max_expr_len, record_transitions=True,
-                            seed=self.seed, **self.ppo_kwargs)
+                            seed=self.seed, logit_bias=self.logit_bias, **self.ppo_kwargs)
         ppo_rep = ppo.mine(ppo_budget, None if on_progress is None else
                            (lambda n, b, info: on_progress(n, budget, {**info, "stage": "ppo"})))
-        qcm = AlphaQCMMiner(self.vocabulary, self.rewarder, self.max_expr_len, seed=self.seed, **self.qcm_kwargs)
+        qcm = AlphaQCMMiner(self.vocabulary, self.rewarder, self.max_expr_len, seed=self.seed,
+                            logit_bias=self.logit_bias, **self.qcm_kwargs)
         for t in ppo.recorded:
             qcm.buffer.push(t)
         qcm_rep = qcm.mine(qcm_budget, None if on_progress is None else

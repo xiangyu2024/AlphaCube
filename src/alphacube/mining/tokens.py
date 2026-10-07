@@ -176,6 +176,14 @@ def operator_logit_bias(vocab: Vocabulary, op_weight: Optional[Callable[[OpSpec]
     bias = np.zeros(vocab.size, dtype=np.float64)
     if op_weight is None:
         return bias
+    if not callable(op_weight):
+        # The same ``{name: weight}`` mapping shape the GP side accepts, run through
+        # the same resolver -- so the unknown-operator check and the ND/NT twin
+        # inheritance apply identically on both sides, which is the whole of "one
+        # shared op_weight steers both searches". Lazy import: ``generator`` does not
+        # import ``tokens``, and this keeps that one-directional.
+        from .generator import _resolve_op_weight
+        op_weight = _resolve_op_weight(op_weight, vocab.registry)
     for spec in vocab.operators:
         w = float(op_weight(spec))
         if not math.isfinite(w):

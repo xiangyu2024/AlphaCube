@@ -135,6 +135,45 @@ def _hook_seed(seed: int, rng: random.Random):
         return (int(seed) * 2654435761) & 0xFFFFFFFF
 
 
+def nd_twin_base(spec: OpSpec) -> Optional[str]:
+    """The ND-face operator name an NT-face ``spec`` is the twin OF, or ``None``.
+
+    ``catalog.build_registry`` registers every ``mode="nd"`` kernel TWICE out of
+    one ``fn`` -- on the ND face under its own name, on the NT face under
+    ``nt_<name>`` (catalog.py:479-481; 48 pairs today). Both ``op_weight``'s
+    mapping form and ``leaf_slots`` key on ``spec.name``, so a caller naming only
+    the ND half used to steer only half the kernel, and the half it missed stayed
+    fully live. Measured over 400 seeds x ``generate_population(25)``:
+    ``op_weight={"cs_mean": 0.0}`` took ``cs_mean`` 148 -> 0 while ``nt_cs_mean``
+    sat unmoved at 17 -> 17; the NT face as a whole drew slightly more (637 ->
+    667), because the trees the ND half would have carried get retried elsewhere.
+    ``leaf_slots={"cs_regres": {1: ("FloatCap",)}}`` likewise left
+    ``nt_cs_regres``'s slot 1 unfilled (1 tree in 40 seeds; 0 once both keys are
+    written).
+
+    Not a redistribution onto the twin, though it looks like one at small n: the
+    branch-verification report read 41 -> 0 against 5 -> **9** at 120 seeds as the
+    ND half's mass being handed over, but ``_pick_weighted`` takes a face's mass as
+    the MEAN weight of the operators that SURVIVE in it, so dropping a weight-0
+    operator leaves that face's own probability where it was, and the 5 -> 9 is
+    inside the noise (17 -> 17 at 400 seeds). The defect is the missed half, not a
+    transfer.
+
+    So the twin INHERITS the ND name's entry, unless the caller gives
+    ``nt_<name>`` an entry of its own -- which stays the way to treat the two
+    faces differently on purpose. ``_resolve_op_weight`` raises on an operator
+    name that is not in the registry, but "named only one of the two faces" is
+    not a typo and raised nothing.
+
+    Guarded on ``spec.face``, not on the ``nt_`` prefix alone: a kernel literally
+    named ``nt_x`` registers ``nt_x`` on the ND face and ``nt_nt_x`` on the NT
+    face, and the ND-face ``nt_x`` must not inherit from a key ``"x"``.
+    """
+    if spec.face != "nt" or not spec.name.startswith("nt_"):
+        return None
+    return spec.name[3:]
+
+
 def _resolve_op_weight(op_weight, registry: Registry):
     """``op_weight`` is always called as ``self.op_weight(spec) -> float`` (see
     ``_pick_weighted``); this accepts that callable directly, or the more common,
@@ -142,7 +181,15 @@ def _resolve_op_weight(op_weight, registry: Registry):
     latter into exactly such a callable. A mapping's keys are checked against the registry
     up front (a typo'd name would otherwise sit silently inert, never matched
     against any real ``OpSpec``) and an operator the mapping does not mention
-    defaults to weight 1.0, the uniform baseline."""
+    defaults to weight 1.0, the uniform baseline.
+
+    Matching is by ``spec.name``, and an nd-face kernel carries TWO names (``X``
+    on the ND face, ``nt_X`` on the NT face), so ``{"X": w}`` also sets ``nt_X``
+    -- see :func:`nd_twin_base` for the measurement that forced that and for how
+    to weight the two faces apart (give ``nt_X`` its own entry; an explicit entry
+    always wins). A CALLABLE ``op_weight`` is handed through untouched and is the
+    caller's own business: it sees every spec, both faces, and must match them
+    itself."""
     if op_weight is None or callable(op_weight):
         return op_weight
     try:
@@ -153,7 +200,56 @@ def _resolve_op_weight(op_weight, registry: Registry):
         if name not in registry:
             raise ValueError(f"op_weight names an unknown operator: {name!r}")
         _check_weight(name, w)
-    return lambda s, _table=table: _table.get(s.name, 1.0)
+
+    def weight_of(spec: OpSpec, _table=table) -> float:
+        if spec.name in _table:
+            return _table[spec.name]
+        twin = nd_twin_base(spec)
+        if twin is not None and twin in _table:
+            return _table[twin]
+        return 1.0
+
+    return weight_of
+
+
+def check_daily_field_names(daily_fields, leaf_slots, registry: Registry) -> None:
+    """Every name that ``daily_fields`` / ``leaf_slots`` can put into a
+    ``DailyFeature`` leaf must be one the registry's daily namespace knows,
+    checked at CONSTRUCTION time -- exactly as symmetrically as
+    ``_resolve_op_weight`` checks a mapping's operator names, and for the same
+    reason.
+
+    Nothing downstream catches a typo on its own. ``DailyFeature._infer_shape``
+    looks at the node TYPE, not the field name, so a misspelt leaf sails through
+    the shape system and ``is_valid_root``; ``dailyfields.resolve`` only raises at
+    EVALUATION time; and ``GPMiner._panels`` evaluates with ``tolerant=True``
+    (gp.py:421), which files that exception under ``res.errors``, returns a
+    ``None`` panel and scores the tree ``-inf``. So ``daily_fields=("FlotCap",)``
+    -- one letter -- used to cost every candidate that drew a daily leaf, with no
+    error anywhere: measured, 34 of 40 trees at ``daily_leaf_prob=1.0``.
+
+    The available set is ``registry.daily_fields`` (the generator only ever holds
+    a registry, never a view), i.e. the names that are PARSEABLE. Whether this
+    particular run can actually resolve one is a separate, view-time question --
+    see ``mining.gp.unresolvable_daily_fields`` and ``CubeView.daily_fields``.
+
+    Public because the RL branch needs the same check and never builds a
+    generator: ``pipeline.run_mining`` calls it on ``hooks`` before handing the
+    names to ``Vocabulary(daily_fields=...)``, which would otherwise mint a
+    ``DailyFeatureToken`` for a name the parser itself rejects.
+    """
+    known = set(registry.daily_fields)
+    unknown = {f for f in daily_fields if f not in known}
+    for slots in (leaf_slots or {}).values():
+        for fields in slots.values():
+            unknown.update(f for f in fields if f not in known)
+    if unknown:
+        raise ValueError(
+            f"daily_fields / leaf_slots name {len(unknown)} unknown daily field(s): "
+            f"{', '.join(repr(f) for f in sorted(unknown))}; this registry's daily namespace is "
+            f"{tuple(registry.daily_fields)}. A name that is legal here still needs DATA before it "
+            f"evaluates: attach a daily store (--daily-fields / daily_root) and check it against "
+            f"view.daily_fields or dailyfields.available(store.daily).")
 
 
 class TypedTreeGenerator:
@@ -215,7 +311,13 @@ class TypedTreeGenerator:
             _check_accept_hook(accept)
         self.daily_fields = list(daily_fields)
         self.daily_leaf_prob = float(daily_leaf_prob)
+        # Kept as the very object passed in, never a copy: a plugin that mutates its
+        # slot table between blocks must be steering the live one (pinned by
+        # tests/test_plugin_hooks.py::test_search_hooks_leaf_slots_reach_the_
+        # generator_via_gpminer's `is` assertion), so the ND/NT twin fallback is
+        # done at LOOKUP time in _slots_for, not by rewriting the mapping here.
         self.leaf_slots = leaf_slots
+        check_daily_field_names(self.daily_fields, leaf_slots, registry)
         self.on_exhausted = on_exhausted
         self.mutation_checks_bans = bool(mutation_checks_bans)
         self.unaccepted_fallbacks = 0
@@ -561,6 +663,26 @@ class TypedTreeGenerator:
             return ("daily",) * n
         return ("collapsed",) * n
 
+    def _slots_for(self, spec: OpSpec) -> Optional[Mapping[int, Sequence[str]]]:
+        """``leaf_slots`` for this operator, read LIVE off the caller's own mapping,
+        with an NT-face twin inheriting the ND name's slots unless it carries an
+        entry of its own -- the same ND/NT-registered-twice story, and the same
+        precedence rule, as :func:`nd_twin_base` describes for ``op_weight``.
+
+        An entry of its own includes an EMPTY one: ``{"nt_cs_regres": {}}`` is how a
+        caller says "the ND name's slot policy does not apply to the NT face", and
+        leaves that twin's operands to the normal recursive build. Worth knowing
+        because an NT-face operand must carry genuine per-minute variation, so a
+        daily leaf in one raises ``ShapeError`` and ``_gen`` retries -- inheriting
+        the slot therefore thins the twin out of the population rather than filling
+        anything, which is exactly what writing both keys by hand already did."""
+        slots = self.leaf_slots.get(spec.name)
+        if slots is None:
+            twin = nd_twin_base(spec)
+            if twin is not None:
+                slots = self.leaf_slots.get(twin)
+        return slots
+
     def _build(self, spec: OpSpec, req: str, depth: int, full: bool) -> Expression:
         reqs = self._operand_reqs(spec, req)
         operands = []
@@ -571,7 +693,7 @@ class TypedTreeGenerator:
         # "daily" requirement in BOTH slots, so without this a search cannot know
         # which operand is e.g. a bucketing kernel's own conditioning variable. Off by
         # default (self.leaf_slots empty/None) -- no draw added.
-        slots = self.leaf_slots.get(spec.name) if self.leaf_slots else None
+        slots = self._slots_for(spec) if self.leaf_slots else None
         for i, r in enumerate(reqs):
             if i == const_slot:
                 operands.append(Constant(self._rng.choice(self.constants)))
@@ -582,4 +704,5 @@ class TypedTreeGenerator:
         return make_node(spec, tuple(operands), self._window_for(spec))
 
 
-__all__ = ["TypedTreeGenerator", "shape_req", "collect", "REQS", "GenerationExhausted"]
+__all__ = ["TypedTreeGenerator", "shape_req", "collect", "REQS", "GenerationExhausted", "nd_twin_base",
+           "check_daily_field_names"]

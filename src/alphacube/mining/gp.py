@@ -26,6 +26,7 @@ import math
 import os
 import random
 import time
+import warnings
 from contextlib import contextmanager
 from pathlib import Path
 from collections import OrderedDict
@@ -165,6 +166,44 @@ def check_ban_key(key: str, registry: Registry, fields: Sequence[str]) -> None:
             raise ValueError(f"ban key {key!r}: operand {a!r} is not a leaf (F:<field> or C:<value>)")
 
 
+def unresolvable_daily_fields(hooks, view: CubeView) -> Tuple[str, ...]:
+    """Daily field names ``hooks`` asks the search to put in a leaf that THIS view
+    cannot resolve: ``hooks.daily_fields`` plus every field named in a
+    ``hooks.leaf_slots`` slot, minus ``view.daily_fields``. ``()`` for
+    ``hooks=None``.
+
+    ``TypedTreeGenerator`` already rejects a name outside the registry's daily
+    namespace at construction time, but "a legal name" and "a name this run has
+    data for" are two different questions -- and the second is the one a steer arm
+    gets wrong, because the hook and the ``--daily-fields`` root are set by
+    different people at different times. With no root attached a view resolves only
+    the three DERIVED fields, so ``daily_fields=("FloatCap",)`` builds trees
+    ``dailyfields.resolve`` refuses -- and ``GPMiner._panels`` evaluates with
+    ``tolerant=True``, which files that refusal under ``res.errors``, hands back a
+    ``None`` panel, scores the tree ``-inf`` and drops it. The run exits 0, the
+    archive is non-empty and carries no such expression, and nothing anywhere names
+    the field. Measured through the library at ``daily_leaf_prob=0.35``: 5 of 70
+    evaluated candidates (7%) spent on trees that cannot be evaluated at all, the
+    share rising with ``daily_leaf_prob``.
+
+    Reported, not raised: WP2's design note -- and ``tests/test_plugin_hooks.py::
+    test_search_hooks_daily_fields_reach_the_generator_via_gpminer`` -- make "a
+    daily leaf is generatable (if not evaluatable) without a daily store attached"
+    deliberate, so the fix is to name the fields, not to refuse the run.
+    ``GPMiner`` warns and keeps the list on ``self.unresolvable_daily_fields``;
+    ``pipeline.run_mining`` ``say()``s it for the GP and the RL branch alike and
+    writes it into ``meta.json``, so an archived arm can be told apart from a
+    steered one afterwards.
+    """
+    if hooks is None:
+        return ()
+    want = set(getattr(hooks, "daily_fields", None) or ())
+    for slots in (getattr(hooks, "leaf_slots", None) or {}).values():
+        for fields in slots.values():
+            want.update(fields)
+    return tuple(sorted(want - set(view.daily_fields)))
+
+
 class GPMiner:
     def __init__(self, registry: Registry, view: CubeView, target: np.ndarray, pool: LinearPool,
                  population_size: int = 24, tournament_size: int = 3, crossover_rate: float = 0.7,
@@ -263,6 +302,20 @@ class GPMiner:
                                             daily_fields=hooks.daily_fields if hooks is not None else (),
                                             daily_leaf_prob=hooks.daily_leaf_prob if hooks is not None else 0.0,
                                             leaf_slots=hooks.leaf_slots if hooks is not None else None)
+        # A daily field the generator may legally NAME but this view cannot RESOLVE
+        # costs one evaluated candidate per tree that draws it, and -- because
+        # _panels evaluates tolerant=True -- costs it in total silence. See
+        # unresolvable_daily_fields for the measurement and for why this names the
+        # fields instead of refusing the run.
+        self.unresolvable_daily_fields = unresolvable_daily_fields(hooks, view)
+        if self.unresolvable_daily_fields:
+            warnings.warn(
+                f"search hooks name {len(self.unresolvable_daily_fields)} daily field(s) this view "
+                f"cannot resolve: {', '.join(self.unresolvable_daily_fields)}; resolvable here: "
+                f"{', '.join(view.daily_fields) or '(none)'}. Every candidate carrying one evaluates "
+                f"to nothing and is dropped -- attach the daily store it needs (daily_root / "
+                f"--daily-fields), or take the field out of the hooks.",
+                RuntimeWarning, stacklevel=2)
         # Structures banned from the first generation on -- e.g. what an earlier run's
         # rolling blocks already exhausted -- on top of whatever this run bans itself.
         # A key that names nothing would ban nothing, silently, so each is checked.
@@ -948,4 +1001,4 @@ class GPMiner:
         return path
 
 
-__all__ = ["GPMiner", "MiningReport"]
+__all__ = ["GPMiner", "MiningReport", "check_ban_key", "unresolvable_daily_fields"]

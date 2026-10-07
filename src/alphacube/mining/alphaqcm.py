@@ -101,8 +101,8 @@ class AlphaQCMMiner(TokenMiner):
                  uncertainty_lambda: float = 0.1, tail_alpha: float = 0.75, gamma: float = 0.99, lr: float = 1e-3,
                  batch_size: int = 32, buffer_capacity: int = 4000, target_update_every: int = 5,
                  min_buffer_before_update: int = 32, epsilon_start: float = 0.3, epsilon_end: float = 0.05,
-                 seed: int = 0) -> None:
-        super().__init__(vocabulary, rewarder, max_expr_len)
+                 seed: int = 0, logit_bias=None) -> None:
+        super().__init__(vocabulary, rewarder, max_expr_len, logit_bias=logit_bias)
         self.episodes_per_batch = int(episodes_per_batch)
         self.n_tau, self.n_tau_prime = int(n_tau), int(n_tau_prime)
         self.uncertainty_lambda, self.tail_alpha, self.gamma = float(uncertainty_lambda), float(tail_alpha), float(gamma)
@@ -122,11 +122,30 @@ class AlphaQCMMiner(TokenMiner):
         if len(valid) == 0:
             return 0
         if self._rng.random() < epsilon:
-            return int(self._rng.choice(valid))
+            if self.logit_bias is None:
+                return int(self._rng.choice(valid))
+            # The exploration branch has to respect the steering too, or a weight-0
+            # operator the greedy branch below masks out walks straight back in at
+            # rate epsilon/|valid| (epsilon starts at 0.3 -- not a rounding error).
+            # exp(bias) IS the operator's own weight, so this is the one draw that
+            # keeps "weight 0 means never" true for a value-based miner. Only ever
+            # taken when a bias exists, so the unbiased stream is untouched.
+            w = [math.exp(float(self.logit_bias[i])) for i in valid]
+            if not sum(w) > 0.0:                        # every weight underflowed to 0.0
+                return int(self._rng.choice(valid))
+            return int(self._rng.choices([int(i) for i in valid], weights=w, k=1)[0])
         with torch.no_grad():
             q, var = self.online_net.tail_mean_and_uncertainty(torch.from_numpy(state).unsqueeze(0),
                                                                torch.tensor([length]), self.tail_alpha, self.n_tau)
-            scores = (q + self.uncertainty_lambda * var.clamp(min=0).sqrt()).squeeze(0)
+            # QCM scores actions by value, not by logit, so log(w) is not in this
+            # branch's own currency: at w=0 it is log(1e-9) = -20.7 against a reward
+            # whose scale is |rank IC|, i.e. an effective mask (which is the property
+            # the design asks for), while an intermediate weight is a penalty whose
+            # strength depends on that scale rather than a clean "half as likely".
+            # The probabilistic reading of op_weight lives in the epsilon branch
+            # above and in the three softmax miners; here, treat anything between 0
+            # and 1 as "discouraged", not as a calibrated multiplier.
+            scores = self.biased((q + self.uncertainty_lambda * var.clamp(min=0).sqrt()).squeeze(0))
             scores = scores.masked_fill(~torch.from_numpy(mask), -1e9)
             return int(torch.argmax(scores).item())
 
@@ -197,7 +216,12 @@ class AlphaQCMMiner(TokenMiner):
         pred = self.online_net(states, lengths, taus).gather(2, actions.view(B, 1, 1).expand(B, self.n_tau, 1)).squeeze(-1)
         with torch.no_grad():
             tq, tv = self.target_net.tail_mean_and_uncertainty(next_states, next_lengths, self.tail_alpha, self.n_tau)
-            scores = (tq + self.uncertainty_lambda * tv.clamp(min=0).sqrt()).masked_fill(~next_masks, -1e9)
+            # Biased like _select_action's greedy branch, and for the same reason: an
+            # operator the behaviour policy can never take has an untrained Q, so
+            # bootstrapping the target THROUGH it would feed that noise back into
+            # every state upstream of it. Broadcasts (vocab,) over the batch.
+            scores = self.biased(tq + self.uncertainty_lambda * tv.clamp(min=0).sqrt()).masked_fill(
+                ~next_masks, -1e9)
             best = scores.argmax(dim=1)
             taus_next = torch.rand(B, self.n_tau_prime)
             tgt_q = self.target_net(next_states, next_lengths, taus_next).gather(

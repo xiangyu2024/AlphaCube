@@ -40,7 +40,8 @@ class TokenLSTMEncoder(nn.Module):
 
 class ActorCritic(nn.Module):
     def __init__(self, vocab_size: int, embed_dim: int = 32, hidden_dim: int = 128, num_layers: int = 2,
-                 sep_index: Optional[int] = None, sep_bias: float = 4.0) -> None:
+                 sep_index: Optional[int] = None, sep_bias: float = 4.0,
+                 logit_bias: Optional[torch.Tensor] = None) -> None:
         super().__init__()
         self.encoder = TokenLSTMEncoder(vocab_size, embed_dim, hidden_dim, num_layers)
         self.actor = nn.Linear(hidden_dim, vocab_size)
@@ -50,10 +51,19 @@ class ActorCritic(nn.Module):
             # bootstrap the sparse pool reward (a practical addition, not PPO).
             with torch.no_grad():
                 self.actor.bias[sep_index] = sep_bias
+        # Steering bias (TokenMiner.logit_bias), a buffer rather than a plain
+        # attribute so .to(device) / state_dict carry it with the rest of the policy.
+        # It lives HERE, not in the miner, because forward() is the single place both
+        # rollout (act) and the PPO update read logits -- biasing one and not the
+        # other would make the ratio in the clipped objective wrong.
+        self.register_buffer("logit_bias", None if logit_bias is None else logit_bias.detach().clone())
 
     def forward(self, tokens, lengths, mask):
         feat = self.encoder(tokens, lengths)
-        logits = self.actor(feat).masked_fill(~mask, -1e9)
+        raw = self.actor(feat)
+        if self.logit_bias is not None:
+            raw = raw + self.logit_bias                 # BEFORE the mask: weight 0 -> an effective mask
+        logits = raw.masked_fill(~mask, -1e9)
         return logits, self.critic(feat).squeeze(-1)
 
     def act(self, tokens, lengths, mask):
@@ -115,13 +125,14 @@ class AlphaGenMiner(TokenMiner):
     def __init__(self, vocabulary: Vocabulary, rewarder: BatchRewarder, max_expr_len: int = 20,
                  episodes_per_update: int = 8, ppo_epochs: int = 4, clip_eps: float = 0.2, gamma: float = 1.0,
                  gae_lambda: float = 0.95, entropy_coef: float = 0.01, value_coef: float = 0.5, lr: float = 3e-4,
-                 record_transitions: bool = False, seed: int = 0) -> None:
-        super().__init__(vocabulary, rewarder, max_expr_len)
+                 record_transitions: bool = False, seed: int = 0, logit_bias=None) -> None:
+        super().__init__(vocabulary, rewarder, max_expr_len, logit_bias=logit_bias)
         self.episodes_per_update = int(episodes_per_update)
         self.ppo_epochs, self.clip_eps, self.gamma = int(ppo_epochs), float(clip_eps), float(gamma)
         self.gae_lambda, self.entropy_coef, self.value_coef = float(gae_lambda), float(entropy_coef), float(value_coef)
         torch.manual_seed(seed)
-        self.policy = ActorCritic(vocab_size=vocabulary.size, sep_index=vocabulary.sep_index)
+        self.policy = ActorCritic(vocab_size=vocabulary.size, sep_index=vocabulary.sep_index,
+                                  logit_bias=self.logit_bias)
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr)
         # Optional side channel for the PPO -> QCM warm start: every transition
         # with its FINAL reward (known only after the batch is rewarded).

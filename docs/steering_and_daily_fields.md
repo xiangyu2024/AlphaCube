@@ -210,23 +210,47 @@ mutation_checks_bans: bool = True       # 只为逐 bit 复现某次老的 --ban
   要是把所有面都掏空,自动退回均匀路径 —— 权重函数不许把生成搞成不可能。
   `mutate_operator` 本来就走 `self._pick(alts)`,所以权重自动也管算子替换。
   **`{名字: 权重}` 这种写法是按 `spec.name` 匹配的,而每个 nd 面核函数在注册表里注册了
-  两次** —— ND 面用自己的名字,NT 面用 `nt_<name>`。所以 `{"cs_mean": 0.0}` 只掐掉
-  ND 那一半,`nt_cs_mean` 还是权重 1.0 照样被抽(实测 120 个 seed:`cs_mean` 从 41 次
-  降到 0 次,`nt_cs_mean` 从 5 次**升到** 9 次 —— 质量挪过去了)。要真的去掉一个 nd 算子,
-  两个名字都得写:`{"cs_mean": 0.0, "nt_cs_mean": 0.0}`。打错的算子名在构造时就会报
-  `ValueError`,但"只写了一半"不是打错,不会报。
+  两次** —— ND 面用自己的名字,NT 面用 `nt_<name>`。**映射的 key 自动展开到孪生体**:
+  `{"cs_mean": 0.0}` 把 `cs_mean` 和 `nt_cs_mean` 一起掐掉,不必手写两遍
+  (`generator.nd_twin_base`)。要**区别对待**两个面,就显式给 `nt_` 那个名字一条自己的
+  权重 —— 显式写的永远优先:`{"cs_mean": 0.0, "nt_cs_mean": 1.0}`。
+  传**可调用对象**时不展开:它自己看得见每个 spec 的两个面,怎么匹配是调用方的事。
+  打错的算子名在构造时报 `ValueError`。
+  (展开是分支验证后补的。改之前只写一半就只指引一半:实测 400 个 seed ×
+  `generate_population(25)`,`{"cs_mean": 0.0}` 让 `cs_mean` 从 148 次降到 0,而
+  `nt_cs_mean` 不动,17 次还是 17 次。验证报告里"5 次升到 9 次"是 120 个 seed 下的噪声,
+  不是质量被挪给了孪生体 —— `_pick_weighted` 取的是**存活**算子权重的均值,掐掉一个
+  权重 0 的算子并不改那个面自己的概率。)
 - **`accept`** —— 候选筛子,签名**只能有一个位置参数**(构造时检查)。它挂在封禁集
   所在的那个验收点上,所以 `generate` / `mutate_subtree` / `mutate_operator` /
   `mutate_hoist` / `crossover` 全都免费生效。
 - **`daily_fields` + `daily_leaf_prob`** —— 让搜索**抽得出**日频叶子(不只是能解析)。
   `self.daily_fields and ...` 的短路守卫意味着空默认**一次随机数都不消耗**。
+  字段名在**构造时**就对着 `registry.daily_fields` 查一遍,`leaf_slots` 里的名字同样查
+  (`generator.check_daily_field_names`)。少一个字母不会悄悄生效:
+  `daily_fields=("FlotCap",)` 直接 `ValueError` 并列出九个可用名字。以前不查 ——
+  `DailyFeature` 的 shape 只看节点类型、不看字段名,打错的叶子一路通过 shape 系统和
+  `is_valid_root`,到求值时才被 `dailyfields.resolve` 拒绝,而 `GPMiner._panels` 是
+  `tolerant=True`,把异常收进 `res.errors` 就把那棵树丢了(实测 `daily_leaf_prob=1.0`
+  时 40 棵里 34 棵带着这个叶子,整轮看起来就像"日频叶子这条指引没起作用")。
+  **"名字合法"和"这个 run 有数据"是两件事**:没挂 `--daily-fields` 的视图只解析得出
+  `LimitWidth` / `BoardCode` / `ListAge` 三个派生字段,`FloatCap` 这种带 hooks 写进去
+  照样构造成功、照样抽得出来、求值时照样被丢掉 —— 所以 `GPMiner` 会 `warnings.warn`
+  点名这些字段(也留在 `miner.unresolvable_daily_fields` 上),`run_mining` 会
+  `say()` 一行 `!! search hooks name N daily field(s) this view cannot resolve: ...`
+  并写进 `meta.json` 的 `unresolvable_daily_fields`。想当场拦住就自己比一下
+  `view.daily_fields`。
 - **`leaf_slots`** —— 位置提示,`_operand_reqs` 表达不了的那种:一个 nd 面二元算子的
   **两个**槽位都是 `"daily"` 要求,所以搜索本身无从知道哪个槽位是"分桶用的条件变量"。
   `leaf_slots={"cs_regres": {1: ("FloatCap",)}}` 让 `_build` 直接把槽位 1 填成日频叶子
   而不是递归下去 —— 这才把"在自己的市值分位里排序"变成搜索**抽得出来**的东西。
-  key 同样按 `spec.name` 匹配,所以**同样要把 `nt_` 孪生体一起写上**,否则 NT 面那一半
-  不受指引(实测:只写 `cs_regres` 时,40 个 seed 里有 1 棵 `nt_cs_regres` 的槽位 1 没被填;
-  两个 key 都写则为 0)。
+  key 同样按 `spec.name` 匹配,也**同样自动展开到 `nt_` 孪生体**(查表在用时做,
+  `_slots_for`,所以 `gen.leaf_slots` 还是你传进去的那个对象,插件按块改它仍然生效)。
+  要让孪生体不受这条槽位约束,给它一条**空**的:`{"nt_cs_regres": {}}`。
+  注意 NT 面的操作数必须有真的分钟变化,日频叶子塞进去会 `ShapeError`、`_gen` 重试,
+  所以孪生体继承槽位的效果是**把它从种群里筛掉**,而不是填上什么 —— 这跟以前手写两个
+  key 的效果一样(实测:只写 `cs_regres` 时 40 个 seed 里有 1 棵 `nt_cs_regres` 的槽位 1
+  没被填;自动展开后、或两个 key 都写时都是 0;写 `{"nt_cs_regres": {}}` 回到 1)。
 
 **`hook_rng`**:`accept` 钩子要抽随机数,**必须**用 `gen.hook_rng`,**不许**用 `gen._rng`。
 用了 `_rng`,轨迹就取决于被筛掉了多少个候选,steer / control 两臂的对比也就毁了。
@@ -241,23 +265,23 @@ from alphacube.mining.generator import TypedTreeGenerator
 
 gen = TypedTreeGenerator(
     default_registry(), seed=7,
-    # day_sum 是 dt 面、只注册一次;nd 面的算子要连 nt_ 孪生体一起写
-    op_weight={"day_sum": 10.0, "day_std": 0.0, "cs_mean": 0.0, "nt_cs_mean": 0.0},
+    # nd 面的名字自动连 nt_ 孪生体一起生效,只写一个就够;day_sum 是 dt 面、只注册一次
+    op_weight={"day_sum": 10.0, "day_std": 0.0, "cs_mean": 0.0},
     accept=lambda e: "cross_" not in repr(e),           # 只能有一个位置参数
     daily_fields=("FloatCap", "LogFloatCap"), daily_leaf_prob=0.3,
-    leaf_slots={"cs_regres": {1: ("FloatCap",)},        # 同样两个名字都要写
-                "nt_cs_regres": {1: ("FloatCap",)}},
+    leaf_slots={"cs_regres": {1: ("FloatCap",)}},       # 同样自动覆盖 nt_cs_regres
 )
 pop = gen.generate_population(30)
 any("day_std" in repr(e) for e in pop)      # False —— 权重 0 生效
-any("cs_mean(" in repr(e) for e in pop)     # False —— 两个名字都写了,ND/NT 都掐掉
+any("cs_mean(" in repr(e) for e in pop)     # False —— ND/NT 两个面都掐掉了
 any("FloatCap" in repr(e) for e in pop)     # True  —— 抽到了日频叶子
 any("cross_" in repr(e) for e in pop)       # False —— 筛子生效
 gen.unaccepted_fallbacks                    # 0 —— 没有走退化兜底
 ```
 
-构造时就会报错的四种配置:`op_weight` 里有没注册过的算子名;权重是负数或 NaN;
-`accept` 要两个参数;权重表把那 26 个 `reduces_m and not non_root` 的算子池掏空了
+构造时就会报错的五种配置:`op_weight` 里有没注册过的算子名;权重是负数或 NaN;
+`accept` 要两个参数;`daily_fields` / `leaf_slots` 里有不在 `registry.daily_fields`
+里的字段名;权重表把那 26 个 `reduces_m and not non_root` 的算子池掏空了
 (掏空会让兜底路径走到 `self._rng.choice(sorted({}))` → IndexError)。
 
 ### 2.2 三处**故意**的行为改变
@@ -405,6 +429,29 @@ search_hooks_from(["my_plugin"])     # -> SearchHooks(...)
     --label close --budget 24 --population 12 --out /tmp/demo/runs --run-id m1
 ```
 
+**同一份 `SearchHooks` 对 GP 和 RL 都生效**(`--miner alphagen` / `alphaqcm` /
+`alphaforge` / `alphasage` / `warmstart` 这五个都算 RL),所以一个 sweep 里拿同一份
+steer 配置分别指 GP 臂和 RL 臂,两臂是**可比**的:
+
+| `SearchHooks` 字段 | GP 这条路 | RL 这条路 |
+|---|---|---|
+| `op_weight` | `TypedTreeGenerator._pick_weighted` | 折成每个 `OperatorToken` 一个 `log(max(w, tiny))` 的 logit 偏置,在 `action_mask` **之前**加到策略分数上(`tokens.operator_logit_bias` → `TokenMiner(logit_bias=...)`),所以权重 0 两边都等于抽不到 |
+| `accept` | `generator.acceptable` | `BatchRewarder(accept=...)` |
+| `daily_fields` | 生成器的日频叶子 | `Vocabulary(daily_fields=...)` 追加的 `DailyFeatureToken`(**追加在最后**,存盘策略的下标不动) |
+| `daily_leaf_prob` / `leaf_slots` | 生效 | 不适用(RPN 词表里没有"槽位"这个概念,策略自己决定下一个 token) |
+
+`mine` 的日志里这两行就是接上了的证据(没有 hooks 时两行都不打印):
+
+```
+RL action space: + 2 daily-feature token(s) (FloatCap, LogFloatCap)
+RL op_weight -> logit bias: 5 of 214 operators down-weighted, 0 up; lowest -20.72
+```
+
+> QCM 是按**价值**选动作的,`log(w)` 不是它那条分支的量纲:`w=0` 时 `log(1e-9) = -20.7`
+> 对着 `|rank IC|` 量级的分数等于一个硬掩码(这是要的性质),但 0 和 1 之间的权重只是
+> "被压制",不是校准过的倍数。想要概率意义上的加权,用三个 softmax miner
+> (`alphagen` / `alphaforge` / `alphasage`)。
+
 机制与时序:
 
 - 光 **import** 就够用来注册 `@op` 装饰的核函数(它们落进 `operators.common.OPERATOR_REGISTRY`);
@@ -537,7 +584,7 @@ AlphaCube 自己的核函数里**恰好三个**被误判:`in_sustain_mean`、`in
 ```bash
 cd /Users/wxy/Desktop/AlphaCube-steering
 ~/.venvs/alphacube/bin/python -m pytest tests/ -q 2>&1 | tail -8
-# 923 passed, 10 skipped, 1 xfailed —— 改动前的基线是 617 passed, 10 skipped, 1 xfailed
+# 943 passed, 10 skipped, 1 xfailed —— 改动前的基线是 617 passed, 10 skipped, 1 xfailed
 ```
 
 仓库根的 `conftest.py` 会把**当前 worktree 自己的 `src/`** 放进路径,所以在哪个 worktree 里
@@ -548,7 +595,7 @@ cd /Users/wxy/Desktop/AlphaCube-steering
 cd /Users/wxy/Desktop/Partura-steering
 ALPHACUBE_ROOT=/Users/wxy/Desktop/AlphaCube-steering \
 PYTHONPATH=/Users/wxy/Desktop/AlphaCube-steering/src:/Users/wxy/Desktop/Partura-steering \
-  ~/.venvs/alphacube/bin/python -m pytest tests/ -q        # 56 passed
+  ~/.venvs/alphacube/bin/python -m pytest tests/ -q        # 57 passed
 ```
 
 新增的测试文件,按工作包:
@@ -565,3 +612,4 @@ PYTHONPATH=/Users/wxy/Desktop/AlphaCube-steering/src:/Users/wxy/Desktop/Partura-
 | `tests/test_cli_daily_and_plugin.py` | `mine`/`research`/`calculate` 端到端、`--fitness` 校验、RL 侧校验 |
 | `tests/test_build_daily_fields.py` | 手写 parquet 目录、覆盖率下限、`--out` 拒绝、半成品不可读 |
 | `tests/test_daily_tokens.py` | token 下标不变、`ExpressionBuilder`、权重 0 的 logit 偏置 |
+| `tests/test_steering_wiring.py` | 分支验证的五条回归:logit 偏置真的接到五个 RL miner 上、`hooks.daily_fields` 真的进词表、解析不了的日频字段被点名、ND/NT 孪生体、日频字段名校验 |
