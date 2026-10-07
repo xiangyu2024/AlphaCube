@@ -108,6 +108,33 @@ def _check_accept_hook(accept) -> None:
         pass    # signature unavailable (some builtins) -- nothing more to check here
 
 
+def _hook_seed(seed: int, rng: random.Random):
+    """What ``hook_rng`` is seeded from. Returns anything ``random.Random`` accepts.
+
+    The accept hook's stream has to do two things: vary with whatever seeded the
+    generator (so "the steer/control comparison is reproducible from the seed"
+    means something), and not BE the generator's own sequence. The design's literal
+    ``random.Random((seed * 2654435761) & 0xFFFFFFFF)`` delivers neither at the one
+    in-tree construction site: ``gp.py:241`` builds the generator with
+    ``rng=self._rng`` and no ``seed=``, so ``seed`` stayed at its default 0 and
+    every mining run -- seed 0, 7, 12345 alike -- got the identical hook stream
+    ``[0.844422, 0.757954, 0.420572]`` (measured); and at ``seed=0`` that stream is
+    byte-for-byte ``self._rng`` itself, so a hook thinning on ``hook_rng.random()``
+    would be reading the generator's own draws.
+
+    Deriving it from the generator stream's *state* fixes both at once and keeps
+    the one guarantee that matters: ``getstate()`` consumes no draw, so the tree
+    stream stays bit-identical. ``seed`` still reaches it, via
+    ``random.Random(seed)``, whenever no ``rng`` is supplied. A string seed is
+    hashed by ``random.Random`` with SHA-512, which is stable across runs and
+    platforms (unlike ``hash()`` on a str), so this stays reproducible.
+    """
+    try:
+        return f"alphacube.hook_rng/{rng.getstate()[1]!r}"
+    except Exception:   # noqa: BLE001 - SystemRandom and duck-typed rngs have no state
+        return (int(seed) * 2654435761) & 0xFFFFFFFF
+
+
 def _resolve_op_weight(op_weight, registry: Registry):
     """``op_weight`` is always called as ``self.op_weight(spec) -> float`` (see
     ``_pick_weighted``); this accepts that callable directly, or the more common,
@@ -155,8 +182,10 @@ class TypedTreeGenerator:
         # A second, independent stream for accept hooks: Partura's guidance hook used
         # to draw from gen._rng, which made its own trajectory depend on how many
         # candidates were thinned -- not reproducible from the seed. A hook MUST draw
-        # from this one instead, never from self._rng.
-        self.hook_rng = random.Random((seed * 2654435761) & 0xFFFFFFFF)
+        # from this one instead, never from self._rng. Seeded off the generator
+        # stream's own state rather than off the `seed` keyword, which gp.py never
+        # passes -- see _hook_seed for the measurement and why.
+        self.hook_rng = random.Random(_hook_seed(seed, self._rng))
         specs = (registry.list_all() if include_lookahead
                  else registry.searchable(include_boolean=allow_boolean_ops,
                                           include_resource_risk=allow_resource_risk))
@@ -245,6 +274,12 @@ class TypedTreeGenerator:
             tree = self._collapse_leaf(self._pick(pool))
             if self.acceptable(tree):
                 return tree
+            # _ban_ok, not just is_valid_root: a fallback tree carrying a banned key
+            # is no longer returned at all (deliberate behaviour change (b)). Drop
+            # this conjunct and an always-False hook plus a ban set covering the
+            # reachable minimal keys leaks a banned tree every time -- measured
+            # 40/40 seeds, against 0/40 here. test_generator_hooks.py's
+            # test_generate_fallback_never_returns_a_banned_tree_* pins it.
             if relaxed is None and self._ban_ok(tree) and is_valid_root(tree):
                 relaxed = tree
         if relaxed is None or self.on_exhausted == "raise":
@@ -422,21 +457,39 @@ class TypedTreeGenerator:
 
     def _pick_weighted(self, faces: Dict[str, List[OpSpec]]) -> OpSpec:
         """Weighted counterpart of the uniform branch above, reproducing Partura's
-        current ``pick`` semantics exactly: a face's mass is its operators' mean
-        weight (so a face with more operators in it is not automatically louder),
-        then an operator within the chosen face in proportion to its own weight. A
-        face whose every operator weighs 0 drops out of the draw; if that drops
-        every face, the uniform path above runs instead -- a weight function must
-        not be able to make generation impossible."""
-        weights: Dict[str, List[float]] = {
-            face: [max(0.0, float(self.op_weight(s))) for s in specs] for face, specs in faces.items()
-        }
-        live = [face for face in sorted(faces) if sum(weights[face]) > 0.0]
-        if not live:
+        current ``pick`` semantics exactly: a face's mass is the mean weight of the
+        operators that SURVIVE in it (so a face with more operators in it is not
+        automatically louder), then an operator within the chosen face in proportion
+        to its own weight. A face whose every operator weighs 0 drops out of the
+        draw; if that drops every face, the uniform path above runs instead -- a
+        weight function must not be able to make generation impossible.
+
+        "Surviving" is the load-bearing word, and the reason the weight-0 specs are
+        dropped from ``live_specs`` before the mean is taken rather than left in with
+        a 0: Partura's ``pick`` filters ``if w > 0`` BEFORE it groups by face
+        (``scripts/idea_search.py:225-238``), so its denominator is the surviving
+        count. Dividing by the face's FULL operator count instead scales the face's
+        probability by its surviving fraction, which makes weight 0 shift the draws
+        -- the opposite of what it is for. Measured on the searchable vocabulary
+        Partura mines with (``allow_resource_risk=True``: 218 specs, dt 109 / nd 46 /
+        nt 46 / shared 17): with only ``day_mean`` left alive in the dt face, P(dt)
+        collapses from 0.25 to 0.003, an 81x distortion, and since
+        ``operator_weights()`` assigns 0.0 for every generic ``ban`` rule the shift
+        would grow with however many operators a steer config bans per face -- the
+        ``shared`` face has only 17 members."""
+        live_specs: Dict[str, List[Tuple[OpSpec, float]]] = {}
+        for face, specs in faces.items():
+            kept = [(s, w) for s, w in ((s, max(0.0, float(self.op_weight(s)))) for s in specs)
+                    if w > 0.0]
+            if kept:
+                live_specs[face] = kept
+        if not live_specs:
             return self._rng.choice(faces[self._rng.choice(sorted(faces))])
-        masses = [sum(weights[face]) / len(weights[face]) for face in live]
+        live = sorted(live_specs)
+        masses = [sum(w for _, w in live_specs[face]) / len(live_specs[face]) for face in live]
         face = self._rng.choices(live, weights=masses)[0]
-        return self._rng.choices(faces[face], weights=weights[face])[0]
+        return self._rng.choices([s for s, _ in live_specs[face]],
+                                 weights=[w for _, w in live_specs[face]])[0]
 
     def _root_ops_of(self, kind: str) -> List[OpSpec]:
         return [s for s in self.specs if s.reduces_m and not s.non_root]
