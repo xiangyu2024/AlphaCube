@@ -21,6 +21,7 @@ against a real production schema, which was not available this session.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Optional, Sequence
@@ -365,16 +366,96 @@ def test_dry_run_still_exits_nonzero_below_the_coverage_floor(tmp_path):
 # (dailyfields.py's own documented second call site for this function).
 # ---------------------------------------------------------------------------
 
-def test_a_store_whose_symbols_can_never_match_a_board_rule_is_refused(tmp_path):
+def _bad_symbol_store(tmp_path):
+    """A store whose symbols put the market prefix LAST ('SH.600000'), so
+    ``dailyfields.require_board_rule`` can never fire a board rule on it."""
     from alphacube.store import build_cube_store
     from alphacube.store import DAY_STATUS_CODES
 
     S, D, M = 2, 3, 2
     cubes = {k: np.ones((S, D, M)) for k in ("Open", "High", "Low", "Close", "Volume", "Vwap", "Ret", "Amt")}
     status = np.full((S, D), DAY_STATUS_CODES["TRADING"], dtype=np.int8)
-    bad_store = build_cube_store(tmp_path / "bad_cube", cubes, ["SH.600000", "SH.600001"],
-                                 ["20200101", "20200102", "20200103"], day_status=status)
+    return build_cube_store(tmp_path / "bad_cube", cubes, ["SH.600000", "SH.600001"],
+                            ["20200101", "20200102", "20200103"], day_status=status)
+
+
+def test_a_store_whose_symbols_can_never_match_a_board_rule_is_refused(tmp_path):
+    bad_store = _bad_symbol_store(tmp_path)
     cap_dir = tmp_path / "daily_capital"
     out = tmp_path / "daily_fields"
     with pytest.raises(SystemExit, match="STAR.*GEM.*BSE|digit"):
         bdf.main(["--store", str(bad_store.directory), "--cap-dir", str(cap_dir), "--out", str(out)])
+
+
+# ---------------------------------------------------------------------------
+# $ALPHACUBE_DAILY_FIELDS: the server shell's own value must not reach the
+# label-only store open. open_cube_store defaults daily_root to that env var
+# (store.py:444-445), and the design documents it as THE way to point
+# AlphaCube at the daily store -- so on the server it is most naturally set to
+# exactly this script's --out, which on a first build does not exist yet.
+# ---------------------------------------------------------------------------
+
+def _tiny_build_inputs(tmp_path):
+    store = _store(tmp_path)
+    cap_dir = tmp_path / "daily_capital"
+    for d in store.dates:
+        _write_cap_file(cap_dir, d, store.symbols, cap=[1e9] * 4, tot=[2e9] * 4)
+    return store, cap_dir
+
+
+def test_builds_with_alphacube_daily_fields_pointing_at_the_not_yet_built_out(tmp_path, monkeypatch):
+    """The regression: this is the script that CREATES the daily store, so a
+    shell that already exports ALPHACUBE_DAILY_FIELDS=<out> must not make it
+    die on ``FileNotFoundError: <out>/meta.json`` before it does anything."""
+    store, cap_dir = _tiny_build_inputs(tmp_path)
+    out = tmp_path / "not_built_yet"
+    monkeypatch.setenv("ALPHACUBE_DAILY_FIELDS", str(out))          # the very dir to build
+
+    rc = bdf.main(["--store", str(store.directory), "--cap-dir", str(cap_dir), "--out", str(out),
+                  "--min-coverage", "0.0"])
+    assert rc == 0
+    assert set(DailyFieldStore(out).fields) == {"FloatCap", "TotalCap"}
+    # the operator's own value is left exactly as it was for the rest of the process
+    assert os.environ["ALPHACUBE_DAILY_FIELDS"] == str(out)
+
+
+def test_an_unset_alphacube_daily_fields_is_not_resurrected_by_the_open(tmp_path, monkeypatch):
+    """Mirror image: the neutralising must restore *absence* as absence, not
+    plant an empty string that a later open_cube_store would try to use."""
+    store, cap_dir = _tiny_build_inputs(tmp_path)
+    monkeypatch.delenv("ALPHACUBE_DAILY_FIELDS", raising=False)
+    assert bdf.main(["--store", str(store.directory), "--cap-dir", str(cap_dir),
+                     "--out", str(tmp_path / "daily_fields"), "--min-coverage", "0.0"]) == 0
+    assert "ALPHACUBE_DAILY_FIELDS" not in os.environ
+
+
+def test_a_stale_daily_store_in_the_environment_is_never_attached(tmp_path, monkeypatch):
+    """Design step 1: the store is opened "read-only purely for its canonical
+    symbols/dates". An existing (stale) store named by the env var must not be
+    attached and mixed into contract_hash behind the operator's back."""
+    store, cap_dir = _tiny_build_inputs(tmp_path)
+    stale = tmp_path / "stale_daily"
+    assert bdf.main(["--store", str(store.directory), "--cap-dir", str(cap_dir), "--out", str(stale),
+                     "--min-coverage", "0.0"]) == 0
+    assert (stale / "meta.json").is_file()                     # a real, openable daily store
+
+    monkeypatch.setenv("ALPHACUBE_DAILY_FIELDS", str(stale))
+    opened = bdf.open_store_for_labels(Path(store.directory))
+    assert opened.daily is None                                # not attached ...
+    from alphacube.store import CubeStore
+    assert opened.contract_hash == CubeStore(store.directory).contract_hash   # ... nor fingerprinted
+
+    # and a second build still runs end to end with that stale store exported
+    assert bdf.main(["--store", str(store.directory), "--cap-dir", str(cap_dir),
+                     "--out", str(tmp_path / "daily_fields"), "--min-coverage", "0.0"]) == 0
+
+
+def test_the_board_rule_refusal_survives_a_set_alphacube_daily_fields(tmp_path, monkeypatch):
+    """With the env var honoured, CubeStore.__init__ ran require_board_rule
+    itself -- ahead of this script's own call -- so a bad symbol spelling
+    escaped as a raw ValueError instead of main()'s SystemExit."""
+    bad_store = _bad_symbol_store(tmp_path)
+    monkeypatch.setenv("ALPHACUBE_DAILY_FIELDS", str(tmp_path / "not_built_yet"))
+    with pytest.raises(SystemExit, match="STAR.*GEM.*BSE|digit"):
+        bdf.main(["--store", str(bad_store.directory), "--cap-dir", str(tmp_path / "daily_capital"),
+                 "--out", str(tmp_path / "daily_fields")])

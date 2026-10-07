@@ -249,6 +249,44 @@ def write_daily_field_store(out_dir: Path, planes: Dict[str, np.ndarray], symbol
     return out_dir
 
 
+def open_store_for_labels(store_dir: Path):
+    """Open the cube store read-only, purely for its canonical symbols/dates
+    (step 1) -- with NO daily source attached, whatever the operator's shell
+    happens to say.
+
+    ``store.open_cube_store`` defaults its ``daily_root`` to
+    ``$ALPHACUBE_DAILY_FIELDS`` (store.py:444-445) and offers no way to spell
+    "explicitly none" -- and that env var is the design's documented way to
+    point AlphaCube at the daily store, so on the server it is most naturally
+    set to exactly this script's ``--out``. Letting the fallback through would
+    break the one script that CREATES that directory:
+
+    * on the FIRST build ``<out>`` does not exist yet, so CubeStore.__init__
+      (store.py:131) builds a ``DailyFieldStore`` over it and the script dies
+      with an uncaught ``FileNotFoundError: <out>/meta.json`` -- before the
+      schema probe, before the side-by-side symbol print, before any of the
+      diagnostics that exist precisely for a first build;
+    * that same attach runs ``require_board_rule`` from inside
+      ``CubeStore.__init__``, i.e. ahead of this script's own call, so a store
+      with the wrong symbol spelling escapes as a raw ``ValueError`` instead of
+      the ``SystemExit`` main() converts it into;
+    * and when the env var points at an EXISTING, stale store, the open
+      silently attaches and fingerprints it into ``contract_hash`` -- not
+      "read-only, purely for that canonical label list" either.
+
+    So the fallback is neutralised for the duration of the open and then put
+    back exactly as it was: the dispatch itself still comes from
+    ``open_cube_store``, so this cannot drift from the real rule."""
+    from alphacube.store import open_cube_store
+
+    saved = os.environ.pop("ALPHACUBE_DAILY_FIELDS", None)
+    try:
+        return open_cube_store(str(store_dir))
+    finally:
+        if saved is not None:
+            os.environ["ALPHACUBE_DAILY_FIELDS"] = saved
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--store", required=True,
@@ -269,9 +307,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     refuse_if_out_inside_sources(out_dir, cap_dir, store_dir)
 
     from alphacube.dailyfields import DERIVED_FIELDS, LOG_OF, require_board_rule
-    from alphacube.store import open_cube_store
 
-    store = open_cube_store(str(store_dir))
+    # NOT open_cube_store(...) directly: no daily source may be attached while
+    # we are building one -- see open_store_for_labels.
+    store = open_store_for_labels(store_dir)
     try:
         require_board_rule(store.symbols)
     except ValueError as e:
