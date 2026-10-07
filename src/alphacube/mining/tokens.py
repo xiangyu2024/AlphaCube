@@ -24,12 +24,16 @@ What the three-axis type system adds to the grammar mask:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Callable, Dict, List, Optional, Sequence, Union
+
+import numpy as np
 
 from ..axes import OpSpec
 from ..catalog import Registry
-from ..expression import Constant, Expression, Feature, ShapeError, is_valid_root, make_node, operand_ok
+from ..expression import (Constant, DailyFeature, Expression, Feature, ShapeError, is_valid_root, make_node,
+                          operand_ok)
 
 
 @dataclass(frozen=True)
@@ -48,6 +52,11 @@ class FeatureToken:
 
 
 @dataclass(frozen=True)
+class DailyFeatureToken:
+    field: str
+
+
+@dataclass(frozen=True)
 class OperatorToken:
     name: str
 
@@ -62,7 +71,7 @@ class WindowToken:
     window: int
 
 
-Token = Union[BegToken, SepToken, FeatureToken, OperatorToken, ConstantToken, WindowToken]
+Token = Union[BegToken, SepToken, FeatureToken, DailyFeatureToken, OperatorToken, ConstantToken, WindowToken]
 BEG = BegToken()
 SEP = SepToken()
 StackItem = Union[Expression, int]
@@ -74,10 +83,16 @@ class Vocabulary:
     def __init__(self, registry: Registry, fields: Optional[Sequence[str]] = None,
                  constants: Optional[Sequence[float]] = None, windows: Optional[Sequence[int]] = None,
                  n_minutes: int = 241, include_lookahead: bool = False,
-                 allow_boolean_ops: bool = False, allow_resource_risk: bool = False) -> None:
+                 allow_boolean_ops: bool = False, allow_resource_risk: bool = False,
+                 daily_fields: Sequence[str] = ()) -> None:
         self.registry = registry
         self.n_minutes = int(n_minutes)
         self.fields = list(fields) if fields is not None else list(registry.fields)
+        # A namespace PARALLEL to `fields` (mirrors `Registry.daily_fields`), empty
+        # by default: with no daily fields named, no DailyFeatureToken is appended
+        # below and every existing token index is unchanged (WP10's backward-compat
+        # requirement -- a saved policy's action indices must still line up).
+        self.daily_fields = list(daily_fields)
         self.constants = [float(c) for c in (constants if constants is not None else registry.constants)]
         specs = (registry.list_all() if include_lookahead
                  else registry.searchable(include_boolean=allow_boolean_ops,
@@ -96,6 +111,11 @@ class Vocabulary:
         tokens += [OperatorToken(s.name) for s in self.operators]
         tokens += [ConstantToken(c) for c in self.constants]
         tokens += [WindowToken(w) for w in self.windows]
+        # Appended AFTER every existing group: with the empty default this adds
+        # nothing, so a vocabulary built before WP10 and one built after it (both
+        # with no daily_fields) are byte-identical, and a non-empty daily_fields
+        # only ever grows the index space upward, never renumbers a token below.
+        tokens += [DailyFeatureToken(f) for f in self.daily_fields]
         self.token_to_index: Dict[Token, int] = {t: i for i, t in enumerate(tokens)}
         self.index_to_token: Dict[int, Token] = {i: t for t, i in self.token_to_index.items()}
         self._spec_by_name = {s.name: s for s in self.operators}
@@ -125,6 +145,30 @@ class Vocabulary:
         if spec.restores_m:
             return window == self.n_minutes
         return window in spec.windows
+
+
+def operator_logit_bias(vocab: Vocabulary, op_weight: Optional[Callable[[OpSpec], float]],
+                         tiny: float = 1e-9) -> np.ndarray:
+    """Per-token additive bias for a policy's pre-``action_mask`` logits, from the
+    same ``op_weight`` a GP run passes to ``TypedTreeGenerator`` (resolved to a
+    plain ``spec -> float`` callable -- see ``mining.generator._resolve_op_weight``,
+    which a ``{name: weight}`` mapping also goes through before reaching either
+    search). ``log(max(w, tiny))`` at every ``OperatorToken`` index, 0.0
+    everywhere else (``BEG``/``SEP``/feature/daily-feature/constant/window
+    tokens). Added to the policy logits BEFORE the grammar mask, a weight of 0
+    (or any w <= 0) becomes an effective -inf-ish mask once softmax runs, and the
+    one ``op_weight`` a caller builds steers both the GP and the RL search.
+
+    ``op_weight=None`` -- the GP-side default too -- returns an all-zero array:
+    no operator is biased.
+    """
+    bias = np.zeros(vocab.size, dtype=np.float64)
+    if op_weight is None:
+        return bias
+    for spec in vocab.operators:
+        w = float(op_weight(spec))
+        bias[vocab.index_of(OperatorToken(spec.name))] = math.log(max(w, tiny))
+    return bias
 
 
 class ExpressionBuilderError(ValueError):
@@ -162,6 +206,15 @@ class ExpressionBuilder:
             if token.field not in self.vocabulary.fields:
                 raise ExpressionBuilderError(f"unknown field {token.field!r}")
             self.stack.append(Feature(token.field))
+            return
+        if isinstance(token, DailyFeatureToken):
+            if token.field not in self.vocabulary.daily_fields:
+                raise ExpressionBuilderError(f"unknown daily field {token.field!r}")
+            # No operand-type check here: a DailyFeature leaf is COLLAPSED/degenerate
+            # by construction (expression.py), so the same static shape system that
+            # already gates every operator in `_apply` is what will accept or refuse
+            # it as an operand -- nothing daily-specific to re-check at push time.
+            self.stack.append(DailyFeature(token.field))
             return
         if isinstance(token, ConstantToken):
             self.stack.append(Constant(token.value))
@@ -214,7 +267,8 @@ class ExpressionBuilder:
             return []
         if not self._began:
             return [v.beg_index]
-        out: List[Token] = [FeatureToken(f) for f in v.fields] + [ConstantToken(c) for c in v.constants]
+        out: List[Token] = ([FeatureToken(f) for f in v.fields] + [DailyFeatureToken(f) for f in v.daily_fields]
+                             + [ConstantToken(c) for c in v.constants])
         st = self.stack
         top_expr = bool(st) and isinstance(st[-1], Expression)
         if top_expr:
@@ -238,5 +292,6 @@ class ExpressionBuilder:
         return [v.index_of(t) for t in out]
 
 
-__all__ = ["BegToken", "SepToken", "FeatureToken", "OperatorToken", "ConstantToken", "WindowToken",
-           "Token", "BEG", "SEP", "Vocabulary", "ExpressionBuilder", "ExpressionBuilderError"]
+__all__ = ["BegToken", "SepToken", "FeatureToken", "DailyFeatureToken", "OperatorToken", "ConstantToken",
+           "WindowToken", "Token", "BEG", "SEP", "Vocabulary", "ExpressionBuilder", "ExpressionBuilderError",
+           "operator_logit_bias"]
