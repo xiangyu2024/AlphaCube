@@ -31,6 +31,7 @@ import warnings
 
 import numpy as np
 import pytest
+import torch
 
 from alphacube.axes import MODE_D, MODE_P, MODE_S
 from alphacube.engine.dag import Dag
@@ -174,11 +175,55 @@ def test_leaf_panel_returns_a_writable_copy_not_the_views_own_cache(daily_view):
     assert not np.isnan(raw_again).any()
 
 
+def test_unresolvable_bare_daily_root_does_not_sink_a_tolerant_batch(store):
+    """``_leaf_panel`` is called from evaluate()'s root loop, outside the
+    per-round try/except every in-round failure is funnelled through. Before
+    daily leaves the only leaf reaching that branch was a ``Constant`` and
+    ``np.full`` cannot raise; a ``DailyFeature`` resolves a field through the
+    view, which raises whenever the field is in ``Registry.daily_fields`` (so it
+    parses) but not in ``view.daily_fields`` (so it cannot be resolved) -- the
+    ``--daily-root``-not-passed misconfiguration. ``tolerant=True`` is the mode
+    every batch caller uses (gp.py, mining/env.py, mining/boosting.py,
+    research.py, calculate.py, legacy/seed_library.py), and
+    ``is_valid_root`` admits a bare ``DailyFeature``, so one bad seed must not
+    cost the whole batch.
+
+    The ``store`` fixture deliberately has NO daily_root attached."""
+    view = store.view()
+    assert "FloatCap" not in view.daily_fields
+    exprs = [DailyFeature("FloatCap"), parse("cs_rank(day_mean(Close))")]
+    res = CubeEngine(view).evaluate(exprs, tolerant=True)
+    assert set(res.errors) == {0}
+    assert "DF:FloatCap" in res.errors[0] and "daily_root" in res.errors[0]
+    assert res.panels[0] is None
+    assert res.panels[1] is not None and res.panels[1].shape == (view.n_days, view.n_symbols)
+    # the healthy root must be a real panel, not an all-NaN placeholder
+    assert np.isfinite(res.panels[1]).any()
+
+
+def test_unresolvable_bare_daily_root_still_raises_when_not_tolerant(store):
+    with pytest.raises(ValueError, match="FloatCap"):
+        CubeEngine(store.view()).evaluate([DailyFeature("FloatCap")], tolerant=False)
+
+
 # ---------------------------------------------------------------------------
 # Masking: a suspended stock-day is NaN on every leaf reader
 # ---------------------------------------------------------------------------
 
 def test_suspended_stock_day_is_nan_on_every_leaf_reader(daily_view):
+    """Pins the NaN PATTERN only, and it is load-bearing for ``_leaf_panel``
+    alone -- mutation-verified: deleting the mask in ``_load_leaf_cube`` or in
+    ``_run_panel_round``'s operand leaves every assertion here green.
+
+    ``day_mean(mul(Ret, LimitWidth))`` cannot see the cube reader's mask because
+    ``Ret`` is already NaN on a suspended stock-day, so the product is NaN
+    whether or not ``LimitWidth`` was masked; ``cs_rank(FloatCap)`` cannot see
+    the panel operand's mask because ``_run_panel_round`` re-masks every node
+    output unconditionally, so the PATTERN is identical either way (what the
+    operand mask protects is the finite values of the TRADABLE stocks, since an
+    unmasked suspended stock joins the cross-section). The two value-level guard
+    rails below, and the two mutation tests after them, are what actually hold
+    the cube and panel masks in place."""
     trad = daily_view.tradable()
     assert not trad.all(), "fixture must have some suspended/unlisted stock-days"
     exprs = [parse("FloatCap"),                        # _leaf_panel
@@ -187,6 +232,101 @@ def test_suspended_stock_day_is_nan_on_every_leaf_reader(daily_view):
     res = CubeEngine(daily_view).evaluate(exprs)
     for e, p in zip(exprs, res.panels):
         assert np.array_equal(np.isnan(p), ~trad.T), e
+
+
+def _masked_cap(view):
+    """``FloatCap`` as the leaf readers are required to deliver it: float64 for
+    the reference arithmetic, NaN wherever the stock-day is not tradable."""
+    cap = view.daily("FloatCap").astype(np.float64)            # (S, D), unmasked
+    return np.where(view.tradable(), cap, np.nan)
+
+
+def test_cube_leaf_mask_carries_into_cross_mean_values(daily_view):
+    """Value-level guard rail for ``_load_leaf_cube``'s mask.
+    ``cross_mean(FloatCap, 3)`` is a MODE_S round whose ONLY operand is the
+    daily leaf, so nothing else can supply a NaN: a causal 3-day rolling
+    nanmean that swallowed a suspended day's raw FloatCap would land on a
+    different number, not merely a different NaN pattern."""
+    trad = daily_view.tradable()
+    cap_m = _masked_cap(daily_view)
+    want = np.full(cap_m.shape, np.nan)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)        # all-NaN window
+        for d in range(daily_view.n_days):                     # rolling_windows: causal, NaN-left-padded
+            want[:, d] = np.nanmean(cap_m[:, max(0, d - 2):d + 1], axis=1)
+    want = np.where(trad, want, np.nan).T                      # (D, S), engine re-masks the output
+    got = CubeEngine(daily_view).evaluate([parse("cross_mean(FloatCap, 3)")]).panels[0]
+    assert np.array_equal(np.isnan(want), np.isnan(got))
+    assert np.nanmax(np.abs(want - got) / np.abs(want)) < 1e-6
+
+
+def test_panel_leaf_operand_mask_carries_into_cs_demean_values(daily_view):
+    """Value-level guard rail for ``_run_panel_round.operand``'s mask. ``cs_*``
+    is cross-sectional, so an unmasked suspended stock joins the day's
+    cross-section and shifts the mean for every TRADABLE stock that day --
+    invisible to an ``np.isnan`` assertion, because the round re-masks its own
+    output regardless."""
+    trad = daily_view.tradable()
+    base = _masked_cap(daily_view).T                           # (D, S)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)        # a day with nothing tradable
+        want = base - np.nanmean(base, axis=1, keepdims=True)
+    want = np.where(trad.T, want, np.nan)
+    got = CubeEngine(daily_view).evaluate([parse("cs_demean(FloatCap)")]).panels[0]
+    assert np.array_equal(np.isnan(want), np.isnan(got))
+    assert np.nanmax(np.abs(want - got)) < 1e-6 * np.nanmax(np.abs(base))   # demeaned values straddle 0
+
+
+def test_dropping_the_cube_leaf_mask_changes_cross_mean(daily_view):
+    """Self-checking counterpart of
+    test_cube_leaf_mask_carries_into_cross_mean_values: neutralise ONLY the
+    mask call inside ``_load_leaf_cube`` and the carrier must move. Also pins
+    the reason the NaN-pattern test above cannot stand in for it."""
+    e = parse("cross_mean(FloatCap, 3)")
+    clean = CubeEngine(daily_view).evaluate([e]).panels[0]
+
+    eng = CubeEngine(daily_view)
+    real_load, real_mask, fired = eng._load_leaf_cube, eng._mask_cube, []
+
+    def unmasked_load(expr, mode, lo, hi, tradable):
+        fired.append(expr)
+        eng._mask_cube = lambda t, trad: t                     # only for this one call
+        try:
+            return real_load(expr, mode, lo, hi, tradable)
+        finally:
+            eng._mask_cube = real_mask
+
+    eng._load_leaf_cube = unmasked_load
+    mutant = eng.evaluate([e]).panels[0]
+    assert [x.field for x in fired] == ["FloatCap"], "the carrier no longer reaches _load_leaf_cube"
+    assert np.array_equal(np.isnan(clean), np.isnan(mutant)), \
+        "NaN pattern unchanged -- an np.isnan-only assertion is blind to this mask"
+    assert not np.array_equal(clean, mutant, equal_nan=True)
+
+
+def test_dropping_the_panel_operand_mask_changes_cs_demean(daily_view):
+    """Self-checking counterpart of
+    test_panel_leaf_operand_mask_carries_into_cs_demean_values: pre-seed the
+    cache ``operand()`` consults with the UNMASKED (D, S) plane, so the
+    DailyFeature branch returns before it would have applied ``tradable_ds``."""
+    e = parse("cs_demean(FloatCap)")
+    clean = CubeEngine(daily_view).evaluate([e]).panels[0]
+
+    eng = CubeEngine(daily_view)
+    real_round, fired = eng._run_panel_round, []
+
+    def unmasked_round(rnd, panels, tolerant):
+        plane = eng.view.daily("FloatCap")
+        eng._daily_t["FloatCap"] = torch.from_numpy(np.ascontiguousarray(plane.T)).to(eng.device, eng.dtype)
+        fired.append(rnd)
+        return real_round(rnd, panels, tolerant)
+
+    eng._run_panel_round = unmasked_round
+    mutant = eng.evaluate([e]).panels[0]
+    assert len(fired) == 1, "the carrier no longer runs as a single panel round"
+    assert np.array_equal(np.isnan(clean), np.isnan(mutant)), \
+        "NaN pattern unchanged -- an np.isnan-only assertion is blind to this mask"
+    assert not np.array_equal(clean, mutant, equal_nan=True)
 
 
 def test_mask_policies_agree_with_daily_leaves(daily_view):

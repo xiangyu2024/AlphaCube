@@ -191,7 +191,20 @@ class CubeEngine:
                         errors[i] = node.error or "evaluation failed"
                         continue
                     if node.is_leaf:
-                        p = self._leaf_panel(node.expr)
+                        # Honour `tolerant` here the same way the round loops do.
+                        # Before daily leaves the only leaf that reached this
+                        # branch was a Constant, and np.full cannot raise; a
+                        # DailyFeature root resolves a field through the view,
+                        # which raises when the field parses but no daily store
+                        # carries it (--daily-root not passed) -- and that must
+                        # not take a whole tolerant=True batch down with it.
+                        try:
+                            p = self._leaf_panel(node.expr)
+                        except Exception as exc:  # noqa: BLE001
+                            if not tolerant:
+                                raise
+                            errors[i] = f"{node.key}: {type(exc).__name__}: {exc}"
+                            continue
                     else:
                         p = panels[node.key]
                     out[i] = np.ascontiguousarray(p.T, dtype=self.np_dtype)   # (D, S)
