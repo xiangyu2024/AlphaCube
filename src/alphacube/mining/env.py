@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections import OrderedDict
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -105,6 +105,7 @@ class BatchRewarder:
                  scorer: Optional["PanelScorer"] = None, reward_kind: str = "pool",
                  min_solo: Optional[float] = None,
                  banned_substructures: Sequence[str] = (),
+                 accept: Optional[Callable[[Expression], bool]] = None,
                  rank_ban: Optional["RankSimilarityBan"] = None) -> None:
         self.engine = engine
         self.pool = pool
@@ -129,8 +130,15 @@ class BatchRewarder:
         # 池子停在 17 个不动了。
         self._paid_outside: set = set()
         self.banned_substructures = frozenset(banned_substructures)
+        # A plugin's reverse-guidance hook (plugins.SearchHooks.accept, forwarded by
+        # pipeline.run_mining's RL branch from cfg.get("hooks")) -- the RL-side mirror
+        # of TypedTreeGenerator.accept_hook (mining/generator.py) on the GP side. None
+        # leaves the check in rewards() below off entirely, so a caller that never
+        # passes this keyword sees exactly today's behaviour.
+        self.accept = accept
         self.rank_ban = rank_ban
         self.refused_structure = 0
+        self.refused_accept = 0
         self.refused_similar = 0
         self.exemplar_cache = None        # 由 pipeline 塞进来,见 rankban.ExemplarCache
         self._solo_scores: Dict[str, dict] = {}       # 表达式 key -> 打分器的结果(收敛的策略会反复吐同一条)
@@ -219,11 +227,19 @@ class BatchRewarder:
         for i, e in enumerate(exprs):
             if e is None:
                 continue
-            # 结构封禁在**评估之前**拦下来:一次引擎调用是几秒 GPU,而这些结构
-            # 是前面十几轮已经挖穿的(gp_full_market.sh 里累计 46 个)。
-            if self.banned_substructures and (one_layer_keys(e) & self.banned_substructures):
-                self.refused_structure += 1
-                results[i] = RewardResult(self.penalty, reason="banned substructure")
+            # 结构封禁和插件的 accept 钩子都在**评估之前**拦下来:一次引擎调用是几秒
+            # GPU,而封禁结构是前面十几轮已经挖穿的(gp_full_market.sh 里累计 46 个),
+            # accept 钩子则是插件的反向指引(plugins.SearchHooks.accept)—— 没必要为了
+            # 一个钩子注定要拒的候选真的去跑引擎。两者各算各的计数器和理由,方便区分
+            # 一次运行里到底是封禁结构挡得多,还是钩子挡得多。
+            banned = bool(self.banned_substructures) and bool(one_layer_keys(e) & self.banned_substructures)
+            if banned or (self.accept is not None and not self.accept(e)):
+                if banned:
+                    self.refused_structure += 1
+                    results[i] = RewardResult(self.penalty, reason="banned substructure")
+                else:
+                    self.refused_accept += 1
+                    results[i] = RewardResult(self.penalty, reason="rejected by accept hook")
                 continue
             live.append(i)
         panels = self.panels([exprs[i] for i in live]) if live else []

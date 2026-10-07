@@ -214,12 +214,14 @@ def run_mining(
     combine_train_frac: float = 0.7,
     smooth_halflives: Sequence[float] = (),
     mirror_root: Optional[Union[str, Path]] = None,
+    daily_root: Optional[Union[str, Path]] = None,
     universe: Optional[Union[str, Path]] = None,
     out_root: Optional[Union[str, Path]] = None,
     run_id: Optional[str] = None,
     save_values: bool = True,
     log: Optional[Callable[[str], None]] = print,
 ) -> RunResult:
+    from . import dailyfields
     from .catalog import default_registry
     from .engine.engine import CubeEngine
     from .metrics import backtest_metrics, cs_pearson, ic_summary
@@ -231,7 +233,11 @@ def run_mining(
     say = log or (lambda s: None)
     t0 = time.time()
     if not isinstance(store, (CubeStore, SegmentedCubeStore)):
-        store = open_cube_store(store, mirror_root=mirror_root)
+        store = open_cube_store(store, mirror_root=mirror_root, daily_root=daily_root)
+    if store.daily is not None:
+        say(f"daily fields {store.daily.root}: {', '.join(dailyfields.available(store.daily))}")
+    else:
+        say("daily fields: none attached")
     member = None
     if universe is not None:
         if symbols is not None or max_symbols is not None:
@@ -360,6 +366,9 @@ def run_mining(
         gp = dict(population_size=24, max_depth=4, min_depth=2, top_k=None)
         gp.update(gp_params or {})
         gp.pop("rl_min_solo", None)                         # 只有 RL 的池子用
+        # warmup 是 trim(下面显式传),调用方算不出 trim(warmed_view 在 :244,trim 只在
+        # 落盘那两处报告里用,见 WP8 设计),所以不让它从 gp_params 里漏进来跟显式参数打架。
+        gp.pop("warmup", None)
         seed_src = gp.pop("seed_population", None)
         if seed_src:
             from .legacy import load_seed_population
@@ -373,7 +382,7 @@ def run_mining(
                     on_block=on_block, cost_per_side=cost_per_side,
                     checkpoint_dir=ckpt_dir,
                     on_engine_progress=(engine_progress if engine_progress_every > 0 else None),
-                    checkpoint_every=checkpoint_every, workdir=workdir, **gp)
+                    checkpoint_every=checkpoint_every, workdir=workdir, warmup=trim, **gp)
         if member is not None:
             # GPMiner 自己建引擎:不在这里套上股票池那层,GP 的面板就全是池外也有值的
             m.engine = UniverseEngine(m.engine, member)
@@ -399,13 +408,26 @@ def run_mining(
         if kind != "ic" or penalty > 0:
             from .mining.scoring import make_scorer
             scorer = make_scorer(target, kind, turnover_penalty=penalty, cost_per_side=cost_per_side,
-                                 min_coverage=min_coverage, min_scored_days=min_scored_days)
+                                 min_coverage=min_coverage, min_scored_days=min_scored_days,
+                                 dates=list(view.dates), warmup=trim)
         rank_ban = None
         if cfg.get("ban_rank_corr"):
             from .mining.rankban import RankSimilarityBan
             rank_ban = RankSimilarityBan(target.shape, float(cfg["ban_rank_corr"]))
+        banned_substructures = tuple(cfg.get("banned_substructures", ()))
+        if banned_substructures:
+            # 以前只有 GP 这条路(gp.py 的 GPMiner.__init__)验证过;RL 这边直接把元组
+            # 原样塞给 BatchRewarder,一个打错的键在这里不报错、也不封任何东西 —— 静默
+            # 失效。check_ban_key 和 GPMiner 用的是同一个函数,挑的字段集也一样
+            # (registry.fields,不含分钟轴以外的东西)。惰性 import:env.py 不认识
+            # gp.py,gp.py 也不认识 env.py,这里转一圈不会绕出循环。
+            from .mining.gp import check_ban_key
+            for key in banned_substructures:
+                check_ban_key(key, reg, reg.fields)
+        hooks = cfg.get("hooks")
         rew = BatchRewarder(engine, pool_obj, scorer=scorer, rank_ban=rank_ban, min_solo=cfg.get("rl_min_solo"),
-                            banned_substructures=tuple(cfg.get("banned_substructures", ())),
+                            banned_substructures=banned_substructures,
+                            accept=(hooks.accept if hooks is not None else None),
                             panel_cache_items=int(cfg.get("panel_cache_items", 256)),
                             panel_cache_bytes=cfg.get("panel_cache_bytes", 8 * 1024 ** 3))
         if rank_ban is not None and cfg.get("ban_exemplars"):
@@ -499,7 +521,9 @@ def run_mining(
         if table is not None:
             table.to_csv(run_dir / "combination.csv")
         (run_dir / "meta.json").write_text(json.dumps({
-            "store": str(getattr(store, "directory", store)), "start": start, "end": end, "dates": view.dates[trim:],
+            "store": str(getattr(store, "directory", store)),
+            "store_contract_hash": getattr(store, "contract_hash", None),
+            "start": start, "end": end, "dates": view.dates[trim:],
             "symbols": view.symbols, "label": lab.describe(), "miner": miner, "pool": pool, "budget": budget,
             "seed": seed, "pool_metrics": {k: float(v) for k, v in ens.items()}, "rejected": dict(rejected),
             "seconds": round(time.time() - t0, 1), "engine_seconds": round(engine_s, 1),

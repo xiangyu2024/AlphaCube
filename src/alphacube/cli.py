@@ -78,8 +78,8 @@ def cmd_research(a) -> int:
         print("research supports the return labels open_vwap15 / close", file=sys.stderr)
         return 2
     out = Path(a.out) / (a.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")) if a.out else None
-    evaluate_factors(open_cube_store(a.store), exprs, start=a.start, end=a.end, max_symbols=a.max_symbols,
-                     label=Label(a.label, a.horizon), device=a.device, out_dir=out,
+    evaluate_factors(open_cube_store(a.store, daily_root=a.daily_fields), exprs, start=a.start, end=a.end,
+                     max_symbols=a.max_symbols, label=Label(a.label, a.horizon), device=a.device, out_dir=out,
                      chunk_symbols=a.chunk_symbols, chunk_days=a.chunk_days)
     return 0
 
@@ -96,8 +96,8 @@ def cmd_calculate(a) -> int:
         return 2
     run_id = a.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
     run_factor_calculation(exprs, a.store, save_root=a.out or "factor_runs", run_id=run_id, start=a.start, end=a.end,
-                           max_symbols=a.max_symbols, factor_batch_size=a.batch_size, device=a.device,
-                           chunk_symbols=a.chunk_symbols, chunk_days=a.chunk_days,
+                           max_symbols=a.max_symbols, daily_root=a.daily_fields, factor_batch_size=a.batch_size,
+                           device=a.device, chunk_symbols=a.chunk_symbols, chunk_days=a.chunk_days,
                            defer_resource_risk=not a.allow_resource_risk, resume=not a.no_resume)
     if a.parquet:
         info = export_run_to_parquet(Path(a.out or "factor_runs") / run_id, a.parquet, store=a.store)
@@ -106,7 +106,16 @@ def cmd_calculate(a) -> int:
 
 
 def cmd_mine(a) -> int:
+    from .mining.scoring import scorer_kinds
     from .pipeline import run_mining
+    from .plugins import search_hooks_from
+
+    # build_parser() runs before --plugin is loaded (main()), so --fitness can no
+    # longer be validated by argparse's own choices= -- a plugin-registered kind
+    # would not be in a list built that early. scorer_kinds() here sees whatever
+    # main() already loaded, since cmd_mine only runs after that.
+    if a.fitness not in scorer_kinds():
+        raise SystemExit(f"--fitness must be one of {scorer_kinds()}, not {a.fitness!r}")
 
     frac = os.environ.get("ALPHACUBE_GPU_FRACTION")
     if frac and str(a.device).startswith("cuda"):
@@ -124,7 +133,10 @@ def cmd_mine(a) -> int:
               panel_cache_bytes=int(a.panel_cache_gb * 1024 ** 3),
               banned_substructures=tuple(a.ban),
               ban_rank_corr=a.ban_rank_corr, fitness_kind=a.fitness, turnover_penalty=a.turnover_penalty,
-              archive_dedup=a.archive_dedup)
+              archive_dedup=a.archive_dedup, wall_seconds=a.wall_seconds)
+    hooks = search_hooks_from(a.plugin)
+    if hooks is not None:
+        gp["hooks"] = hooks
     if a.rl_min_solo is not None:
         gp["rl_min_solo"] = a.rl_min_solo
     if a.seed_population:
@@ -152,7 +164,7 @@ def cmd_mine(a) -> int:
         max_expr_len=a.max_expr_len, combine_methods=tuple(x for x in a.combine.split(",") if x),
         combine_train_frac=a.combine_train_frac, out_root=a.out, run_id=a.run_id,
         smooth_halflives=tuple(float(x) for x in a.smooth_halflives.split(",") if x),
-        mirror_root=a.mirror_root, universe=(a.universe or None),
+        mirror_root=a.mirror_root, daily_root=a.daily_fields, universe=(a.universe or None),
     )
     return 0 if res.pool_size else 1
 
@@ -176,6 +188,16 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--mirror-root", default=None,
                         help="D-major mirrors built by scripts/build_mirror.py (a store may be read-only); "
                              "D rounds then read contiguous (D, S, M) blocks instead of strided (S, D, M) ones")
+    common.add_argument("--daily-fields", default=None, metavar="DIR",
+                        help="dailyfields.DailyFieldStore directory (FloatCap/TotalCap/FloatShares + "
+                             "meta.json, built by scripts/build_daily_fields.py); default "
+                             "$ALPHACUBE_DAILY_FIELDS, else none. The three derived fields "
+                             "(LimitWidth/BoardCode/ListAge) resolve even with no directory at all")
+    common.add_argument("--plugin", action="append", default=[], metavar="MODULE",
+                        help="importable module to load before this command runs (repeatable) -- may "
+                             "register operators, a --fitness kind, or (mine only) search hooks; see "
+                             "alphacube.plugins. Also $ALPHACUBE_PLUGINS, a comma list, used when --plugin "
+                             "is not given at all")
     common.add_argument("--start", default=None, help="YYYYMMDD, snaps to the first trading day >= it")
     common.add_argument("--end", default=None)
     common.add_argument("--max-symbols", type=int, default=None)
@@ -215,6 +237,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "只在进过池子的票上算因子,标签和因子面板的池外格子都置空")
     m.add_argument("--pool", default="mse", choices=POOLS)
     m.add_argument("--budget", type=int, default=480)
+    m.add_argument("--wall-seconds", type=float, default=0.0,
+                   help="GP only: stop mining after about this many seconds, checked once per generation "
+                        "(after the rolling-block rebuild too, when one happens) -- 0 runs the whole "
+                        "--budget regardless of wall time")
     m.add_argument("--population", type=int, default=24, help="GP population")
     m.add_argument("--min-depth", type=int, default=2)
     m.add_argument("--max-depth", type=int, default=4)
@@ -327,12 +353,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "after --turnover-penalty) is below this does not enter the pool; it is paid that fitness "
                         "(floored at half the invalid-expression penalty) the first time and the penalty on repeats. "
                         "Unset = the pool admits on combination IC alone")
-    m.add_argument("--fitness", default="ic", choices=("ic", "rank_ic", "long", "long_hit"),
+    m.add_argument("--fitness", default="ic",
                    help="GP fitness base: |mean daily Pearson IC| (ic) or |mean daily rank IC| (rank_ic); "
                         "long = the factor traded on its own as a long-only top-decile book (net excess Sharpe "
                         "and return after --cost-per-side, plus IC / rank IC on the long half; "
                         "mining/scoring.LongScorer); long_hit = long-side hit rates plus several long-only "
-                        "books built from the factor's cross-sectional rank (mining/scoring.LongHitScorer). "
+                        "books built from the factor's cross-sectional rank (mining/scoring.LongHitScorer); "
+                        "or a kind a --plugin registered (mining.scoring.register_scorer). No choices= here --"
+                        "a plugin's kind would not be known yet when this parser is built (before --plugin "
+                        "loads, see main()); cmd_mine validates it against scorer_kinds() instead, after "
+                        "plugins have loaded, and names the full list on a bad value. "
                         "--turnover-penalty is not used with the long kinds")
     m.add_argument("--turnover-penalty", type=float, default=0.0,
                    help="GP fitness = |IC or rank IC| - this x daily turnover of the top/bottom decile book "
@@ -346,6 +376,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    # --plugin is repeatable on research/calculate/mine (the `common` parent parser);
+    # `synth` has no such argument at all, hence getattr's default. ALPHACUBE_PLUGINS
+    # is the env equivalent for sweep scripts, consulted only when --plugin was not
+    # given even once -- the two are not merged, so a script that always exports the
+    # env var and sometimes also passes --plugin gets exactly what it asked for.
+    names = list(getattr(args, "plugin", []) or []) or \
+        [x for x in os.environ.get("ALPHACUBE_PLUGINS", "").split(",") if x]
+    if names:
+        from .plugins import load_plugins
+        print(f"plugins: {', '.join(load_plugins(names))}")
     return args.fn(args)
 
 

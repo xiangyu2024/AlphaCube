@@ -93,6 +93,7 @@ def evaluate_factors(
     end: Optional[str] = None,
     symbols: Optional[Sequence[str]] = None,
     max_symbols: Optional[int] = None,
+    daily_root: Optional[Union[str, Path]] = None,
     label: Label = Label("open_vwap15", 1),
     horizons: Sequence[int] = (1, 5, 10),
     quantiles: int = 5,
@@ -105,7 +106,7 @@ def evaluate_factors(
     quiet: bool = False,
 ) -> pd.DataFrame:
     if not isinstance(store, CubeStore):
-        store = CubeStore(store)
+        store = CubeStore(store, daily_root=daily_root)
     parsed, errors = parse_many(expressions, n_minutes=store.n_minutes)
     warm = max((max_window(e, "D") for e in parsed.values()), default=0) + warmup_buffer
     view, trim = warmed_view(store, start, end, warm, symbols, max_symbols)

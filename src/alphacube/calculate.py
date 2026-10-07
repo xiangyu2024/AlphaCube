@@ -76,6 +76,7 @@ def run_factor_calculation(
     end: Optional[str] = None,
     symbols: Optional[Sequence[str]] = None,
     max_symbols: Optional[int] = None,
+    daily_root: Optional[Union[str, Path]] = None,
     factor_batch_size: int = 64,
     warmup_buffer: int = 10,
     device: str = "cpu",
@@ -92,7 +93,7 @@ def run_factor_calculation(
     resumption); the run is then left IN_PROGRESS and a later call with
     ``resume=True`` finishes it."""
     if not isinstance(store, (CubeStore, SegmentedCubeStore)):
-        store = open_cube_store(store)
+        store = open_cube_store(store, daily_root=daily_root)
     run_dir = Path(save_root) / run_id
     values_dir = run_dir / "values"
     values_dir.mkdir(parents=True, exist_ok=True)

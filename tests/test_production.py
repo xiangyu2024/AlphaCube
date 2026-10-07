@@ -250,8 +250,13 @@ def test_cli_mine_takes_the_fitness_and_smoothing_knobs(tmp_path):
     assert (args.fitness, args.turnover_penalty, args.archive_dedup, args.smooth_halflives) == \
         ("rank_ic", 0.14, 0.99, "1,2,5")
     for bad in (["--fitness", "sharpe"],):
+        # WP8: --fitness lost its argparse choices= (a plugin's --fitness kind
+        # would not be known yet when build_parser() runs, before --plugin loads
+        # in main()), so parse_args() itself no longer rejects an unknown value --
+        # cmd_mine does, against scorer_kinds(), once the command actually runs.
+        bad_args = p.parse_args(["mine", "--store", "x", *bad])
         with pytest.raises(SystemExit):
-            p.parse_args(["mine", "--store", "x", *bad])
+            cmd_mine(bad_args)
 
     write_synthetic_store(tmp_path / "cube", n_symbols=20, n_days=90, n_minutes=24, seed=8, plant_beta=1.0)
     import contextlib
