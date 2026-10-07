@@ -444,3 +444,97 @@ def test_main_prefers_explicit_plugin_flag_over_the_env_var(tmp_path, monkeypatc
     assert env_mod not in out
     assert importlib.import_module(flag_mod).LOADED == ["flag"]
     assert not importlib.import_module(env_mod).LOADED
+
+
+# ---------------------------------------------------------------------------
+# $ALPHACUBE_PLUGINS must steer, not only load: cmd_mine's search_hooks lookup
+# resolves the same --plugin/env fallback main() does (cli._plugin_names), on
+# both miner branches. The regression it pins: main() used to load the env
+# plugin without putting it on the namespace, so cmd_mine's lookup saw [] and
+# the run was unsteered -- while printing `plugins: <mod>` and honouring the
+# plugin's operators and --fitness kind, so it still looked like a steer arm.
+# ---------------------------------------------------------------------------
+
+
+# A plugin with a real steering opinion (unlike _SCORER_PLUGIN_SOURCE above,
+# which only registers a --fitness kind and exposes no search_hooks at all).
+_HOOKS_PLUGIN_SOURCE = (
+    "from alphacube.plugins import SearchHooks\n"
+    "def _accept(tree):\n"
+    "    return True\n"
+    "def _op_weight(spec):\n"
+    "    return 1.0\n"
+    "def search_hooks():\n"
+    "    return SearchHooks(accept=_accept, op_weight=_op_weight)\n"
+)
+
+
+def test_env_var_plugin_delivers_its_search_hooks_to_the_gp_miner(tmp_path, monkeypatch, store):
+    """GP branch: reached through $ALPHACUBE_PLUGINS alone, the plugin's
+    search_hooks() must arrive as GPMiner(hooks=...) -- same as the --plugin
+    spelling of it (test_cli_mine_with_daily_fields_and_plugin_fitness..., and
+    the no-plugin control test_cli_mine_defaults_have_no_daily_store_and_no_hooks
+    which pins hooks=None)."""
+    captured = {}
+
+    class _RecordingGPMiner(RealGPMiner):
+        def __init__(self, *a, **kw):
+            captured["hooks"] = kw.get("hooks")
+            super().__init__(*a, **kw)
+
+    monkeypatch.setattr(mining_mod, "GPMiner", _RecordingGPMiner)
+    mod_name = "_wp8_env_hooks_plugin_gp"
+    _write_module(tmp_path, monkeypatch, mod_name, _HOOKS_PLUGIN_SOURCE)
+    monkeypatch.setenv("ALPHACUBE_PLUGINS", mod_name)
+
+    rc = cli.main(["mine", "--store", str(store.directory), "--label", "close",
+                   "--start", store.dates[5], "--budget", "12", "--population", "6", "--max-depth", "3",
+                   "--combine", "", "--out", str(tmp_path / "env_hooks_gp"), "--run-id", "r1"])
+    assert rc in (0, 1)              # a tiny 10-symbol store may or may not fill the pool
+    hooks = captured["hooks"]
+    assert hooks is not None, "$ALPHACUBE_PLUGINS dropped the plugin's search_hooks()"
+    expected = importlib.import_module(mod_name)
+    assert hooks.accept is expected._accept and hooks.op_weight is expected._op_weight
+
+
+def test_env_var_plugin_delivers_its_accept_hook_to_the_rl_rewarder(tmp_path, monkeypatch, store):
+    """RL branch, same root cause one layer down: gp_params["hooks"].accept is
+    what pipeline's alphasage branch forwards to BatchRewarder(accept=...), so
+    an env-var arm that lost `hooks` lost the accept hook too."""
+    captured = {}
+
+    class _RecordingRewarder(BatchRewarder):
+        def __init__(self, *a, **kw):
+            captured["accept"] = kw.get("accept")
+            super().__init__(*a, **kw)
+
+    monkeypatch.setattr(mining_mod, "BatchRewarder", _RecordingRewarder)
+    mod_name = "_wp8_env_hooks_plugin_rl"
+    _write_module(tmp_path, monkeypatch, mod_name, _HOOKS_PLUGIN_SOURCE)
+    monkeypatch.setenv("ALPHACUBE_PLUGINS", mod_name)
+
+    rc = cli.main(["mine", "--store", str(store.directory), "--label", "close", "--miner", "alphasage",
+                   "--start", store.dates[5], "--budget", "4", "--max-expr-len", "10", "--pool-capacity", "2",
+                   "--combine", "", "--out", str(tmp_path / "env_hooks_rl"), "--run-id", "r1"])
+    assert rc in (0, 1)
+    assert captured["accept"] is importlib.import_module(mod_name)._accept
+
+
+def test_plugin_names_is_the_one_resolver_both_entry_points_share(monkeypatch):
+    """cli._plugin_names resolves --plugin/$ALPHACUBE_PLUGINS for main() AND for
+    cmd_mine, so a namespace that never went through main()'s write-back (a
+    script calling cmd_mine directly, or main() changing how it dispatches)
+    still finds the env plugin -- and the flag still wins outright."""
+    args = cli.build_parser().parse_args(["mine", "--store", "x"])
+    args_with_flag = cli.build_parser().parse_args(["mine", "--store", "x", "--plugin", "a.b"])
+    synth_args = cli.build_parser().parse_args(["synth", "--out", "x"])      # no .plugin attribute at all
+
+    monkeypatch.setenv("ALPHACUBE_PLUGINS", "m.one,m.two")
+    assert cli._plugin_names(args) == ["m.one", "m.two"]
+    assert cli._plugin_names(args_with_flag) == ["a.b"]          # never merged with the env var
+    assert cli._plugin_names(synth_args) == ["m.one", "m.two"]
+
+    monkeypatch.setenv("ALPHACUBE_PLUGINS", "")
+    assert cli._plugin_names(args) == []                        # no empty-string module name
+    monkeypatch.delenv("ALPHACUBE_PLUGINS")
+    assert cli._plugin_names(args) == [] and cli._plugin_names(args_with_flag) == ["a.b"]

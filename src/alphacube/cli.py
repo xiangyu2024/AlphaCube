@@ -42,6 +42,24 @@ def _parse_exprs(items: List[str], file: Optional[str]) -> Dict[str, str]:
     return out
 
 
+def _plugin_names(a) -> List[str]:
+    """The plugin modules this invocation runs with: every ``--plugin`` if the
+    flag was given even once, else ``$ALPHACUBE_PLUGINS`` as a comma list. The
+    two are never merged, so a sweep script that always exports the env var and
+    sometimes also passes ``--plugin`` gets exactly what it asked for. ``synth``
+    has no ``--plugin`` argument at all (it does not inherit the ``common``
+    parent parser), hence getattr's default.
+
+    ``main()`` (which imports them) and ``cmd_mine`` (which reads their
+    ``search_hooks()`` off the same list) both resolve the names through here,
+    so an ``$ALPHACUBE_PLUGINS`` arm steers exactly like the ``--plugin``
+    spelling of it. Resolution only reads the namespace and the environment, so
+    the two calls agree whether or not ``main()`` ran first -- which is what
+    keeps ``cmd_mine(args)`` called directly by a script honest too."""
+    return list(getattr(a, "plugin", []) or []) or \
+        [x for x in os.environ.get("ALPHACUBE_PLUGINS", "").split(",") if x]
+
+
 def _kv(items: List[str]) -> Dict[str, float]:
     out = {}
     for it in items:
@@ -134,7 +152,9 @@ def cmd_mine(a) -> int:
               banned_substructures=tuple(a.ban),
               ban_rank_corr=a.ban_rank_corr, fitness_kind=a.fitness, turnover_penalty=a.turnover_penalty,
               archive_dedup=a.archive_dedup, wall_seconds=a.wall_seconds)
-    hooks = search_hooks_from(a.plugin)
+    # Not `a.plugin`: _plugin_names also honours $ALPHACUBE_PLUGINS, so the env
+    # route delivers search_hooks() instead of silently running unsteered.
+    hooks = search_hooks_from(_plugin_names(a))
     if hooks is not None:
         gp["hooks"] = hooks
     if a.rl_min_solo is not None:
@@ -377,15 +397,22 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     # --plugin is repeatable on research/calculate/mine (the `common` parent parser);
-    # `synth` has no such argument at all, hence getattr's default. ALPHACUBE_PLUGINS
-    # is the env equivalent for sweep scripts, consulted only when --plugin was not
-    # given even once -- the two are not merged, so a script that always exports the
-    # env var and sometimes also passes --plugin gets exactly what it asked for.
-    names = list(getattr(args, "plugin", []) or []) or \
-        [x for x in os.environ.get("ALPHACUBE_PLUGINS", "").split(",") if x]
+    # ALPHACUBE_PLUGINS is the env equivalent for sweep scripts -- see _plugin_names
+    # for which of the two wins.
+    names = _plugin_names(args)
     if names:
         from .plugins import load_plugins
         print(f"plugins: {', '.join(load_plugins(names))}")
+        if hasattr(args, "plugin"):
+            # Write the resolved list back, so everything downstream of here sees
+            # the plugins this run actually loaded rather than only the flag. The
+            # env route used to leave args.plugin == [] and cmd_mine read its
+            # search hooks off exactly that: an $ALPHACUBE_PLUGINS arm loaded the
+            # plugin (its operators and its --fitness kind worked, main() printed
+            # it) and silently dropped op_weight / accept / daily_fields /
+            # daily_leaf_prob / leaf_slots -- a steer arm that was in fact an
+            # unsteered run.
+            args.plugin = names
     return args.fn(args)
 
 
