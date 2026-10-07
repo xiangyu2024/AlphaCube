@@ -30,6 +30,25 @@
 **挖出来的东西都在**:服务器 `mining_runs/*/checkpoints/` 完好;本地有全量备份(§2);全部表达式
 去重汇总在 `~/Desktop/AlphaCube/mining_runs/全部因子表达式.csv`(1922 条)。
 
+### 新能力(2026-10-06):日频字段 + 搜索指引 → `docs/steering_and_daily_fields.md`
+
+这份交接之后加了一批能力,**单独一份文档** `docs/steering_and_daily_fields.md`(中文,
+每个例子都跑过)讲怎么用。接手前先扫一眼那份的 §0 一页表:
+
+- **日频字段进表达式**:9 个只有日频的字段(`FloatCap` / `LimitWidth` / `ListAge` / `Log*` …)
+  可以当叶子直接写,`cs_rank(div(day_sum(Amt), FloatCap))` 这种换手率因子现在就是一行表达式。
+  `--daily-fields DIR` 挂库(`scripts/build_daily_fields.py` 在服务器上建一次);
+  其中 3 个**派生**字段不用建库,给个 store 就有。
+- **外部插件能指引搜索**:算子权重 / 候选筛子 / 日频叶子 / 叶子槽位四个生成器关键字,
+  一个打分器注册表(插件自己注册 `--fitness` 取值),`--plugin MODULE` /
+  `$ALPHACUBE_PLUGINS` 加载。AlphaCube **永不主动 import 任何插件**。
+- **`real_valued`**:声明某个核函数输出是实数、跳过会误判它的布尔探针。机制做好了但
+  **一个都没声明**,所以可搜索算子数仍是 218 / 214。
+
+**所有新东西的默认值都选中今天这条代码路径**:不传新参数就和改动前逐 bit 相同。
+测试从 617 passed 涨到 **923 passed, 10 skipped, 1 xfailed**。
+设计文档(含每条决定的实测依据)在 `/Users/wxy/Desktop/Partura/docs/alphacube_steering_design.md`。
+
 ---
 
 ## 1. 这个项目是什么
