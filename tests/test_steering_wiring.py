@@ -344,7 +344,10 @@ def test_pipeline_says_and_records_the_unresolvable_daily_fields(tmp_path, store
                gp_params=dict(population_size=6, max_depth=3))
     assert not [ln for ln in lines if "cannot resolve" in ln]
     meta2 = json.loads((tmp_path / "runs2" / "r2" / "meta.json").read_text(encoding="utf-8"))
-    assert meta2["unresolvable_daily_fields"] == []
+    # No hooks given: not an empty list but no key at all, so an unsteered run's
+    # meta.json carries exactly the pre-steering keys (the key is written only for a
+    # run that was given hooks; tests/test_default_path_output.py pins all three cases).
+    assert "unresolvable_daily_fields" not in meta2
 
 
 # ---------------------------------------------------------------------------

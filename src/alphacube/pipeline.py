@@ -221,7 +221,6 @@ def run_mining(
     save_values: bool = True,
     log: Optional[Callable[[str], None]] = print,
 ) -> RunResult:
-    from . import dailyfields
     from .catalog import default_registry
     from .engine.engine import CubeEngine
     from .metrics import backtest_metrics, cs_pearson, ic_summary
@@ -234,10 +233,14 @@ def run_mining(
     t0 = time.time()
     if not isinstance(store, (CubeStore, SegmentedCubeStore)):
         store = open_cube_store(store, mirror_root=mirror_root, daily_root=daily_root)
-    if store.daily is not None:
-        say(f"daily fields {store.daily.root}: {', '.join(dailyfields.available(store.daily))}")
-    else:
-        say("daily fields: none attached")
+    # Said ONLY when a daily store is attached. A run that attaches none must print
+    # exactly the lines the pre-steering run_mining printed -- a caller that greps,
+    # counts or diffs its log would otherwise see every line shifted down by one --
+    # and "no such line" already is the report that nothing is attached.
+    daily_store = getattr(store, "daily", None)
+    if daily_store is not None:
+        from . import dailyfields
+        say(f"daily fields {daily_store.root}: {', '.join(dailyfields.available(daily_store))}")
     member = None
     if universe is not None:
         if symbols is not None or max_symbols is not None:
@@ -265,8 +268,12 @@ def run_mining(
     # once for BOTH branches and recorded in meta.json, so an arm that quietly burnt
     # budget can be told from a steered one afterwards. See mining.gp.
     # unresolvable_daily_fields for the measurement and for why this is not a raise.
+    # The meta.json key is written only for a run that was GIVEN hooks (an unsteered
+    # run has nothing to be unable to resolve, and the pre-steering key set stays
+    # exactly as it was); a steered run whose fields all resolve records [].
     from .mining.gp import unresolvable_daily_fields
-    unresolvable_daily = unresolvable_daily_fields((gp_params or {}).get("hooks"), view)
+    search_hooks = (gp_params or {}).get("hooks")
+    unresolvable_daily = unresolvable_daily_fields(search_hooks, view)
     if unresolvable_daily:
         say(f"!! search hooks name {len(unresolvable_daily)} daily field(s) this view cannot resolve: "
             f"{', '.join(unresolvable_daily)}; resolvable here: {', '.join(view.daily_fields) or '(none)'}. "
@@ -562,13 +569,20 @@ def run_mining(
         np.save(run_dir / "combined.npy", pool_obj.combined()[trim:].astype(np.float32))
         if table is not None:
             table.to_csv(run_dir / "combination.csv")
+        # The two optional keys are spliced in at their own positions, so a run with no
+        # daily store and no hooks writes exactly the pre-steering key set in the
+        # pre-steering order (the identical-defaults promise covers meta.json too).
         (run_dir / "meta.json").write_text(json.dumps({
             "store": str(getattr(store, "directory", store)),
-            "store_contract_hash": getattr(store, "contract_hash", None),
+            # Only with a daily store attached: the hash then covers the daily source as
+            # well (store.py), which is what makes two runs over different daily data
+            # tell apart. Without one it is a function of the minute store alone and was
+            # never recorded here. (calculate.py records its own, and always did.)
+            **({"store_contract_hash": getattr(store, "contract_hash", None)} if daily_store is not None else {}),
             "start": start, "end": end, "dates": view.dates[trim:],
             "symbols": view.symbols, "label": lab.describe(), "miner": miner, "pool": pool, "budget": budget,
             "seed": seed, "pool_metrics": {k: float(v) for k, v in ens.items()}, "rejected": dict(rejected),
-            "unresolvable_daily_fields": list(unresolvable_daily),
+            **({"unresolvable_daily_fields": list(unresolvable_daily)} if search_hooks is not None else {}),
             "seconds": round(time.time() - t0, 1), "engine_seconds": round(engine_s, 1),
         }, ensure_ascii=False, indent=2), encoding="utf-8")
         say(f"wrote {run_dir}")

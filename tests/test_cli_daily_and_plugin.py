@@ -146,11 +146,14 @@ def test_cli_mine_rejects_unknown_fitness_naming_scorer_kinds():
 
 
 def test_cli_mine_defaults_have_no_daily_store_and_no_hooks(tmp_path, monkeypatch, capsys, store):
-    """With neither --plugin nor --daily-fields: the say() line must report no
-    daily store attached, and the constructed GPMiner must receive no `hooks`
-    keyword at all -- not even hooks=None spelled out, just plain omission,
-    which is what reproduces today's construction exactly (WP7's own
-    test_gpminer_hooks_none_matches_omitting_hooks_entirely)."""
+    """With neither --plugin nor --daily-fields: run_mining must print no
+    daily-field line at all -- the log is exactly the pre-steering log, whose first
+    line is the "store ..." one (a "daily fields: none attached" line used to be a
+    new first line on every run; it is said only when a daily store IS attached,
+    see tests/test_default_path_output.py) -- and the constructed GPMiner must
+    receive no `hooks` keyword at all -- not even hooks=None spelled out, just
+    plain omission, which is what reproduces today's construction exactly (WP7's
+    own test_gpminer_hooks_none_matches_omitting_hooks_entirely)."""
     captured = {}
 
     class _RecordingGPMiner(RealGPMiner):
@@ -167,7 +170,8 @@ def test_cli_mine_defaults_have_no_daily_store_and_no_hooks(tmp_path, monkeypatc
     assert "hooks" in captured and captured["hooks"] is None
 
     stdout = capsys.readouterr().out
-    assert "daily fields: none attached" in stdout
+    assert "daily field" not in stdout.lower(), stdout
+    assert stdout.splitlines()[0].startswith("store "), stdout.splitlines()[:2]
 
 
 # ---------------------------------------------------------------------------
