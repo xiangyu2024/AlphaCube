@@ -9,13 +9,17 @@ digit-first symbol spelling from WP3 so ``dailyfields.require_board_rule``,
 which this script also runs per its own docstring's second call site, passes
 on every fixture here for free).
 
-DEVIATION, recorded here (see this package's ``notes``, not asserted as fact
-in the script's own docstring beyond its own DEVIATION paragraph): the
-design leaves FloatShares's source column name unspecified ("a share column
-if one exists"). ``build_daily_fields.SHARE_COLUMN_CANDIDATES`` is this
-implementation's documented guess; the tests below exercise both the
-present- and absent-share-column paths against that guess rather than
-against a real production schema, which was not available this session.
+FloatShares's source column. The design leaves it unspecified ("a share column
+if one exists"); it was MEASURED on the production data on 2026-10-07
+(read-only): every daily capital parquet, 20180102.parquet through
+20260916.parquet (2114 files), has exactly the columns ``date, symbol,
+day_status, circulating_capital, total_capital, circulating_market_value,
+total_market_value``, and ``circulating_capital`` is the float share count.
+``build_daily_fields.SHARE_COLUMN_CANDIDATES`` therefore leads with
+``circulating_capital`` (``PRODUCTION_COLUMNS`` below is that schema, and the
+primary fixture writes it); the older guessed spellings stay as fallbacks, and
+the tests below still run them -- plus the absent-share-column path -- so a
+differently spelled schema keeps working.
 """
 
 from __future__ import annotations
@@ -41,15 +45,43 @@ from alphacube.synthetic import write_synthetic_store          # noqa: E402
 # helpers
 # ---------------------------------------------------------------------------
 
+# The schema MEASURED on the production data (2026-10-07, read-only): exactly these
+# columns, in this order, in every one of the 2114 daily capital files.
+PRODUCTION_COLUMNS = ["date", "symbol", "day_status", "circulating_capital", "total_capital",
+                      "circulating_market_value", "total_market_value"]
+
+
 def _write_cap_file(cap_dir: Path, date: str, symbols: Sequence[str], cap: Sequence[float],
                     tot: Sequence[float], shares: Optional[Sequence[float]] = None,
-                    share_column: str = "circulating_shares") -> None:
+                    share_column: str = "circulating_capital",
+                    extra: Optional[dict] = None) -> None:
     cap_dir.mkdir(parents=True, exist_ok=True)
     data = {"symbol": list(symbols), "circulating_market_value": list(cap),
            "total_market_value": list(tot)}
     if shares is not None:
         data[share_column] = list(shares)
+    data.update(extra or {})
     pd.DataFrame(data).to_parquet(cap_dir / f"{date}.parquet")
+
+
+def _write_production_schema_file(cap_dir: Path, date: str, symbols: Sequence[str],
+                                  float_shares: Sequence[float], total_shares: Sequence[float],
+                                  price: Sequence[float]) -> None:
+    """A capital snapshot with EXACTLY the seven measured columns. Market values are
+    share count x a per-symbol price, as in production (000001.SZ on 2026-09-16:
+    1.940568e10 float shares, 2.270465e11 float market value, about 11.70 a share).
+    Only the column NAMES were measured: the dtypes of ``date`` and ``day_status``
+    here are placeholders, and the script reads neither column."""
+    cap_dir.mkdir(parents=True, exist_ok=True)
+    n = len(symbols)
+    df = pd.DataFrame({
+        "date": [date] * n, "symbol": list(symbols), "day_status": [1] * n,
+        "circulating_capital": list(float_shares), "total_capital": list(total_shares),
+        "circulating_market_value": [s * p for s, p in zip(float_shares, price)],
+        "total_market_value": [s * p for s, p in zip(total_shares, price)],
+    })
+    assert list(df.columns) == PRODUCTION_COLUMNS
+    df.to_parquet(cap_dir / f"{date}.parquet")
 
 
 def _store(tmp_path, **kw):
@@ -91,7 +123,7 @@ def test_build_writes_correct_planes_with_a_missing_date_and_a_missing_symbol(tm
     assert meta["n_symbols"] == 4 and meta["n_days"] == 3
     assert meta["columns_used"] == {"FloatCap": "circulating_market_value",
                                     "TotalCap": "total_market_value",
-                                    "FloatShares": "circulating_shares"}
+                                    "FloatShares": "circulating_capital"}
     assert set(meta["coverage"]) == {"FloatCap", "TotalCap", "FloatShares"}
     for name in ("FloatCap", "TotalCap", "FloatShares"):
         assert meta["coverage"][name] == pytest.approx(7 / 12)
@@ -264,7 +296,7 @@ def test_floatshares_is_omitted_when_no_share_column_is_present(tmp_path):
     assert "FloatShares" not in meta["columns_used"]
 
 
-@pytest.mark.parametrize("candidate", ["circulating_shares", "float_shares", "share_count"])
+@pytest.mark.parametrize("candidate", ["circulating_capital", "circulating_shares", "float_shares", "share_count"])
 def test_floatshares_is_built_from_whichever_candidate_column_is_actually_present(tmp_path, candidate):
     store = _store(tmp_path)
     cap_dir = tmp_path / "daily_capital"
@@ -277,6 +309,81 @@ def test_floatshares_is_built_from_whichever_candidate_column_is_actually_presen
     meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
     assert meta["columns_used"]["FloatShares"] == candidate
     np.testing.assert_array_equal(np.load(out / "daily_FloatShares.npy"), np.full((4, 3), 9e7))
+
+
+def test_share_column_candidates_lead_with_the_measured_name_and_keep_the_old_spellings_as_fallbacks():
+    assert bdf.SHARE_COLUMN_CANDIDATES[0] == "circulating_capital"
+    for fallback in ("circulating_shares", "circulating_share", "circ_shares", "circulating_a_shares",
+                     "float_shares", "float_a_shares", "free_shares", "share_count"):
+        assert fallback in bdf.SHARE_COLUMN_CANDIDATES
+    assert "total_capital" not in bdf.SHARE_COLUMN_CANDIDATES      # the TOTAL share count is not the float count
+
+
+def test_a_schema_with_exactly_the_seven_measured_columns_builds_all_three_stored_fields(tmp_path):
+    """The production schema, as measured: date, symbol, day_status, circulating_capital,
+    total_capital, circulating_market_value, total_market_value. FloatShares comes from
+    circulating_capital -- NOT total_capital, whose values differ here so a wrong-column read
+    cannot pass -- and the default 0.5 coverage gate is left on (every date is present)."""
+    store = _store(tmp_path)
+    cap_dir = tmp_path / "daily_capital"
+    float_shares = [1.940568e10, 2.0e9, 3.0e9, 4.0e9]
+    total_shares = [2.5e10, 2.5e9, 3.5e9, 4.5e9]
+    price = [11.70, 20.0, 30.0, 40.0]
+    for d in store.dates:
+        _write_production_schema_file(cap_dir, d, store.symbols, float_shares, total_shares, price)
+
+    _, columns, _ = bdf.probe_schema(cap_dir, store.dates)
+    assert columns == PRODUCTION_COLUMNS
+    assert bdf.choose_columns(columns, None) == {"FloatCap": "circulating_market_value",
+                                                  "TotalCap": "total_market_value",
+                                                  "FloatShares": "circulating_capital"}
+
+    out = tmp_path / "daily_fields"
+    assert bdf.main(["--store", str(store.directory), "--cap-dir", str(cap_dir), "--out", str(out)]) == 0
+    meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
+    assert set(meta["fields"]) == {"FloatCap", "TotalCap", "FloatShares"}
+    assert meta["columns_used"] == {"FloatCap": "circulating_market_value",
+                                    "TotalCap": "total_market_value",
+                                    "FloatShares": "circulating_capital"}
+    expect = {"FloatCap": [s * p for s, p in zip(float_shares, price)],
+              "TotalCap": [s * p for s, p in zip(total_shares, price)],
+              "FloatShares": float_shares}
+    for name, per_symbol in expect.items():
+        got = np.load(out / f"daily_{name}.npy")
+        assert got.dtype == np.float64 and got.shape == (4, 3)
+        np.testing.assert_array_equal(got, np.tile(np.asarray(per_symbol)[:, None], (1, 3)))
+    assert set(DailyFieldStore(out).fields) == {"FloatCap", "TotalCap", "FloatShares"}
+
+
+def test_circulating_capital_outranks_every_fallback_spelling_in_the_same_schema(tmp_path):
+    store = _store(tmp_path)
+    cap_dir = tmp_path / "daily_capital"
+    for d in store.dates:
+        _write_cap_file(cap_dir, d, store.symbols, cap=[1e9] * 4, tot=[2e9] * 4, shares=[9e7] * 4,
+                        share_column="circulating_capital",
+                        extra={"circulating_shares": [1.0] * 4, "float_shares": [2.0] * 4, "share_count": [3.0] * 4})
+    out = tmp_path / "daily_fields"
+    assert bdf.main(["--store", str(store.directory), "--cap-dir", str(cap_dir), "--out", str(out),
+                     "--min-coverage", "0.0"]) == 0
+    meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
+    assert meta["columns_used"]["FloatShares"] == "circulating_capital"
+    np.testing.assert_array_equal(np.load(out / "daily_FloatShares.npy"), np.full((4, 3), 9e7))
+
+
+def test_total_capital_alone_is_never_taken_for_the_float_share_count(tmp_path):
+    """total_capital is the TOTAL share count. With no float-share column in the schema
+    FloatShares is simply not built; it must not fall back to the wrong count."""
+    store = _store(tmp_path)
+    cap_dir = tmp_path / "daily_capital"
+    for d in store.dates:
+        _write_cap_file(cap_dir, d, store.symbols, cap=[1e9] * 4, tot=[2e9] * 4, shares=None,
+                        extra={"total_capital": [5e8] * 4})
+    out = tmp_path / "daily_fields"
+    assert bdf.main(["--store", str(store.directory), "--cap-dir", str(cap_dir), "--out", str(out),
+                     "--min-coverage", "0.0"]) == 0
+    meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
+    assert set(meta["fields"]) == {"FloatCap", "TotalCap"}
+    assert not (out / "daily_FloatShares.npy").exists()
 
 
 def test_only_restricts_the_built_fields_even_when_more_columns_are_available(tmp_path):

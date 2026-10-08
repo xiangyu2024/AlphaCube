@@ -153,6 +153,23 @@ python scripts/build_daily_fields.py \
     --min-coverage 0.5 --dry-run        # 先 dry-run 看清楚再去掉
 ```
 
+读哪几列(2026-10-07 在生产数据上只读实测:`daily_capital/` 下 `20180102.parquet` 到
+`20260916.parquet` 共 2114 个文件,**每一个**都恰好是
+`date, symbol, day_status, circulating_capital, total_capital, circulating_market_value, total_market_value`
+这七列,symbol 写法如 `000001.SZ`):
+
+| 字段 | 读的列 | 含义 |
+|---|---|---|
+| `FloatCap` | `circulating_market_value` | 流通市值 |
+| `TotalCap` | `total_market_value` | 总市值 |
+| `FloatShares` | `circulating_capital` | 流通**股数**(`SHARE_COLUMN_CANDIDATES` 的第一个) |
+
+`total_capital` 是总股数,没有对应的存储字段(没有 `TotalShares`),不读。例:000001.SZ 在
+2026-09-16 的 `circulating_capital` 是 1.940568e10 股、`circulating_market_value` 是 2.270465e11,
+约 11.70 元/股。`SHARE_COLUMN_CANDIDATES` 里其余的拼写(`circulating_shares`、`float_shares`
+……)只是给别的 schema 留的退路,在生产 schema 上一个都匹配不上;一个候选都不匹配时
+`FloatShares` 就不建(从不反算)。每个字段实际读了哪一列记在 `meta.json` 的 `columns_used` 里。
+
 脚本做的事,按顺序:
 
 1. **只读**打开 cube store,只为拿它那套 canonical symbols / dates —— 平面天生就是对齐的;

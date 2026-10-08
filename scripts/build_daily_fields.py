@@ -33,17 +33,27 @@ symbols are always printed side by side (must_fix #2's third, visible
 defence -- scripts/tearsheet.py's load_caps, the function this script's
 column reads mirror, has zero test coverage of its own symbol mapping).
 
-DEVIATION, recorded here rather than asserted as fact (see this package's
-notes): the design pins FloatCap/TotalCap's exact source columns
-(circulating_market_value / total_market_value -- scripts/tearsheet.py:52)
-but, by its own wording, leaves FloatShares's share-count column unnamed ("a
-share column if one exists") -- no production parquet schema was reachable
-this session to confirm a real name. SHARE_COLUMN_CANDIDATES below is a
-documented, best-effort guess among common vendor spellings, not a measured
-fact; whichever one (if any) actually matches the probed schema is recorded
-in meta.json's columns_used either way, so the choice stays auditable, and
-FloatShares is simply never written when none match (never synthesised from
-FloatCap / Close -- step 6).
+The source columns. The design pins FloatCap/TotalCap's exact source columns
+(circulating_market_value / total_market_value -- scripts/tearsheet.py:52) but,
+by its own wording, leaves FloatShares's share-count column unnamed ("a share
+column if one exists"). That column is now MEASURED (2026-10-07, read-only, on
+the production data): every daily capital parquet, 20180102.parquet through
+20260916.parquet (2114 files), has exactly these columns --
+
+    date, symbol, day_status, circulating_capital, total_capital,
+    circulating_market_value, total_market_value
+
+-- with symbols spelled like ``000001.SZ``. ``circulating_capital`` is the float
+SHARE COUNT (000001.SZ on 2026-09-16: circulating_capital 1.940568e10 against
+circulating_market_value 2.270465e11, i.e. about 11.70 a share) and
+``total_capital`` is the total share count. So FloatShares is built from
+``circulating_capital``, which heads SHARE_COLUMN_CANDIDATES; the other
+candidates are kept as fallbacks for a differently spelled schema and match
+nothing on the measured one. ``total_capital`` has no stored field to feed
+(there is no TotalShares) and is not read. Whichever column is used (if any)
+is recorded in meta.json's columns_used either way, so the choice stays
+auditable, and FloatShares is simply never written when none match (never
+synthesised from FloatCap / Close -- step 6).
 """
 from __future__ import annotations
 
@@ -66,11 +76,14 @@ SYMBOL_COLUMN = "symbol"
 # pinned by the design (WP9 step 4) -- these two are mandatory, not optional.
 CAP_COLUMN = "circulating_market_value"        # -> FloatCap
 TOTAL_COLUMN = "total_market_value"            # -> TotalCap
-# "a share column if one exists" (design step 6) -- genuinely unnamed by the
-# design, unlike the two above; see the module docstring DEVIATION. The first
-# name below present in the probed schema wins; none present means
-# FloatShares is simply not built (never synthesised -- step 6).
+# "a share column if one exists" (design step 6) -- unnamed by the design, unlike
+# the two above, and measured on the production data on 2026-10-07 (see the module
+# docstring): circulating_capital, the float share count. It comes FIRST. The first
+# name below present in the probed schema wins; the rest are fallbacks for a
+# differently spelled schema (none of them exists in production); none present
+# means FloatShares is simply not built (never synthesised -- step 6).
 SHARE_COLUMN_CANDIDATES: Tuple[str, ...] = (
+    "circulating_capital",
     "circulating_shares", "circulating_share", "circ_shares", "circulating_a_shares",
     "float_shares", "float_a_shares", "free_shares", "share_count",
 )
