@@ -45,8 +45,11 @@
 - **`real_valued`**:声明某个核函数输出是实数、跳过会误判它的布尔探针。机制做好了但
   **一个都没声明**,所以可搜索算子数仍是 218 / 214。
 
-**所有新东西的默认值都选中今天这条代码路径**:不传新参数就和改动前逐 bit 相同。
-测试从 617 passed 涨到 **923 passed, 10 skipped, 1 xfailed**。
+**所有新东西的默认值都选中今天这条代码路径**:不传新参数(也不设 `$ALPHACUBE_DAILY_FIELDS` /
+`$ALPHACUBE_PLUGINS`)时,随机流、数值结果、`run_mining` 的日志行和 `meta.json` 的键与改动前逐字节相同
+(基线与本分支逐文件对拍过);**例外**是 `docs/steering_and_daily_fields.md` §7.2 列的几处故意的
+行为改变,最容易踩到的一条:RL 路径现在会校验 `--ban` 的键,对永远不可能命中的键抛 `ValueError`。
+测试从 617 passed 涨到 **966 passed, 10 skipped, 1 xfailed**。
 设计文档(含每条决定的实测依据)在 `/Users/wxy/Desktop/Partura/docs/alphacube_steering_design.md`。
 
 ---

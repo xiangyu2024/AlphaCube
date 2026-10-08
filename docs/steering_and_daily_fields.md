@@ -9,8 +9,11 @@
 > 相关:`docs/HANDOFF.md`(引擎 / 挖掘的总交接)、`docs/可交易回测.md`(回测口径)。
 >
 > **一句话**:所有新东西的默认值都选中今天这条代码路径。不传新参数、不加 `--plugin`、
-> 不给 `--daily-fields`,随机流和结果与改动前逐 bit 相同;可搜索算子数仍是 218 / 214,
-> 算子总数仍是 244。
+> 不给 `--daily-fields`(也没设 `$ALPHACUBE_DAILY_FIELDS` / `$ALPHACUBE_PLUGINS`),随机流、每个数值
+> 结果、`run_mining` 打印的日志行、`meta.json` 的键和键序都与改动前逐字节相同(基线 `517fd09`
+> 与本分支各跑一遍、逐文件比对,见 §7);可搜索算子数
+> 仍是 218 / 214,算子总数仍是 244。**例外**是 §7.2 列的几处故意的行为改变 —— 最容易踩到的一条:
+> RL 路径现在会校验 `--ban` 的键,对永远不可能命中的键抛 `ValueError`,以前是静默忽略。
 
 ---
 
@@ -195,7 +198,10 @@ python scripts/build_daily_fields.py \
 - **数据身份**:`store.contract_hash` 在**两个** store 类里都混入了
   `dailyfields.fingerprint(self.daily)` —— **仅当真的挂了日频库时**,所以没挂库的
   store,hash 与改动前逐 byte 相同。`SegmentedCubeStore` 不是 `CubeStore` 的子类、
-  也不调 `super().__init__`,两处都得各自改,别只改一处。
+  也不调 `super().__init__`,两处都得各自改,别只改一处。`run_mining` 同样只在**挂了**日频库时
+  才把它写进 `meta.json` 的 `store_contract_hash`、才打印 `daily fields <目录>: <可用字段>` 那一行;
+  没挂库的 run 两者都没有,日志和 `meta.json` 与改动前逐字相同(§7.1)。`calculate.py` 的
+  `store_contract_hash` 是改动前就有的,不在此列。
 - **exemplar 缓存身份**:`rankban.view_cache_key(..., daily=None)`。这个 key 以前
   **完全不含 store 身份**,而 `ExemplarCache` 把排名指纹按 `root/<view_key>/` 存盘、
   构造时还会删掉别的 view key —— 日频库重建一次,旧指纹会活下来,排名封禁就会去拒错的候选。
@@ -254,9 +260,10 @@ mutation_checks_bans: bool = True       # 只为逐 bit 复现某次老的 --ban
   `LimitWidth` / `BoardCode` / `ListAge` 三个派生字段,`FloatCap` 这种带 hooks 写进去
   照样构造成功、照样抽得出来、求值时照样被丢掉 —— 所以 `GPMiner` 会 `warnings.warn`
   点名这些字段(也留在 `miner.unresolvable_daily_fields` 上),`run_mining` 会
-  `say()` 一行 `!! search hooks name N daily field(s) this view cannot resolve: ...`
-  并写进 `meta.json` 的 `unresolvable_daily_fields`。想当场拦住就自己比一下
-  `view.daily_fields`。
+  `say()` 一行 `!! search hooks name N daily field(s) this view cannot resolve: ...`,
+  并在**这次 run 给了 `hooks`** 时写进 `meta.json` 的 `unresolvable_daily_fields`
+  (给了 hooks 而字段都解析得出来则写 `[]`;没给 hooks 的 run 不写这个键,`meta.json` 的键集
+  与改动前完全一样)。想当场拦住就自己比一下 `view.daily_fields`。
 - **`leaf_slots`** —— 位置提示,`_operand_reqs` 表达不了的那种:一个 nd 面二元算子的
   **两个**槽位都是 `"daily"` 要求,所以搜索本身无从知道哪个槽位是"分桶用的条件变量"。
   `leaf_slots={"cs_regres": {1: ("FloatCap",)}}` 让 `_build` 直接把槽位 1 填成日频叶子
@@ -326,6 +333,9 @@ docstring 本来就断言了这条不变式("封禁必须在每个验收点都�
 **(c) `--fitness` 去掉了 argparse 的 `choices=`。** 打错现在由 `cmd_mine` 对着
 `scorer_kinds()` 拒绝(报错信息里列全),不再由 argparse 拒绝;shell 补全也不再提示列表。
 原因:`build_parser()` 在插件加载**之前**跑,静态 `choices` 看不见插件注册的 kind。
+
+另有一处故意的行为改变**不在生成器里**:RL 分支现在会校验 `--ban` 的键,对永远不可能命中的键
+抛 `ValueError`(以前静默忽略)。受影响的输入和实测见 §7.2。
 
 ---
 
@@ -553,17 +563,21 @@ AlphaCube 自己的核函数里**恰好三个**被误判:`in_sustain_mean`、`in
    在全量 view 上值 22.0、在往后挪 20 天的 view 上值 10010.0,而且因为窗口首日之前上市的
    股票全都领到哨兵值,平面会在横截面上**退化成常数** —— `cs_rank(ListAge)` 变成一片并列。
    `contract_hash` 不随窗口变,所以没有任何东西会标记这件事。
-6. **指引 nd 算子时,`nt_` 孪生体要单独写一遍。** `op_weight` 的 `{名字: 权重}` 形式和
-   `leaf_slots` 的 key 都按 `spec.name` 匹配,而 48 个 nd 面核函数每个都注册**两次**
-   (ND 面用自己的名字,NT 面用 `nt_<name>`)。所以 `{"cs_mean": 0.0}` 只掐掉一半,
-   质量还会**挪到**孪生体上(实测 120 seed:`nt_cs_mean` 从 5 次升到 9 次)。
-   这不会报错 —— 打错名字会报,"只写了一半"不会。Partura 侧已经有
-   `ac_plugin.partura_operator_names()` 专门把 `nt_` 展开,写新的指引时照抄那个做法。
-7. **日频叶子名字打错不会在构造时报错。** `op_weight` 的算子名在构造时就校验,
-   但 `daily_fields=` / `leaf_slots=` 里的**字段名没有校验**。GP 用
-   `tolerant=True` 求值,所以 `daily_fields=("FlotCap",)` 这种打错会让每个带它的候选
-   **静默地**在求值时被丢掉,看起来就像指引没起作用。用 `view.daily_fields` 或
-   `dailyfields.available(store.daily)` 先对一遍名字。
+6. **nd 算子有两个名字;映射写法会替你展开,可调用对象不会。** 48 个 nd 面核函数每个都注册
+   **两次**(ND 面用自己的名字,NT 面用 `nt_<name>`),`op_weight` 的 `{名字: 权重}` 形式和
+   `leaf_slots` 的 key 都按 `spec.name` 匹配。以前只写 ND 那个名字就只指引一半
+   (`{"cs_mean": 0.0}` 让 `cs_mean` 从 148 次降到 0,`nt_cs_mean` 17 次还是 17 次);现在
+   映射的 key 自动展开到 `nt_` 孪生体,显式写 `nt_` 永远优先(§2)。**仍要自己展开的只有
+   可调用对象形式的 `op_weight`**:它自己看得见每个 spec 的两个面。(这条旧版写过"质量会挪到
+   孪生体上、5 次升到 9 次",那是 120 个 seed 下的噪声,不是被挪走的质量,见 §2。)
+   Partura 侧 `ac_plugin.partura_operator_names()` 手工展开 `nt_` 的做法仍然有效,只是不再必需。
+7. **日频叶子的名字:拼写在构造时校验,"这个 run 有没有数据"要另外对。** `daily_fields=` /
+   `leaf_slots=` 里的字段名现在会在构造时对着 `registry.daily_fields` 查,打错直接
+   `ValueError`(§2)。但"名字合法"不等于"有数据":没挂 `--daily-fields` 的视图只解析得出三个
+   派生字段,`FloatCap` 这种照样构造成功、照样抽得出来,求值时被丢掉(GP 用 `tolerant=True`
+   求值)。这种情况现在会被点名(`GPMiner` 的 `warnings.warn`、`run_mining` 的 `!!` 日志行,
+   给了 hooks 时还写进 `meta.json`;§2),想当场拦住就自己用 `view.daily_fields` 或
+   `dailyfields.available(store.daily)` 先对一遍。
 8. **`hook_rng` 的种子不是设计文档里那个字面公式。** 设计写的是
    `random.Random((seed * 2654435761) & 0xFFFFFFFF)`;实现改成了从生成器那条流的
    `getstate()` 派生。原因实测:唯一的在树内构造点 `gp.py` 是用 `rng=self._rng` 建生成器、
@@ -578,9 +592,13 @@ AlphaCube 自己的核函数里**恰好三个**被误判:`in_sustain_mean`、`in
 
 ---
 
-## 7. 向后兼容:为什么默认什么都不变
+## 7. 向后兼容:默认路径上什么不变、什么变了
 
-逐条列在设计文档的 "Backward compatibility"(15 条)。要点:
+逐条列在设计文档的 "Backward compatibility"(15 条)。下面分两半:**不传新参数、不加 `--plugin`、
+不给 `--daily-fields`、也没设 `$ALPHACUBE_DAILY_FIELDS` / `$ALPHACUBE_PLUGINS`** 时,什么与改动前
+逐字节相同(§7.1);以及那几处**确实**变了的(§7.2)。
+
+### 7.1 不变的
 
 - 新叶子类 `DailyFeature` 是**新类**,不是 `Feature(field, daily=True)` ——
   别处有五个 `isinstance(n, Feature)` 的判断点,加 flag 会让它们全部悄悄改变语义。
@@ -593,6 +611,58 @@ AlphaCube 自己的核函数里**恰好三个**被误判:`in_sustain_mean`、`in
 - `Vocabulary(registry)` 的 token 下标逐 bit 不变,存盘的策略照样能载入;
   日频 token 只在传了 `daily_fields=` 时**追加在最后**。
 - 没挂日频库时,两个 store 类的 `contract_hash`、`view_cache_key` 的哈希串都**逐 byte 相同**。
+- **`run_mining` 的日志行和 `meta.json` 也不变。** 三样东西只在有话可说时才出现:
+  `daily fields <目录>: <可用字段>` 那一行和 `meta.json` 的 `store_contract_hash` 只在**挂了**日频库
+  时有;`meta.json` 的 `unresolvable_daily_fields` 只在这次 run **被给了 `hooks`** 时有。三者都不满足
+  的 run,日志里没有任何提到日频字段的行,`meta.json` 的键和键序就是基线的
+  `store, start, end, dates, symbols, label, miner, pool, budget, seed, pool_metrics, rejected,
+  seconds, engine_seconds`。这三处一度是**无条件**的 —— `daily fields: none attached` 成了每次 run 的
+  新第一行日志,另两个成了每份 `meta.json` 的新键,日志被整体错开一行。前两处是第一次对拍发现的;
+  `unresolvable_daily_fields` 是那之后的一次提交(`e4b258a`)才加的,读那次提交才发现。
+  `tests/test_default_path_output.py` 把三处都钉着。
+- **怎么验证的。** 基线 `517fd09` 与本分支各用同一个磁盘上的合成 cube(16 只 × 90 天 × 24 分钟)
+  跑同一批任务,每个任务一个子进程,逐文件比对输出目录(浮点按 IEEE-754 位模式落盘,数组按字节)。
+  被抹掉的只有耗时数字和这次调用自己的输出目录;基线对基线的对照组同样逐文件相同,所以抹掉的只是噪声。
+  - 挖掘 11 个(GP 的 `ic` / `rank_ic` / `long` / `long_hit` 各 2 个 seed;RL 的 AlphaGen 2 个 seed、
+    AlphaSAGE 1 个):`members.csv`、`values/*.npy`、`combined.npy`、结果各字段、RL 的逐批 reward
+    序列、日志、`meta.json` 的键与键序,全部相同。
+  - 30 条表达式的解析与求值(含分块求值)、注册表(算子 / 字段 / `searchable()` 的顺序)、生成器随机
+    流(4 个 seed 的树、5 种变异、交叉、种群构造、RNG 状态)全部相同。
+  - 补充 12 个任务:RL 的 AlphaQCM(2 个 seed)/ AlphaForge / warmstart / AlphaSAGE(第 2 个 seed)、
+    RL 的打分器路径(`rank_ic` + 换手惩罚、`long`)、rank-ban + exemplar 缓存(GP 与 RL)、两个更长的
+    GP、store / `view_cache_key` / 词表 / 八个 RL 网络初始权重的指纹,全部相同;基线存的
+    `state_dict` 在本分支上 `strict=True` 载得进去,反过来也是;真实命令行
+    `python -m alphacube.cli mine` 的 7 组参数,stdout 逐行相同。
+  - 唯一的差别是两份"新增属性清单"(`additive_surface.json`):它们记录的就是分支才有的属性,
+    基线上是 `<absent>`。
+  对拍脚本在 `/Users/wxy/Desktop/Partura/tmp/impl/verify_defaults/`(临时目录,不进仓库;
+  `REPRO.txt` 是最小复现)。
+
+### 7.2 确实变了的(故意的;都不碰随机流和数值结果)
+
+1. **§2.2 的 (a)(b)(c)**:`--ban` / 滚动块下的变异也查封禁集;`generate()` 的兜底路径尊重钩子和
+   封禁集;`--fitness` 不再由 argparse 拒绝。对不封禁任何东西、不装钩子的 run 逐 bit 相同。实测:
+   `rolling_block=2, ban_top_n=2`(2 个 seed)和 `--ban O:log(F:Amt)`(GP、RL 各 1 个)这 4 个 run 的
+   所有输出与基线逐字节相同 —— (a) 只在变异恰好造出被封禁的结构时才会动,不是每个带 `--ban` 的 run 都变。
+2. **RL 路径(`miner` 不是 `gp`)现在校验 `banned_substructures`(CLI 的 `--ban`)里的每个键。**
+   用的是 `GPMiner.__init__` 一直在用的同一个 `gp.check_ban_key`,同样的报错信息;在建词表之后、开始挖
+   之前抛 `ValueError`。以前 RL 分支把元组原样交给 `BatchRewarder`,一个永远命不中的键就静默地什么都不封。
+   - **受影响的输入只有一类:`check_ban_key` 会拒绝的键** —— (i) 不是 `O:<算子>(<叶子>,...)[|w<窗口>]`
+     形式的;(ii) 算子名不在注册表里的;(iii) `F:<字段>` 的字段不在注册表那 8 个分钟字段里,或
+     `DF:<字段>` 的字段不在 `registry.daily_fields` 里的;(iv) 操作数不是 `F:` / `DF:` / `C:` 叶子的。
+   - 这类键**从来不可能命中**:搜索能造出的表达式(GP 生成器、RL 词表;`GeneralCall` 只由解析器造,搜索
+     语法造不出来)写出的每个 `one_layer_keys` 都满足这个形式 —— 算子名取自注册表,叶子只有 `F:` /
+     `C:` / `DF:` 三种拼写。`tests/test_default_path_output.py` 用 GP 生成器(348 个不同的键)和 RL
+     随机游走(25 个)收集了键,覆盖日频叶子、常数、窗口后缀,`check_ban_key` 一个都没拒。
+   - **不受影响的**:不传封禁键;`check_ban_key` 接受的任何键 —— 包括点名了 RL 词表里根本没有的算子
+     (布尔 / 资源风险类)的键,那种键仍然静默无效,这条改动没有去抓它;GP 路径(基线就抛)。
+   - 实测同一个键 `O:log(F:NoSuchField)`:基线 GP 路径抛
+     `ValueError: ban key 'O:log(F:NoSuchField)': no field named 'NoSuchField'`;基线 RL 路径跑完
+     (pool 2);本分支两条路径都抛这同一条信息。`O:no_such_op(F:Amt)`、`log(F:Amt)`、`O:log(Amt)`
+     三个键同样(基线 GP 抛、基线 RL 跑完、本分支两边都抛且信息相同)。
+   - 同一个函数在另一个方向放宽了一处:`DF:<日频字段>` 的键(如 `O:cs_rank(DF:FloatCap)`)以前
+     GP 路径会拒("operand 'DF:FloatCap' is not a leaf"),现在两条路径都接受(WP7:滚动块要能继承含
+     日频叶子的封禁键)。
 
 ---
 
@@ -601,7 +671,7 @@ AlphaCube 自己的核函数里**恰好三个**被误判:`in_sustain_mean`、`in
 ```bash
 cd /Users/wxy/Desktop/AlphaCube-steering
 ~/.venvs/alphacube/bin/python -m pytest tests/ -q 2>&1 | tail -8
-# 943 passed, 10 skipped, 1 xfailed —— 改动前的基线是 617 passed, 10 skipped, 1 xfailed
+# 966 passed, 10 skipped, 1 xfailed —— 改动前的基线是 617 passed, 10 skipped, 1 xfailed
 ```
 
 仓库根的 `conftest.py` 会把**当前 worktree 自己的 `src/`** 放进路径,所以在哪个 worktree 里
@@ -627,6 +697,7 @@ PYTHONPATH=/Users/wxy/Desktop/AlphaCube-steering/src:/Users/wxy/Desktop/Partura-
 | `tests/test_scorer_registry.py` | 空注册表下内置分支不变、factory 收到的 `dates`/`warmup`、重名 |
 | `tests/test_plugin_hooks.py` | `hooks=None` 与不传等价、插件加载、墙钟、`DF:` 封禁键、缓存身份 |
 | `tests/test_cli_daily_and_plugin.py` | `mine`/`research`/`calculate` 端到端、`--fitness` 校验、RL 侧校验 |
-| `tests/test_build_daily_fields.py` | 手写 parquet 目录、覆盖率下限、`--out` 拒绝、半成品不可读 |
+| `tests/test_build_daily_fields.py` | 手写 parquet 目录、覆盖率下限、`--out` 拒绝、半成品不可读;生产实测的七列 schema 建出三个存储字段、`FloatShares` 取自 `circulating_capital` |
 | `tests/test_daily_tokens.py` | token 下标不变、`ExpressionBuilder`、权重 0 的 logit 偏置 |
 | `tests/test_steering_wiring.py` | 分支验证的五条回归:logit 偏置真的接到五个 RL miner 上、`hooks.daily_fields` 真的进词表、解析不了的日频字段被点名、ND/NT 孪生体、日频字段名校验 |
+| `tests/test_default_path_output.py` | 默认路径的输出与基线逐行逐键相同:没挂日频库 / 没给 hooks 时 `run_mining` 的日志行种类、`meta.json` 的键与键序;挂了库时那一行和 hash 回来;RL 封禁键校验与 GP 同一条信息、`check_ban_key` 不拒任何搜索产得出的键(§7) |
