@@ -338,3 +338,21 @@ def test_day_major_boundaries_give_the_same_values(view, src, cs, cd):
     a = CubeEngine(view, chunk_symbols=cs, chunk_days=cd).evaluate([e]).panels[0]
     b = CubeEngine(view, chunk_symbols=cs, chunk_days=cd, boundary_layout="S").evaluate([e]).panels[0]
     assert np.array_equal(a, b, equal_nan=True), src
+
+
+@pytest.mark.parametrize("src", ["day_last(nt_cs_rank(cross_mean(Close, 3)))",
+                                 "day_mean(nt_cs_rank(mul(cross_mean(Vwap, 5), in_rank(Volume))))",
+                                 "day_std(nt_ts_mean(cross_max(High, 3), 5))"])
+@pytest.mark.parametrize("layout", ["auto", "S"])
+def test_in_memory_boundaries_give_the_same_values(view, src, layout, monkeypatch, tmp_path):
+    """$ALPHACUBE_BOUNDARY_MEMORY=1 keeps boundaries in process memory: the same
+    values bit for bit, and no file in the work directory."""
+    e = parse(src)
+    a = CubeEngine(view, chunk_symbols=3, chunk_days=7, boundary_layout=layout).evaluate([e])
+    monkeypatch.setenv("ALPHACUBE_BOUNDARY_MEMORY", "1")
+    eng = CubeEngine(view, chunk_symbols=3, chunk_days=7, boundary_layout=layout, workdir=str(tmp_path))
+    assert eng.plan([e]).boundaries
+    b = eng.evaluate([e])
+    assert np.array_equal(a.panels[0], b.panels[0], equal_nan=True), src
+    assert b.stats["boundary_bytes"] == a.stats["boundary_bytes"] > 0
+    assert list(tmp_path.iterdir()) == []

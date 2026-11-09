@@ -10,7 +10,10 @@ through ``is_gt0`` or a NaN-aware reducer), and hands results on:
   (column 0; exact for minute-degenerate values);
 - full-width nodes crossing modes -> a ``(S, D, M)`` memmap in ``workdir``
   (deleted at the end). ``workdir`` defaults to ``<project>/tmp``, never the
-  system temp dir -- see ``default_workdir``.
+  system temp dir -- see ``default_workdir``.  ``$ALPHACUBE_BOUNDARY_MEMORY=1``
+  keeps them in process memory instead (no file at all): for a host with RAM to
+  spare and a slow, busy disk (2026-11-09: a 10 GB boundary written to a 100 %
+  busy HDD at ~20 MB/s made one chunk of 8 expressions take hours).
 
 Panel rounds run whole ``(D, S)`` tensors on ``device``. ``dtype="float64"``
 widens the whole path for a reference run (see the constructor).
@@ -111,6 +114,7 @@ class CubeEngine:
             raise ValueError("boundary_layout must be 'auto' or 'S'")
         self.boundary_layout = boundary_layout
         self.workdir = Path(workdir) if workdir is not None else default_workdir()
+        self._bound_in_memory = os.environ.get("ALPHACUBE_BOUNDARY_MEMORY", "") not in ("", "0")
         if torch_threads is not None:
             torch.set_num_threads(int(torch_threads))
         self._bound_advice: Dict[str, bool] = {}     # boundary key -> last access advice given
@@ -160,7 +164,7 @@ class CubeEngine:
         self._bound_layout: Dict[str, str] = {}      # boundary key -> "S" / "D" (axis order of its file)
         self._daily_t: Dict[str, torch.Tensor] = {}  # daily field -> cached (D, S) panel tensor, this call only
         tmp = None
-        if plan.boundaries:
+        if plan.boundaries and not self._bound_in_memory:
             tmp = tempfile.TemporaryDirectory(dir=self.workdir, prefix="alphacube_")
         stats = {"chunks": 0, "boundary_bytes": 0.0, "rounds": len(plan.rounds)}
         try:
@@ -280,6 +284,8 @@ class CubeEngine:
         return torch.from_numpy(np.ascontiguousarray(sl)).to(self.device, self.dtype)
 
     def _advise_bound(self, key: str, b: np.memmap, strided: bool) -> None:
+        if not isinstance(b, np.memmap):              # an in-memory boundary: nothing to advise
+            return
         if self._bound_advice.get(key) is not strided:
             advise_access(b, random=strided)
             self._bound_advice[key] = strided
@@ -355,11 +361,14 @@ class CubeEngine:
                 b = bounds.get(n.key)
                 if b is None:
                     # width comes from the RESULT: a width-changing call (in_slice) is narrower than M
-                    path = Path(tmp.name) / f"bound_{len(bounds):04d}.npy"
                     layout = n.bound_layout if self.boundary_layout == "auto" else "S"
                     shape = (D, S, int(arr.shape[-1])) if layout == "D" else (S, D, int(arr.shape[-1]))
-                    b = bounds[n.key] = np.lib.format.open_memmap(path, mode="w+", dtype=self.np_dtype,
-                                                                   shape=shape)
+                    if tmp is None:                   # $ALPHACUBE_BOUNDARY_MEMORY: zero-filled like a fresh memmap
+                        b = bounds[n.key] = np.zeros(shape, dtype=self.np_dtype)
+                    else:
+                        path = Path(tmp.name) / f"bound_{len(bounds):04d}.npy"
+                        b = bounds[n.key] = np.lib.format.open_memmap(path, mode="w+", dtype=self.np_dtype,
+                                                                       shape=shape)
                     self._bound_layout[n.key] = layout
                 day_major = self._bound_layout[n.key] == "D"
                 self._advise_bound(n.key, b, strided=(mode == MODE_S) == day_major)
@@ -377,7 +386,8 @@ class CubeEngine:
                 if remaining_uses[c.key] == 0 and not c.is_root:
                     values.pop(c.key, None)
         for b in bounds.values():
-            b.flush()
+            if isinstance(b, np.memmap):
+                b.flush()
 
     def _run_panel_round(self, rnd: Round, panels: Dict[str, np.ndarray], tolerant: bool) -> None:
         tradable_ds = self._tradable.transpose(0, 1)          # (D, S)
